@@ -11,7 +11,8 @@ export default defineConfig(async () => ({
   //
   // 1. prevent Vite from obscuring rust errors
   clearScreen: false,
-  // 2. tauri expects a fixed port, fail if that port is not available
+  // 2. tauri expects a fixed port, if that port is not available, will throw an error
+  // you can pass APP_PORT=1421 npm run tauri dev -- --port 1421 to run on an alternate port
   server: {
     port: process.env.APP_PORT ? parseInt(process.env.APP_PORT) : 1420,
     strictPort: true,
