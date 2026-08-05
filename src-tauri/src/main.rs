@@ -17,6 +17,7 @@
 use futures::stream::StreamExt;
 use libp2p::gossipsub;
 use libp2p::identity::Keypair;
+use libp2p::ping;
 use libp2p::request_response::cbor;
 use libp2p::request_response::Config as RequestResponseConfig;
 use libp2p::request_response::Event as RequestResponseEvent;
@@ -92,6 +93,16 @@ const MDNS_RECORD_TTL: Duration = Duration::from_secs(6 * 60);
 /// measured in heartbeats. Three heartbeats is 30 seconds, so a peer we failed
 /// to reach — or lost a connection to — is picked up again promptly.
 const GOSSIPSUB_EXPLICIT_PEER_TICKS: u64 = 3;
+
+/// How often each connection is pinged, and how long a ping may go unanswered.
+///
+/// Together these bound how quickly a node that vanished without closing its
+/// sockets — a machine suspended, unplugged, or losing Wi-Fi — is noticed. The
+/// worst case is one interval plus one timeout, so 20 seconds: the peer dies
+/// just after answering a ping, the next ping goes out an interval later, and it
+/// takes a timeout to give up on it.
+const PING_INTERVAL: Duration = Duration::from_secs(10);
+const PING_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Reads the ID of this node from the environment.
 ///
@@ -230,6 +241,11 @@ struct AppBehaviour {
     /// Unlike `chat`, this reaches members we have no direct connection to:
     /// peers in the middle relay what they receive.
     groups: gossipsub::Behaviour,
+    /// Checks that the peer on the other end of each connection is still there.
+    ///
+    /// Only needed for nodes that disappear without closing their sockets; one
+    /// that exits normally is noticed the moment the connection drops.
+    ping: ping::Behaviour,
 }
 
 /// The gossipsub topic a group's messages travel on.
@@ -927,10 +943,17 @@ fn build_swarm(keypair: Keypair) -> Swarm<AppBehaviour> {
             )
             .expect("failed to start gossipsub");
 
+            let ping = ping::Behaviour::new(
+                ping::Config::new()
+                    .with_interval(PING_INTERVAL)
+                    .with_timeout(PING_TIMEOUT),
+            );
+
             AppBehaviour {
                 mdns,
                 chat,
                 groups,
+                ping,
             }
         })
         .expect("failed to configure the network behaviours")
@@ -1136,6 +1159,21 @@ fn handle_swarm_event(
             // Ignored on purpose. An mDNS record expiring says only that we
             // haven't been told about the peer lately, which happens routinely to
             // a node that is alive and connected — see `handle_peer_connected`.
+        }
+
+        SwarmEvent::Behaviour(AppBehaviourEvent::Ping(ping::Event {
+            peer,
+            connection,
+            result: Err(failure),
+        })) => {
+            // libp2p leaves the policy to us: a failed ping is reported, not
+            // acted on. Closing the connection is what turns it into a presence
+            // change, since that path already tells the frontend.
+            //
+            // Safe to be decisive about. If the peer is in fact alive, gossipsub
+            // retries it within 30 seconds and it comes straight back.
+            eprintln!("ping to {} failed ({}), closing the connection", peer, failure);
+            swarm.close_connection(connection);
         }
 
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
