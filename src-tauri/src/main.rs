@@ -68,22 +68,30 @@ const LISTEN_ADDRESS: &str = "/ip4/0.0.0.0/tcp/0";
 const COMMAND_CHANNEL_CAPACITY: usize = 100;
 
 /// How long a connection with no traffic on it is kept open.
-const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
+///
+/// Long, because presence is decided by whether a connection exists: dropping an
+/// idle connection between two live nodes would show them as having gone away. A
+/// node that actually goes away closes its sockets, which is noticed instantly.
+const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// How often we ask the local network who's out there.
 ///
-/// This is also how often a peer that's still alive refreshes its record, so it
-/// has to be comfortably shorter than the TTL below or live peers would flicker
-/// offline between queries.
+/// Shorter than libp2p's five minute default so a node that just started is
+/// found quickly. This costs one small multicast packet per interval.
 const MDNS_QUERY_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How long a peer stays "online" without us hearing from it again.
+/// How long our mDNS record stays valid in other nodes' tables.
 ///
-/// This is what decides how quickly a node that went away is shown as offline. A
-/// process that is killed has no chance to announce that it's leaving, so the
-/// record expiring is the only signal we get. libp2p defaults to six minutes,
-/// which leaves a dead node looking online for far too long.
-const MDNS_RECORD_TTL: Duration = Duration::from_secs(30);
+/// Kept generous on purpose. This governs how long other nodes retain our
+/// *address*, which is what they need to dial us; it deliberately has nothing to
+/// do with whether we're shown as online. See the note on presence above
+/// `handle_peer_connected`.
+const MDNS_RECORD_TTL: Duration = Duration::from_secs(6 * 60);
+
+/// How often gossipsub retries connecting to peers it has been told about,
+/// measured in heartbeats. Three heartbeats is 30 seconds, so a peer we failed
+/// to reach — or lost a connection to — is picked up again promptly.
+const GOSSIPSUB_EXPLICIT_PEER_TICKS: u64 = 3;
 
 /// Reads the ID of this node from the environment.
 ///
@@ -909,6 +917,7 @@ fn build_swarm(keypair: Keypair) -> Swarm<AppBehaviour> {
                 // inbound group message is the peer who actually wrote it and
                 // not whoever passed it along.
                 .validation_mode(gossipsub::ValidationMode::Strict)
+                .check_explicit_peers_ticks(GOSSIPSUB_EXPLICIT_PEER_TICKS)
                 .build()
                 .expect("invalid gossipsub configuration");
 
@@ -941,48 +950,72 @@ fn emit_to_frontend<P: Serialize + Clone>(app: &AppHandle, event: &str, payload:
     }
 }
 
-/// Records newly discovered peers and tells the frontend about them.
+/// Connects to peers mDNS has found.
 ///
-/// Discovered peers are also handed to gossipsub, which is what builds the mesh
-/// that group messages travel over. Gossipsub never goes looking for peers
-/// itself; it only uses connections it's told about.
-fn handle_peers_discovered(app: &AppHandle, swarm: &mut Swarm<AppBehaviour>, peers: Vec<PeerId>) {
-    let state = app.state::<NetworkState>();
-
+/// Handing them to gossipsub does two jobs: it builds the mesh that group
+/// messages travel over, and it dials any peer we aren't connected to yet, which
+/// is what turns a discovery into the connection that presence is based on.
+/// Gossipsub never goes looking for peers itself.
+///
+/// Peers are never handed back once added. Gossipsub retries them on a timer, so
+/// keeping them means a node we briefly lost is picked up again without waiting
+/// for mDNS to rediscover it. The cost is a failed dial every 30 seconds for a
+/// node that really did leave, which on a local network is nothing.
+fn connect_to_discovered_peers(swarm: &mut Swarm<AppBehaviour>, peers: Vec<PeerId>) {
     for peer_id in peers {
         swarm.behaviour_mut().groups.add_explicit_peer(&peer_id);
-
-        let peer_id = peer_id.to_string();
-
-        match state.active_peers.lock() {
-            Ok(mut active_peers) => {
-                active_peers.insert(peer_id.clone());
-            }
-            Err(error) => eprintln!("could not record discovered peer: {}", error),
-        }
-
-        emit_to_frontend(app, "peer-discovered", peer_id);
     }
 }
 
-/// Forgets peers we haven't heard from and tells the frontend they went away.
-fn handle_peers_expired(app: &AppHandle, swarm: &mut Swarm<AppBehaviour>, peers: Vec<PeerId>) {
+/// Records that a peer is reachable and tells the frontend.
+///
+/// Presence is deliberately based on whether a connection exists rather than on
+/// mDNS records, which cannot be trusted to expire honestly.
+///
+/// The reason is a quirk of how mDNS refreshes work. A node's record is only
+/// renewed in other nodes' tables when it *answers* a query, and receiving any
+/// answer resets a node's own timer for asking. Each node's query interval is
+/// randomised once at startup and then never changes, so after the first round
+/// every node's timer restarts together and whichever node drew the shortest
+/// interval always asks first — forever. That node never answers anyone, so its
+/// record is never renewed, and once its TTL passes it disappears from every
+/// other node's list and never returns, despite being alive and connected.
+///
+/// A connection, by contrast, says exactly what we want to know: the peer is
+/// there right now. It also detects a node going away immediately, since a
+/// process that exits closes its sockets.
+fn handle_peer_connected(app: &AppHandle, peer_id: PeerId) {
     let state = app.state::<NetworkState>();
+    let peer_id = peer_id.to_string();
 
-    for peer_id in peers {
-        swarm.behaviour_mut().groups.remove_explicit_peer(&peer_id);
-
-        let peer_id = peer_id.to_string();
-
-        match state.active_peers.lock() {
-            Ok(mut active_peers) => {
-                active_peers.remove(&peer_id);
+    match state.active_peers.lock() {
+        Ok(mut active_peers) => {
+            // Nothing new to report on a second connection to the same peer.
+            if !active_peers.insert(peer_id.clone()) {
+                return;
             }
-            Err(error) => eprintln!("could not forget expired peer: {}", error),
         }
-
-        emit_to_frontend(app, "peer-lost", peer_id);
+        Err(error) => eprintln!("could not record connected peer: {}", error),
     }
+
+    emit_to_frontend(app, "peer-discovered", peer_id);
+}
+
+/// Records that a peer is no longer reachable and tells the frontend.
+///
+/// Only called once the last connection to that peer is gone.
+fn handle_peer_disconnected(app: &AppHandle, peer_id: PeerId) {
+    let state = app.state::<NetworkState>();
+    let peer_id = peer_id.to_string();
+
+    match state.active_peers.lock() {
+        Ok(mut active_peers) => {
+            active_peers.remove(&peer_id);
+        }
+        Err(error) => eprintln!("could not forget disconnected peer: {}", error),
+    }
+
+    emit_to_frontend(app, "peer-lost", peer_id);
 }
 
 /// Handles one inbound group message.
@@ -1096,12 +1129,29 @@ fn handle_swarm_event(
             // mDNS reports a (peer, address) pair per address; we only need the
             // peer, and the same peer can appear more than once.
             let peers = discovered.into_iter().map(|(peer_id, _address)| peer_id);
-            handle_peers_discovered(app, swarm, peers.collect());
+            connect_to_discovered_peers(swarm, peers.collect());
         }
 
-        SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(mdns::Event::Expired(expired))) => {
-            let peers = expired.into_iter().map(|(peer_id, _address)| peer_id);
-            handle_peers_expired(app, swarm, peers.collect());
+        SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(mdns::Event::Expired(_))) => {
+            // Ignored on purpose. An mDNS record expiring says only that we
+            // haven't been told about the peer lately, which happens routinely to
+            // a node that is alive and connected — see `handle_peer_connected`.
+        }
+
+        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            handle_peer_connected(app, peer_id);
+        }
+
+        SwarmEvent::ConnectionClosed {
+            peer_id,
+            num_established,
+            ..
+        } => {
+            // Peers can hold more than one connection; they're only gone when
+            // the last one closes.
+            if num_established == 0 {
+                handle_peer_disconnected(app, peer_id);
+            }
         }
 
         SwarmEvent::Behaviour(AppBehaviourEvent::Groups(gossipsub::Event::Message {

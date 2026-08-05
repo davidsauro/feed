@@ -740,14 +740,6 @@ onMounted(async () => {
   await loadContacts();
   await loadGroups();
 
-  // Catch up on peers discovered before this window started listening.
-  try {
-    const initialPeers = await invoke<string[]>("get_active_peers");
-    initialPeers.forEach((peer) => activePeers.value.add(peer));
-  } catch (error) {
-    console.error("Could not load the current peer list", error);
-  }
-
   await listen<string>("peer-discovered", (event) => {
     activePeers.value.add(event.payload);
   });
@@ -755,6 +747,17 @@ onMounted(async () => {
   await listen<string>("peer-lost", (event) => {
     activePeers.value.delete(event.payload);
   });
+
+  // Catch up on peers that connected before this window started listening.
+  // Deliberately after the listeners are registered, so a peer appearing during
+  // startup can't fall into the gap between the two. Adding a peer twice is
+  // harmless, since these are held in a Set.
+  try {
+    const initialPeers = await invoke<string[]>("get_active_peers");
+    initialPeers.forEach((peer) => activePeers.value.add(peer));
+  } catch (error) {
+    console.error("Could not load the current peer list", error);
+  }
 
   await listen<{ sender: string; message: string }>("chat-received", async (event) => {
     const { sender, message } = event.payload;
