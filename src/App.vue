@@ -5,6 +5,11 @@
  * This component owns all state and every call into the Rust backend. The
  * components under it are presentational: they take props and report what the
  * user did, and this file decides what that means.
+ *
+ * Two kinds of conversation live here. Direct messages go peer to peer over the
+ * request-response protocol. Group messages go over gossipsub, where they can
+ * reach members we have no direct connection to, because peers in the middle
+ * relay them.
  */
 import { computed, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
@@ -13,10 +18,16 @@ import { listen } from "@tauri-apps/api/event";
 import ChatPane from "./components/ChatPane.vue";
 import ConfirmDialog from "./components/ConfirmDialog.vue";
 import ContactList from "./components/ContactList.vue";
+import GroupList from "./components/GroupList.vue";
 import IdentityBar from "./components/IdentityBar.vue";
+import NewGroupDialog from "./components/NewGroupDialog.vue";
 import PeerList from "./components/PeerList.vue";
 import ThemeToggle from "./components/ThemeToggle.vue";
-import type { ChatMessage, Contact } from "./types";
+import type { ChatMessage, Contact, Group } from "./types";
+import { shortPeerId } from "./types";
+
+/** Which kind of thing a conversation is with. */
+type ConversationKind = "contact" | "group";
 
 // --- State ----------------------------------------------------------------
 
@@ -26,23 +37,41 @@ const nodeInstance = ref("…");
 /** Peer IDs mDNS can currently see, contacts and strangers alike. */
 const activePeers = ref<Set<string>>(new Set());
 const savedContacts = ref<Contact[]>([]);
+const groups = ref<Group[]>([]);
 
-/** Conversations, keyed by the other peer's ID. */
+/**
+ * Conversations and unread flags, keyed by `conversationKey`.
+ *
+ * Direct chats and groups share these maps, so the key carries the kind as well
+ * as the id rather than relying on peer IDs and group IDs never colliding.
+ */
 const messages = ref<Record<string, ChatMessage[]>>({});
-/** Which contacts have a message we haven't shown yet. */
-const unreadStatus = ref<Record<string, boolean>>({});
+const unread = ref<Record<string, boolean>>({});
 
-const selectedPeerId = ref<string | null>(null);
+/** The open conversation, or null for the empty state. */
+const selection = ref<{ kind: ConversationKind; id: string } | null>(null);
 
 /** A short-lived message shown over the UI. Replaces blocking alert() dialogs. */
 const notice = ref<{ text: string; kind: "error" | "info" } | null>(null);
 let noticeTimer = 0;
 
 /**
- * The contact the user has asked to remove, held here while the confirmation
- * dialog is open. Non-null is what makes the dialog visible.
+ * What the user has asked to delete, held here while the confirmation dialog is
+ * open. Non-null is what makes the dialog visible.
  */
-const pendingRemoval = ref<{ contact: Contact; messageCount: number } | null>(null);
+const pendingRemoval = ref<{
+  kind: ConversationKind;
+  id: string;
+  name: string;
+  messageCount: number;
+} | null>(null);
+
+const creatingGroup = ref(false);
+
+/** Identifies a conversation across the `messages` and `unread` maps. */
+function conversationKey(kind: ConversationKind, id: string): string {
+  return `${kind}:${id}`;
+}
 
 // --- Derived state --------------------------------------------------------
 
@@ -51,11 +80,21 @@ const pendingRemoval = ref<{ contact: Contact; messageCount: number } | null>(nu
  * having to update two places.
  */
 const selectedContact = computed<Contact | null>(() => {
-  const found = savedContacts.value.find(
-    (contact) => contact.peer_id === selectedPeerId.value,
-  );
+  if (selection.value?.kind !== "contact") {
+    return null;
+  }
 
-  return found ?? null;
+  return (
+    savedContacts.value.find((contact) => contact.peer_id === selection.value?.id) ?? null
+  );
+});
+
+const selectedGroup = computed<Group | null>(() => {
+  if (selection.value?.kind !== "group") {
+    return null;
+  }
+
+  return groups.value.find((group) => group.id === selection.value?.id) ?? null;
 });
 
 /** Discovered peers we haven't saved as contacts yet. */
@@ -66,16 +105,63 @@ const unregisteredPeers = computed(() =>
 );
 
 const currentMessages = computed(() => {
-  if (!selectedPeerId.value) {
+  if (!selection.value) {
     return [];
   }
 
-  return messages.value[selectedPeerId.value] ?? [];
+  return messages.value[conversationKey(selection.value.kind, selection.value.id)] ?? [];
 });
 
 const selectedIsOnline = computed(
-  () => selectedPeerId.value !== null && activePeers.value.has(selectedPeerId.value),
+  () => selectedContact.value !== null && activePeers.value.has(selectedContact.value.peer_id),
 );
+
+/** Unread flags for one kind, keyed by bare id the way the lists expect them. */
+function unreadByKind(kind: ConversationKind, ids: string[]): Record<string, boolean> {
+  const flags: Record<string, boolean> = {};
+
+  for (const id of ids) {
+    flags[id] = unread.value[conversationKey(kind, id)] ?? false;
+  }
+
+  return flags;
+}
+
+const contactUnread = computed(() =>
+  unreadByKind("contact", savedContacts.value.map((contact) => contact.peer_id)),
+);
+
+const groupUnread = computed(() =>
+  unreadByKind("group", groups.value.map((group) => group.id)),
+);
+
+/** What to call a peer: their nickname if we have one, otherwise a short ID. */
+function displayName(peerId: string): string {
+  if (peerId === myPeerId.value) {
+    return "You";
+  }
+
+  const contact = savedContacts.value.find((saved) => saved.peer_id === peerId);
+
+  return contact?.nickname ?? shortPeerId(peerId);
+}
+
+/**
+ * Names for everyone in the open group, so each message can be attributed.
+ *
+ * A member we haven't added as a contact still gets a label here, even though
+ * their messages are dropped before they reach us — they're visible in the
+ * member count, so they shouldn't show up as a bare ID if that ever changes.
+ */
+const groupSenderLabels = computed<Record<string, string>>(() => {
+  const labels: Record<string, string> = {};
+
+  for (const member of selectedGroup.value?.members ?? []) {
+    labels[member] = displayName(member);
+  }
+
+  return labels;
+});
 
 // --- Notices --------------------------------------------------------------
 
@@ -116,12 +202,20 @@ async function loadContacts() {
         peerId: contact.peer_id,
       });
 
-      unreadStatus.value[contact.peer_id] = history.some(
+      unread.value[conversationKey("contact", contact.peer_id)] = history.some(
         (message) => message.sender === contact.peer_id && message.status !== "read",
       );
     } catch (error) {
       console.error(`Could not check unread messages for ${contact.peer_id}`, error);
     }
+  }
+}
+
+async function loadGroups() {
+  try {
+    groups.value = await invoke<Group[]>("get_groups");
+  } catch (error) {
+    notify(`Could not load groups: ${error}`);
   }
 }
 
@@ -146,89 +240,202 @@ async function renameContact(peerId: string, nickname: string) {
   }
 }
 
+// --- Groups ---------------------------------------------------------------
+
 /**
- * Step one of removing a contact: look up what would be lost and open the
- * confirmation. Nothing is deleted here.
+ * Creates a group and invites its members.
+ *
+ * The invite goes over the direct channel rather than gossipsub, because
+ * gossipsub only delivers to peers already subscribed to a topic: a node that
+ * has never heard of the group isn't subscribed, so the first message would go
+ * nowhere. Once invited, everything else flows over gossipsub.
  */
-async function requestRemoval(contact: Contact) {
-  let messageCount = 0;
+async function createGroup(name: string, memberPeerIds: string[]) {
+  creatingGroup.value = false;
+
+  const id = crypto.randomUUID();
+  const members = [myPeerId.value, ...memberPeerIds];
 
   try {
-    messageCount = await invoke<number>("count_chat_messages", {
-      peerId: contact.peer_id,
-    });
+    await invoke("save_group", { id, name, members });
+    await invoke("subscribe_group", { groupId: id });
+    await loadGroups();
   } catch (error) {
-    // Worth continuing without the count: the user can still make the decision,
-    // and the warning covers the history either way.
-    console.error("Could not count stored messages", error);
-    messageCount = -1;
-  }
-
-  pendingRemoval.value = { contact, messageCount };
-}
-
-/** Step two: the user confirmed, so remove the contact and their history. */
-async function confirmRemoval() {
-  const pending = pendingRemoval.value;
-  if (!pending) {
+    notify(`Could not create the group: ${error}`);
     return;
   }
 
-  const { contact } = pending;
-  pendingRemoval.value = null;
+  const invite = JSON.stringify({
+    type: "group-invite",
+    groupId: id,
+    groupName: name,
+    members,
+  });
 
-  try {
-    const deleted = await invoke<number>("delete_contact", {
-      peerId: contact.peer_id,
-    });
-
-    // Drop the local copies too, or the conversation would linger on screen
-    // until the next restart.
-    delete messages.value[contact.peer_id];
-    delete unreadStatus.value[contact.peer_id];
-
-    if (selectedPeerId.value === contact.peer_id) {
-      selectedPeerId.value = null;
+  const uninvited: string[] = [];
+  for (const peerId of memberPeerIds) {
+    try {
+      await invoke("send_message", { peerId, message: invite });
+    } catch (error) {
+      console.error(`Could not invite ${peerId}`, error);
+      uninvited.push(peerId);
     }
+  }
 
-    await loadContacts();
+  selection.value = { kind: "group", id };
 
+  if (uninvited.length > 0) {
+    // Not fatal: they'll be added by the member list on the next message they
+    // do receive, once they're reachable again.
     notify(
-      `Removed ${contact.nickname} and deleted ${describeMessageCount(deleted)}.`,
-      "info",
+      `Created ${name}, but could not reach ${uninvited.map(displayName).join(", ")}.`,
     );
-  } catch (error) {
-    notify(`Could not remove ${contact.nickname}: ${error}`);
+  } else {
+    notify(`Created ${name}.`, "info");
   }
 }
 
-/** "1 message" / "4 messages", so the dialog and toast read as sentences. */
-function describeMessageCount(count: number): string {
-  return count === 1 ? "1 message" : `${count} messages`;
+/** Handles an invite from a contact by joining the group they made. */
+async function receiveInvite(
+  sender: string,
+  groupId: string,
+  groupName: string,
+  members: string[],
+) {
+  try {
+    await invoke("save_group", { id: groupId, name: groupName, members });
+    await invoke("subscribe_group", { groupId });
+    await loadGroups();
+
+    notify(`${displayName(sender)} added you to ${groupName}.`, "info");
+  } catch (error) {
+    console.error("Could not join a group we were invited to", error);
+  }
 }
 
 /**
- * The consequence spelled out for the confirmation dialog.
+ * Publishes to the open group.
  *
- * A count of -1 means the lookup failed; the warning still has to be clear that
- * history goes away.
+ * Unlike a direct message this can fail loudly: gossipsub refuses to publish
+ * when no other member is subscribed, which is worth showing rather than
+ * pretending the message went out.
  */
-const removalWarning = computed(() => {
-  const pending = pendingRemoval.value;
-  if (!pending) {
-    return "";
+async function sendGroupMessage(text: string) {
+  const group = selectedGroup.value;
+  if (!group) {
+    return;
   }
 
-  if (pending.messageCount < 0) {
-    return "Your entire chat history with this contact will be permanently deleted. This cannot be undone.";
+  const id = crypto.randomUUID();
+  const message: ChatMessage = {
+    id,
+    sender: myPeerId.value,
+    text,
+    status: "sending",
+  };
+
+  const key = conversationKey("group", group.id);
+  if (!messages.value[key]) {
+    messages.value[key] = [];
+  }
+  messages.value[key].push(message);
+
+  try {
+    await invoke("save_group_message", {
+      id,
+      groupId: group.id,
+      sender: myPeerId.value,
+      text,
+      status: "sending",
+    });
+
+    // The name and members ride along so anyone whose copy is out of date
+    // catches up without a separate sync.
+    await invoke("send_group_message", {
+      groupId: group.id,
+      message: JSON.stringify({
+        type: "group-chat",
+        id,
+        text,
+        groupName: group.name,
+        members: group.members,
+      }),
+    });
+
+    message.status = "delivered";
+    await invoke("update_message_status", { id, status: "delivered" });
+  } catch (error) {
+    message.status = "failed";
+    invoke("update_message_status", { id, status: "failed" }).catch(() => {});
+    notify(`Could not send to ${group.name}: ${error}`);
+  }
+}
+
+/**
+ * Whether an inbound message describes a group differently to how we have it.
+ *
+ * Members are compared as sets, since nothing guarantees the order two nodes
+ * store them in.
+ */
+function groupDetailsChanged(groupId: string, name: string, members: string[]): boolean {
+  const known = groups.value.find((group) => group.id === groupId);
+  if (!known) {
+    return true;
   }
 
-  if (pending.messageCount === 0) {
-    return "There is no chat history with this contact yet, so nothing else will be lost.";
+  if (known.name !== name || known.members.length !== members.length) {
+    return true;
   }
 
-  return `${describeMessageCount(pending.messageCount)} will be permanently deleted along with them. This cannot be undone.`;
-});
+  const knownMembers = new Set(known.members);
+
+  return members.some((member) => !knownMembers.has(member));
+}
+
+/** Handles a group message from a contact. */
+async function receiveGroupMessage(
+  groupId: string,
+  sender: string,
+  id: string,
+  text: string,
+  groupName?: string,
+  members?: string[],
+) {
+  // Keep our copy of the group in step with the sender's, but only write when
+  // something actually changed: this runs on every inbound message.
+  if (groupName && Array.isArray(members) && groupDetailsChanged(groupId, groupName, members)) {
+    try {
+      await invoke("save_group", { id: groupId, name: groupName, members });
+      await loadGroups();
+    } catch (error) {
+      console.error("Could not update group details", error);
+    }
+  }
+
+  const key = conversationKey("group", groupId);
+  if (!messages.value[key]) {
+    messages.value[key] = [];
+  }
+
+  // Gossipsub can deliver the same message twice on a mesh with loops.
+  if (messages.value[key].some((message) => message.id === id)) {
+    return;
+  }
+
+  messages.value[key].push({ id, sender, text, status: "delivered" });
+
+  await invoke("save_group_message", {
+    id,
+    groupId,
+    sender,
+    text,
+    status: "delivered",
+  });
+
+  if (selection.value?.kind !== "group" || selection.value.id !== groupId) {
+    unread.value[key] = true;
+  }
+}
 
 // --- Conversations --------------------------------------------------------
 
@@ -249,14 +456,15 @@ async function sendReadReceipt(peerId: string, messageIds: string[]) {
 }
 
 /**
- * Opens a conversation: loads its history, clears the unread dot, and tells the
- * other side we've read what they sent.
+ * Opens a direct conversation: loads its history, clears the unread dot, and
+ * tells the other side we've read what they sent.
  */
 async function selectContact(contact: Contact) {
-  selectedPeerId.value = contact.peer_id;
+  selection.value = { kind: "contact", id: contact.peer_id };
+  const key = conversationKey("contact", contact.peer_id);
 
   try {
-    messages.value[contact.peer_id] = await invoke<ChatMessage[]>("get_chat_history", {
+    messages.value[key] = await invoke<ChatMessage[]>("get_chat_history", {
       peerId: contact.peer_id,
     });
   } catch (error) {
@@ -264,25 +472,47 @@ async function selectContact(contact: Contact) {
     return;
   }
 
-  unreadStatus.value[contact.peer_id] = false;
+  unread.value[key] = false;
 
-  const unread = messages.value[contact.peer_id].filter(
+  const unreadMessages = messages.value[key].filter(
     (message) => message.sender === contact.peer_id && message.status !== "read",
   );
 
-  if (unread.length === 0) {
+  if (unreadMessages.length === 0) {
     return;
   }
 
   sendReadReceipt(
     contact.peer_id,
-    unread.map((message) => message.id),
+    unreadMessages.map((message) => message.id),
   );
 
-  for (const message of unread) {
+  for (const message of unreadMessages) {
     message.status = "read";
     markMessageRead(message.id);
   }
+}
+
+/**
+ * Opens a group conversation.
+ *
+ * No read receipts here: gossipsub tells us a message reached the mesh, not who
+ * read it, and tracking that per member is a bigger feature than it looks.
+ */
+async function selectGroup(group: Group) {
+  selection.value = { kind: "group", id: group.id };
+  const key = conversationKey("group", group.id);
+
+  try {
+    messages.value[key] = await invoke<ChatMessage[]>("get_group_history", {
+      groupId: group.id,
+    });
+  } catch (error) {
+    notify(`Could not load this conversation: ${error}`);
+    return;
+  }
+
+  unread.value[key] = false;
 }
 
 /** Records a status change in SQLite. Best effort: the UI has already moved on. */
@@ -293,7 +523,7 @@ function markMessageRead(id: string) {
 }
 
 /**
- * Sends a message, showing it in the conversation right away.
+ * Sends a direct message, showing it in the conversation right away.
  *
  * The message is saved as "sending" before it goes out so it survives a crash
  * mid-send, then promoted to "delivered" once the other node accepts it.
@@ -314,10 +544,11 @@ async function sendMessage(text: string) {
     status: "sending",
   };
 
-  if (!messages.value[peerId]) {
-    messages.value[peerId] = [];
+  const key = conversationKey("contact", peerId);
+  if (!messages.value[key]) {
+    messages.value[key] = [];
   }
-  messages.value[peerId].push(message);
+  messages.value[key].push(message);
 
   try {
     await invoke("save_chat_message", {
@@ -336,20 +567,21 @@ async function sendMessage(text: string) {
     message.status = "delivered";
     await invoke("update_message_status", { id, status: "delivered" });
   } catch (error) {
+    message.status = "failed";
+    invoke("update_message_status", { id, status: "failed" }).catch(() => {});
     notify(`Could not send to ${contact.nickname}: ${error}`);
   }
 }
 
-// --- Inbound network events ----------------------------------------------
-
-/** Handles a chat message from a contact. */
+/** Handles a direct chat message from a contact. */
 async function receiveChatMessage(sender: string, id: string, text: string) {
+  const key = conversationKey("contact", sender);
   const message: ChatMessage = { id, sender, text, status: "delivered" };
 
-  if (!messages.value[sender]) {
-    messages.value[sender] = [];
+  if (!messages.value[key]) {
+    messages.value[key] = [];
   }
-  messages.value[sender].push(message);
+  messages.value[key].push(message);
 
   await invoke("save_chat_message", {
     id,
@@ -360,18 +592,18 @@ async function receiveChatMessage(sender: string, id: string, text: string) {
   });
 
   // If their conversation is already on screen, it's read the moment it lands.
-  if (selectedPeerId.value === sender) {
+  if (selection.value?.kind === "contact" && selection.value.id === sender) {
     sendReadReceipt(sender, [id]);
     message.status = "read";
     markMessageRead(id);
   } else {
-    unreadStatus.value[sender] = true;
+    unread.value[key] = true;
   }
 }
 
 /** Handles the other side telling us they read our messages. */
 function receiveReadReceipt(sender: string, messageIds: string[]) {
-  const conversation = messages.value[sender];
+  const conversation = messages.value[conversationKey("contact", sender)];
   if (!conversation) {
     return;
   }
@@ -384,12 +616,129 @@ function receiveReadReceipt(sender: string, messageIds: string[]) {
   }
 }
 
+// --- Removal --------------------------------------------------------------
+
+/** "1 message" / "4 messages", so the dialog and toast read as sentences. */
+function describeMessageCount(count: number): string {
+  return count === 1 ? "1 message" : `${count} messages`;
+}
+
+/**
+ * Step one of removing a contact or leaving a group: look up what would be lost
+ * and open the confirmation. Nothing is deleted here.
+ */
+async function requestRemoval(kind: ConversationKind, id: string, name: string) {
+  const command = kind === "contact" ? "count_chat_messages" : "count_group_messages";
+  const args = kind === "contact" ? { peerId: id } : { groupId: id };
+
+  let messageCount = -1;
+  try {
+    messageCount = await invoke<number>(command, args);
+  } catch (error) {
+    // Worth continuing without the count: the user can still make the decision,
+    // and the warning covers the history either way.
+    console.error("Could not count stored messages", error);
+  }
+
+  pendingRemoval.value = { kind, id, name, messageCount };
+}
+
+/** Step two: the user confirmed, so delete. */
+async function confirmRemoval() {
+  const pending = pendingRemoval.value;
+  if (!pending) {
+    return;
+  }
+
+  pendingRemoval.value = null;
+
+  try {
+    let deleted: number;
+
+    if (pending.kind === "contact") {
+      deleted = await invoke<number>("delete_contact", { peerId: pending.id });
+      await loadContacts();
+    } else {
+      // Stop listening before forgetting the group, or messages would keep
+      // arriving for a conversation we no longer have.
+      await invoke("unsubscribe_group", { groupId: pending.id });
+      deleted = await invoke<number>("delete_group", { groupId: pending.id });
+      await loadGroups();
+    }
+
+    // Drop the local copies too, or the conversation would linger on screen
+    // until the next restart.
+    const key = conversationKey(pending.kind, pending.id);
+    delete messages.value[key];
+    delete unread.value[key];
+
+    if (selection.value?.kind === pending.kind && selection.value.id === pending.id) {
+      selection.value = null;
+    }
+
+    const action = pending.kind === "contact" ? "Removed" : "Left";
+    notify(
+      `${action} ${pending.name} and deleted ${describeMessageCount(deleted)}.`,
+      "info",
+    );
+  } catch (error) {
+    notify(`Could not remove ${pending.name}: ${error}`);
+  }
+}
+
+const removalTitle = computed(() =>
+  pendingRemoval.value?.kind === "group" ? "Leave this group?" : "Remove this contact?",
+);
+
+const removalConfirmLabel = computed(() =>
+  pendingRemoval.value?.kind === "group"
+    ? "Leave and delete history"
+    : "Remove and delete history",
+);
+
+const removalMessage = computed(() => {
+  const pending = pendingRemoval.value;
+  if (!pending) {
+    return "";
+  }
+
+  if (pending.kind === "group") {
+    return `You'll stop receiving messages from ${pending.name}. The other members carry on without you, and you can be invited back.`;
+  }
+
+  return `${pending.name} will be removed from your contacts, and messages from them will be silently dropped until you add them again.`;
+});
+
+/**
+ * The consequence spelled out for the confirmation dialog.
+ *
+ * A count of -1 means the lookup failed; the warning still has to be clear that
+ * history goes away.
+ */
+const removalWarning = computed(() => {
+  const pending = pendingRemoval.value;
+  if (!pending) {
+    return "";
+  }
+
+  if (pending.messageCount < 0) {
+    return "Your entire chat history with this conversation will be permanently deleted. This cannot be undone.";
+  }
+
+  if (pending.messageCount === 0) {
+    return "There is no chat history here yet, so nothing else will be lost.";
+  }
+
+  return `${describeMessageCount(pending.messageCount)} will be permanently deleted along with it. This cannot be undone.`;
+});
+
 // --- Startup --------------------------------------------------------------
 
 onMounted(async () => {
   nodeInstance.value = await invoke<string>("get_node_id");
   await loadIdentity();
   await loadContacts();
+  await loadGroups();
 
   // Catch up on peers discovered before this window started listening.
   try {
@@ -410,13 +759,8 @@ onMounted(async () => {
   await listen<{ sender: string; message: string }>("chat-received", async (event) => {
     const { sender, message } = event.payload;
 
-    // The backend passes the payload through untouched, so anything malformed
-    // gets dropped here rather than breaking the listener.
-    let data: { type?: string; id?: string; text?: string; messageIds?: string[] };
-    try {
-      data = JSON.parse(message);
-    } catch {
-      console.error("Ignoring an unreadable payload from", sender);
+    const data = parsePayload(message, sender);
+    if (!data) {
       return;
     }
 
@@ -424,9 +768,63 @@ onMounted(async () => {
       await receiveChatMessage(sender, data.id, data.text);
     } else if (data.type === "read" && Array.isArray(data.messageIds)) {
       receiveReadReceipt(sender, data.messageIds);
+    } else if (
+      data.type === "group-invite" &&
+      data.groupId &&
+      data.groupName &&
+      Array.isArray(data.members)
+    ) {
+      await receiveInvite(sender, data.groupId, data.groupName, data.members);
     }
   });
+
+  await listen<{ group_id: string; sender: string; message: string }>(
+    "group-message-received",
+    async (event) => {
+      const { group_id: groupId, sender, message } = event.payload;
+
+      const data = parsePayload(message, sender);
+      if (!data || data.type !== "group-chat" || !data.id || typeof data.text !== "string") {
+        return;
+      }
+
+      await receiveGroupMessage(
+        groupId,
+        sender,
+        data.id,
+        data.text,
+        data.groupName,
+        data.members,
+      );
+    },
+  );
 });
+
+/**
+ * Reads a payload off the network.
+ *
+ * The backend passes payloads through untouched, so anything malformed is
+ * dropped here rather than breaking the listener.
+ */
+function parsePayload(
+  message: string,
+  sender: string,
+): {
+  type?: string;
+  id?: string;
+  text?: string;
+  messageIds?: string[];
+  groupId?: string;
+  groupName?: string;
+  members?: string[];
+} | null {
+  try {
+    return JSON.parse(message);
+  } catch {
+    console.error("Ignoring an unreadable payload from", sender);
+    return null;
+  }
+}
 </script>
 
 <template>
@@ -438,11 +836,21 @@ onMounted(async () => {
         class="fill"
         :contacts="savedContacts"
         :online-peers="activePeers"
-        :unread="unreadStatus"
-        :selected-peer-id="selectedPeerId"
+        :unread="contactUnread"
+        :selected-peer-id="selectedContact?.peer_id ?? null"
         @select="selectContact"
         @rename="renameContact"
-        @remove="requestRemoval"
+        @remove="(contact) => requestRemoval('contact', contact.peer_id, contact.nickname)"
+      />
+
+      <GroupList
+        :groups="groups"
+        :unread="groupUnread"
+        :selected-group-id="selectedGroup?.id ?? null"
+        :can-create="savedContacts.length > 0"
+        @select="selectGroup"
+        @create="creatingGroup = true"
+        @leave="(group) => requestRemoval('group', group.id, group.name)"
       />
 
       <PeerList :peers="unregisteredPeers" @add="addContact" />
@@ -460,12 +868,25 @@ onMounted(async () => {
     <main class="content">
       <ChatPane
         v-if="selectedContact"
-        :key="selectedContact.peer_id"
-        :contact="selectedContact"
-        :messages="currentMessages"
+        :key="`contact:${selectedContact.peer_id}`"
+        :title="selectedContact.nickname"
+        :subtitle="shortPeerId(selectedContact.peer_id)"
         :online="selectedIsOnline"
+        :messages="currentMessages"
         :my-peer-id="myPeerId"
         @send="sendMessage"
+      />
+
+      <ChatPane
+        v-else-if="selectedGroup"
+        :key="`group:${selectedGroup.id}`"
+        :title="selectedGroup.name"
+        :subtitle="`${selectedGroup.members.length} members`"
+        :online="null"
+        :messages="currentMessages"
+        :my-peer-id="myPeerId"
+        :sender-labels="groupSenderLabels"
+        @send="sendGroupMessage"
       />
 
       <div v-else class="placeholder">
@@ -482,17 +903,25 @@ onMounted(async () => {
 
         <p class="placeholder-title">No conversation open</p>
         <p class="placeholder-hint">
-          Pick a contact, or add a discovered peer to start talking to them.
+          Pick a contact or a group, or add a discovered peer to start talking to
+          them.
         </p>
       </div>
     </main>
 
+    <NewGroupDialog
+      v-if="creatingGroup"
+      :contacts="savedContacts"
+      @create="createGroup"
+      @cancel="creatingGroup = false"
+    />
+
     <ConfirmDialog
       v-if="pendingRemoval"
-      title="Remove this contact?"
-      :message="`${pendingRemoval.contact.nickname} will be removed from your contacts, and messages from them will be silently dropped until you add them again.`"
+      :title="removalTitle"
+      :message="removalMessage"
       :warning="removalWarning"
-      confirm-label="Remove and delete history"
+      :confirm-label="removalConfirmLabel"
       @confirm="confirmRemoval"
       @cancel="pendingRemoval = null"
     />
@@ -528,7 +957,7 @@ onMounted(async () => {
 }
 
 /* Applied to ContactList's root: it takes the leftover height and scrolls,
-   which keeps the discovered list and node badge pinned to the bottom. */
+   which keeps the sections below it pinned to the bottom. */
 .fill {
   flex: 1;
   min-height: 0;
@@ -606,6 +1035,7 @@ onMounted(async () => {
   top: 12px;
   left: 50%;
   transform: translateX(-50%);
+  z-index: 20;
   max-width: min(90vw, 520px);
   padding: 8px 8px 8px 14px;
   border: 1px solid var(--border-strong);

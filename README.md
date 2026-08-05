@@ -13,6 +13,7 @@ A decentralized, peer-to-peer communication application built with a web fronten
 * **Local Peer Discovery:** Automatically discovers and connects to other active nodes on the local network using the mDNS protocol.
 * **Persistent Storage & Address Book:** Uses local SQLite databases to save recognized contacts, custom nicknames, and chat history natively to the host OS. Contacts can be renamed, or removed along with their chat history in a single transaction (with a confirmation warning, since there is no undo).
 * **Spam-Resistant Direct Messaging:** Secure 1-to-1 chat using the `libp2p-request-response` protocol. The backend performs a database lookup to silently drop inbound messages from non-contacts.
+* **Group Messaging:** Multi-party chat over `libp2p-gossipsub`, one topic per group. Messages relay through intermediate peers, so members don't need to be directly connected. Gossipsub signs every message, so the same contact-based spam filter applies to the peer who actually wrote it rather than whoever relayed it. Groups are created by inviting contacts over the direct channel — gossipsub only delivers to peers already subscribed, so an invite is what bootstraps membership; the member list then rides along with each message to keep everyone in step. Group messages report sent or failed, but not read: gossipsub can tell us a message reached the mesh, not who saw it.
 * **Rich Chat UI:** Features real-time online/offline status indicators and Telegram-style read receipts (Sending / Delivered / Read) driven by hidden JSON network payloads and SVGs.
 * **Asynchronous IPC Bridge:** Utilizes Tokio `mpsc` channels and Tauri State to seamlessly pass network events between the background Rust network loop and the reactive Vue frontend without race conditions.
 
@@ -74,7 +75,7 @@ The UI includes an Instance indicator in the bottom right corner to help keep tr
 
 * `/src`: Contains the Vue frontend code.
   * `/src/App.vue`: Application shell. Owns all state and every call into the Rust backend.
-  * `/src/components/`: Presentational components — `IdentityBar`, `ContactList`, `PeerList`, `ChatPane`, `MessageBubble`, `ThemeToggle`.
+  * `/src/components/`: Presentational components — `IdentityBar`, `ContactList`, `GroupList`, `PeerList`, `ChatPane`, `MessageBubble`, `ThemeToggle`, `ConfirmDialog`, `NewGroupDialog`.
   * `/src/styles.css`: Theme tokens (light and dark) and base styles. Every color in the app comes from here.
   * `/src/theme.ts`: Resolves the light/dark choice and applies it as `<html data-theme>`. Persists to `localStorage`.
   * `/src/types.ts`: Types shared between `App.vue` and its components.

@@ -1,23 +1,37 @@
 <script setup lang="ts">
 /**
- * The conversation with the selected contact: header, scrolling history, and
- * the composer.
+ * The open conversation: header, scrolling history, and the composer.
+ *
+ * Serves both direct chats and groups. What differs between them is passed in
+ * — presence only applies to a person, and sender labels only to a group — so
+ * the history, composer, and scrolling behavior are written once.
  *
  * Sending is reported upward. All this component owns is the draft text and
  * keeping the history scrolled to the newest message.
  */
 import { nextTick, ref, watch } from "vue";
 import MessageBubble from "./MessageBubble.vue";
-import type { ChatMessage, Contact } from "../types";
-import { shortPeerId } from "../types";
+import type { ChatMessage } from "../types";
 
 const props = defineProps<{
-  contact: Contact;
+  /** Contact nickname, or group name. */
+  title: string;
+  /** Shortened peer ID, or the member count. */
+  subtitle: string;
   messages: ChatMessage[];
-  /** True when mDNS can currently see this contact. */
-  online: boolean;
   /** Our own peer ID, used to tell our messages from theirs. */
   myPeerId: string;
+  /**
+   * Whether the other side is reachable, or null in a group, where presence of
+   * one member says nothing useful about the conversation.
+   */
+  online?: boolean | null;
+  /**
+   * Peer ID to display name, used to attribute incoming messages in a group.
+   * Absent in direct chats, where every incoming message is from the same
+   * person named in the header.
+   */
+  senderLabels?: Record<string, string>;
 }>();
 
 const emit = defineEmits<{
@@ -42,7 +56,7 @@ function send() {
  * conversation changes, which is what makes the newest message the one you see.
  */
 watch(
-  () => [props.contact.peer_id, props.messages.length],
+  () => [props.title, props.messages.length],
   async () => {
     await nextTick();
     if (history.value) {
@@ -57,13 +71,11 @@ watch(
   <section class="chat">
     <header class="header">
       <div class="who">
-        <h2 class="nickname">{{ contact.nickname }}</h2>
-        <code class="peer-id" :title="contact.peer_id">
-          {{ shortPeerId(contact.peer_id) }}
-        </code>
+        <h2 class="nickname">{{ title }}</h2>
+        <code class="peer-id">{{ subtitle }}</code>
       </div>
 
-      <span class="presence" :class="{ online }">
+      <span v-if="online !== null && online !== undefined" class="presence" :class="{ online }">
         <span class="status-dot" />
         {{ online ? "Online" : "Offline" }}
       </span>
@@ -79,6 +91,7 @@ watch(
         :key="message.id"
         :message="message"
         :outgoing="message.sender === myPeerId"
+        :sender-label="senderLabels?.[message.sender]"
       />
     </div>
 

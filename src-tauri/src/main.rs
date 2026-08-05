@@ -15,6 +15,7 @@
 //! network task sends news back to the frontend as Tauri events.
 
 use futures::stream::StreamExt;
+use libp2p::gossipsub;
 use libp2p::identity::Keypair;
 use libp2p::request_response::cbor;
 use libp2p::request_response::Config as RequestResponseConfig;
@@ -35,7 +36,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -48,6 +49,16 @@ const DEFAULT_NODE_ID: &str = "1";
 
 /// Name that both sides of a connection must agree on before they can chat.
 const CHAT_PROTOCOL: &str = "/chat/1.0.0";
+
+/// Prefix for the gossipsub topic a group's messages travel on.
+///
+/// The topic is this prefix plus the group's id, so knowing the id is what lets
+/// a node join the conversation.
+const GROUP_TOPIC_PREFIX: &str = "/group/1.0.0/";
+
+/// How often gossipsub maintains its mesh. The default is one second, which is
+/// more upkeep than a handful of nodes on a LAN needs.
+const GOSSIPSUB_HEARTBEAT: Duration = Duration::from_secs(10);
 
 /// Listen on every network interface, and let the OS pick the port.
 const LISTEN_ADDRESS: &str = "/ip4/0.0.0.0/tcp/0";
@@ -93,16 +104,33 @@ struct Contact {
     nickname: String,
 }
 
-/// One chat message. Rows in the `messages` table.
+/// A group conversation. Rows in the `groups` table, with members joined in.
 ///
-/// `peer_id` is the other side of the conversation no matter who sent the
-/// message, which is what lets us load a whole conversation with one query.
-/// `sender` is who actually wrote it. `status` is one of "sending",
-/// "delivered", or "read".
+/// Whoever creates a group decides who's in it. The member list travels with
+/// every message so the others stay in step without a separate sync protocol.
+#[derive(Serialize, Deserialize)]
+struct Group {
+    id: String,
+    name: String,
+    members: Vec<String>,
+}
+
+/// One chat message, direct or group. Rows in the `messages` table.
+///
+/// Exactly one of `peer_id` and `group_id` identifies the conversation. For a
+/// direct message `peer_id` is the other side (whoever sent it) and `group_id`
+/// is null; for a group message `group_id` is the group and `peer_id` is empty.
+/// `sender` is always who actually wrote it, which is what lets a group message
+/// be attributed.
+///
+/// `status` is one of "sending", "delivered", "read", or "failed". Group
+/// messages stop at "delivered": gossipsub tells us a message reached the mesh,
+/// not who read it.
 #[derive(Serialize, Deserialize)]
 struct ChatMessage {
     id: String,
     peer_id: String,
+    group_id: Option<String>,
     sender: String,
     text: String,
     status: String,
@@ -118,13 +146,48 @@ struct ChatPayload {
     message: String,
 }
 
+/// Emitted to the frontend as the `group-message-received` event.
+///
+/// Same shape as `ChatPayload` plus the group it belongs to. `sender` is taken
+/// from the message signature rather than the payload, so it can't be forged by
+/// whoever relayed it.
+#[derive(Clone, Serialize)]
+struct GroupPayload {
+    group_id: String,
+    sender: String,
+    message: String,
+}
+
 // ---------------------------------------------------------------------------
 // Network plumbing
 // ---------------------------------------------------------------------------
 
 /// Work the frontend asks the background network task to do.
+///
+/// Everything here needs the swarm, which only the network task can touch.
 enum NetworkCommand {
-    SendMessage { peer_id: String, message: String },
+    SendMessage {
+        peer_id: String,
+        message: String,
+    },
+    /// Start receiving a group's messages. Gossipsub only delivers to
+    /// subscribers, so this has to happen before anything arrives.
+    SubscribeToGroup {
+        group_id: String,
+    },
+    /// Stop receiving a group's messages, on leaving it.
+    UnsubscribeFromGroup {
+        group_id: String,
+    },
+    /// Publish to a group.
+    ///
+    /// Unlike a direct message this reports back, because gossipsub refuses to
+    /// publish when nobody is subscribed and the sender needs to know.
+    PublishToGroup {
+        group_id: String,
+        message: String,
+        result_tx: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// Shared state that Tauri hands to commands that ask for it.
@@ -152,8 +215,25 @@ struct ChatResponse();
 struct AppBehaviour {
     /// Finds other nodes on the same local network.
     mdns: mdns::tokio::Behaviour,
-    /// Sends and receives chat messages.
+    /// Sends and receives direct chat messages, and group invites.
     chat: cbor::Behaviour<ChatRequest, ChatResponse>,
+    /// Carries group messages, one topic per group.
+    ///
+    /// Unlike `chat`, this reaches members we have no direct connection to:
+    /// peers in the middle relay what they receive.
+    groups: gossipsub::Behaviour,
+}
+
+/// The gossipsub topic a group's messages travel on.
+fn group_topic(group_id: &str) -> gossipsub::IdentTopic {
+    gossipsub::IdentTopic::new(format!("{}{}", GROUP_TOPIC_PREFIX, group_id))
+}
+
+/// Recovers a group id from the topic a message arrived on.
+///
+/// Returns None for any topic that isn't one of ours.
+fn group_id_from_topic(topic: &str) -> Option<&str> {
+    topic.strip_prefix(GROUP_TOPIC_PREFIX)
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +298,7 @@ fn create_tables(conn: &Connection) -> SqlResult<()> {
         "CREATE TABLE IF NOT EXISTS messages (
             id        TEXT PRIMARY KEY,
             peer_id   TEXT NOT NULL,
+            group_id  TEXT,
             sender    TEXT NOT NULL,
             text      TEXT NOT NULL,
             status    TEXT NOT NULL,
@@ -225,6 +306,55 @@ fn create_tables(conn: &Connection) -> SqlResult<()> {
         )",
         (),
     )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS groups (
+            id         TEXT PRIMARY KEY,
+            name       TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )",
+        (),
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS group_members (
+            group_id TEXT NOT NULL,
+            peer_id  TEXT NOT NULL,
+            PRIMARY KEY (group_id, peer_id)
+        )",
+        (),
+    )?;
+
+    add_missing_columns(conn)?;
+
+    Ok(())
+}
+
+/// Brings a database created by an older version of the app up to date.
+///
+/// `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so
+/// a column added later has to be applied by hand to databases already on disk.
+/// Checked rather than attempted-and-ignored, because SQLite gives no way to say
+/// "add this column only if it's missing".
+fn add_missing_columns(conn: &Connection) -> SqlResult<()> {
+    let has_group_id = {
+        let mut statement = conn.prepare("PRAGMA table_info(messages)")?;
+
+        // Column 1 of table_info is the column name.
+        let names = statement.query_map([], |row| row.get::<_, String>(1))?;
+
+        let mut found = false;
+        for name in names {
+            if name? == "group_id" {
+                found = true;
+            }
+        }
+        found
+    };
+
+    if !has_group_id {
+        conn.execute("ALTER TABLE messages ADD COLUMN group_id TEXT", ())?;
+    }
 
     Ok(())
 }
@@ -308,7 +438,10 @@ fn delete_contact(app: AppHandle, peer_id: String) -> Result<usize, String> {
     let transaction = conn.transaction().map_err(|e| e.to_string())?;
 
     let deleted_messages = transaction
-        .execute("DELETE FROM messages WHERE peer_id = ?1", [&peer_id])
+        .execute(
+            "DELETE FROM messages WHERE peer_id = ?1 AND group_id IS NULL",
+            [&peer_id],
+        )
         .map_err(|e| e.to_string())?;
 
     transaction
@@ -332,7 +465,7 @@ fn count_chat_messages(app: AppHandle, peer_id: String) -> Result<usize, String>
     // widened to usize for the frontend.
     let count: i64 = conn
         .query_row(
-            "SELECT COUNT(1) FROM messages WHERE peer_id = ?1",
+            "SELECT COUNT(1) FROM messages WHERE peer_id = ?1 AND group_id IS NULL",
             [&peer_id],
             |row| row.get(0),
         )
@@ -415,32 +548,221 @@ fn get_chat_history(app: AppHandle, peer_id: String) -> Result<Vec<ChatMessage>,
 
     let mut statement = conn
         .prepare(
-            "SELECT id, peer_id, sender, text, status
+            "SELECT id, peer_id, group_id, sender, text, status
              FROM messages
-             WHERE peer_id = ?1
+             WHERE peer_id = ?1 AND group_id IS NULL
              ORDER BY timestamp ASC",
         )
         .map_err(|e| e.to_string())?;
 
     let rows = statement
-        .query_map([&peer_id], |row| {
-            Ok(ChatMessage {
-                id: row.get(0)?,
-                peer_id: row.get(1)?,
-                sender: row.get(2)?,
-                text: row.get(3)?,
-                status: row.get(4)?,
-            })
-        })
+        .query_map([&peer_id], read_chat_message)
         .map_err(|e| e.to_string())?;
 
+    collect_chat_messages(rows)
+}
+
+/// Builds a `ChatMessage` from a row selecting the columns in the order used by
+/// `get_chat_history` and `get_group_history`.
+fn read_chat_message(row: &rusqlite::Row) -> SqlResult<ChatMessage> {
+    Ok(ChatMessage {
+        id: row.get(0)?,
+        peer_id: row.get(1)?,
+        group_id: row.get(2)?,
+        sender: row.get(3)?,
+        text: row.get(4)?,
+        status: row.get(5)?,
+    })
+}
+
+/// Drains a query into a Vec, turning any row error into a message for the
+/// frontend.
+fn collect_chat_messages<I>(rows: I) -> Result<Vec<ChatMessage>, String>
+where
+    I: Iterator<Item = SqlResult<ChatMessage>>,
+{
     let mut messages = Vec::new();
+
     for row in rows {
         let message = row.map_err(|e| e.to_string())?;
         messages.push(message);
     }
 
     Ok(messages)
+}
+
+// ---------------------------------------------------------------------------
+// Tauri commands: groups
+// ---------------------------------------------------------------------------
+
+/// Creates a group, or updates one we already know about.
+///
+/// Called both when the user makes a group and when we learn about one from an
+/// invite or a message, so the member list is replaced wholesale rather than
+/// merged: whoever created the group decides who's in it.
+#[tauri::command]
+fn save_group(
+    app: AppHandle,
+    id: String,
+    name: String,
+    members: Vec<String>,
+) -> Result<(), String> {
+    let mut conn = get_db_connection(&app).map_err(|e| e.to_string())?;
+    let transaction = conn.transaction().map_err(|e| e.to_string())?;
+
+    transaction
+        .execute(
+            "INSERT OR REPLACE INTO groups (id, name) VALUES (?1, ?2)",
+            (&id, &name),
+        )
+        .map_err(|e| e.to_string())?;
+
+    transaction
+        .execute("DELETE FROM group_members WHERE group_id = ?1", [&id])
+        .map_err(|e| e.to_string())?;
+
+    for member in &members {
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO group_members (group_id, peer_id) VALUES (?1, ?2)",
+                (&id, member),
+            )
+            .map_err(|e| e.to_string())?;
+    }
+
+    transaction.commit().map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Returns every group we're in, members included.
+#[tauri::command]
+fn get_groups(app: AppHandle) -> Result<Vec<Group>, String> {
+    let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
+
+    let mut group_statement = conn
+        .prepare("SELECT id, name FROM groups ORDER BY created_at ASC")
+        .map_err(|e| e.to_string())?;
+
+    let rows = group_statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut groups = Vec::new();
+    for row in rows {
+        let (id, name) = row.map_err(|e| e.to_string())?;
+        let members = get_group_members(&conn, &id).map_err(|e| e.to_string())?;
+
+        groups.push(Group { id, name, members });
+    }
+
+    Ok(groups)
+}
+
+/// Returns the peer IDs in one group.
+fn get_group_members(conn: &Connection, group_id: &str) -> SqlResult<Vec<String>> {
+    let mut statement = conn.prepare("SELECT peer_id FROM group_members WHERE group_id = ?1")?;
+
+    let rows = statement.query_map([group_id], |row| row.get::<_, String>(0))?;
+
+    let mut members = Vec::new();
+    for row in rows {
+        members.push(row?);
+    }
+
+    Ok(members)
+}
+
+/// Leaves a group: forgets it, its members, and the whole conversation.
+///
+/// Returns how many messages were deleted. Local only — the other members keep
+/// talking, they just stop hearing from us. Unsubscribing from the topic is the
+/// frontend's job, since that needs the network task.
+#[tauri::command]
+fn delete_group(app: AppHandle, group_id: String) -> Result<usize, String> {
+    let mut conn = get_db_connection(&app).map_err(|e| e.to_string())?;
+    let transaction = conn.transaction().map_err(|e| e.to_string())?;
+
+    let deleted_messages = transaction
+        .execute("DELETE FROM messages WHERE group_id = ?1", [&group_id])
+        .map_err(|e| e.to_string())?;
+
+    transaction
+        .execute("DELETE FROM group_members WHERE group_id = ?1", [&group_id])
+        .map_err(|e| e.to_string())?;
+
+    transaction
+        .execute("DELETE FROM groups WHERE id = ?1", [&group_id])
+        .map_err(|e| e.to_string())?;
+
+    transaction.commit().map_err(|e| e.to_string())?;
+
+    Ok(deleted_messages)
+}
+
+/// Returns how many messages are stored for one group.
+#[tauri::command]
+fn count_group_messages(app: AppHandle, group_id: String) -> Result<usize, String> {
+    let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
+
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(1) FROM messages WHERE group_id = ?1",
+            [&group_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+
+    Ok(count.max(0) as usize)
+}
+
+/// Writes a group message to the database.
+///
+/// `peer_id` is stored empty: for a group the conversation is identified by
+/// `group_id`, and leaving `peer_id` blank keeps these rows out of every direct
+/// conversation's history.
+#[tauri::command]
+fn save_group_message(
+    app: AppHandle,
+    id: String,
+    group_id: String,
+    sender: String,
+    text: String,
+    status: String,
+) -> Result<(), String> {
+    let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "INSERT OR REPLACE INTO messages (id, peer_id, group_id, sender, text, status)
+         VALUES (?1, '', ?2, ?3, ?4, ?5)",
+        (&id, &group_id, &sender, &text, &status),
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Returns one group conversation, oldest message first.
+#[tauri::command]
+fn get_group_history(app: AppHandle, group_id: String) -> Result<Vec<ChatMessage>, String> {
+    let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
+
+    let mut statement = conn
+        .prepare(
+            "SELECT id, peer_id, group_id, sender, text, status
+             FROM messages
+             WHERE group_id = ?1
+             ORDER BY timestamp ASC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let rows = statement
+        .query_map([&group_id], read_chat_message)
+        .map_err(|e| e.to_string())?;
+
+    collect_chat_messages(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -468,17 +790,81 @@ async fn send_message(
     peer_id: String,
     message: String,
 ) -> Result<(), String> {
-    // Clone the sender and drop the lock right away. Holding a std::sync::Mutex
-    // across the await below would block the async runtime.
-    let network_tx = {
-        let guard = state.network_tx.lock().map_err(|e| e.to_string())?;
-        guard.clone()
-    };
+    let network_tx = network_sender(&state)?;
 
     let command = NetworkCommand::SendMessage { peer_id, message };
     network_tx.send(command).await.map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+/// Takes a copy of the channel into the network task.
+///
+/// Kept separate so the lock is released before any await: holding a
+/// `std::sync::Mutex` across one would block the async runtime.
+fn network_sender(state: &State<'_, NetworkState>) -> Result<mpsc::Sender<NetworkCommand>, String> {
+    let guard = state.network_tx.lock().map_err(|e| e.to_string())?;
+
+    Ok(guard.clone())
+}
+
+/// Starts receiving a group's messages.
+///
+/// Must be called for every group we're in, on startup and whenever one is
+/// created or joined. Gossipsub delivers only to subscribers, so a group we
+/// aren't subscribed to is one we simply never hear from.
+#[tauri::command]
+async fn subscribe_group(state: State<'_, NetworkState>, group_id: String) -> Result<(), String> {
+    let network_tx = network_sender(&state)?;
+
+    network_tx
+        .send(NetworkCommand::SubscribeToGroup { group_id })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Stops receiving a group's messages, on leaving it.
+#[tauri::command]
+async fn unsubscribe_group(state: State<'_, NetworkState>, group_id: String) -> Result<(), String> {
+    let network_tx = network_sender(&state)?;
+
+    network_tx
+        .send(NetworkCommand::UnsubscribeFromGroup { group_id })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Publishes a message to a group and waits to hear whether it went out.
+///
+/// Unlike `send_message` this reports real failures. The common one is
+/// `InsufficientPeers`, which means nobody else is currently subscribed — the
+/// group equivalent of shouting into an empty room, and worth telling the user
+/// about rather than showing the message as sent.
+#[tauri::command]
+async fn send_group_message(
+    state: State<'_, NetworkState>,
+    group_id: String,
+    message: String,
+) -> Result<(), String> {
+    let network_tx = network_sender(&state)?;
+    let (result_tx, result_rx) = oneshot::channel();
+
+    network_tx
+        .send(NetworkCommand::PublishToGroup {
+            group_id,
+            message,
+            result_tx,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    result_rx
+        .await
+        .map_err(|_| "the network task stopped before it could answer".to_string())?
 }
 
 // ---------------------------------------------------------------------------
@@ -517,7 +903,26 @@ fn build_swarm(keypair: Keypair) -> Swarm<AppBehaviour> {
             let mdns = mdns::tokio::Behaviour::new(mdns_config, key.public().to_peer_id())
                 .expect("failed to start mDNS discovery");
 
-            AppBehaviour { mdns, chat }
+            let gossipsub_config = gossipsub::ConfigBuilder::default()
+                .heartbeat_interval(GOSSIPSUB_HEARTBEAT)
+                // Refuse messages that aren't signed, so the sender on an
+                // inbound group message is the peer who actually wrote it and
+                // not whoever passed it along.
+                .validation_mode(gossipsub::ValidationMode::Strict)
+                .build()
+                .expect("invalid gossipsub configuration");
+
+            let groups = gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Signed(key.clone()),
+                gossipsub_config,
+            )
+            .expect("failed to start gossipsub");
+
+            AppBehaviour {
+                mdns,
+                chat,
+                groups,
+            }
         })
         .expect("failed to configure the network behaviours")
         .with_swarm_config(|config| {
@@ -537,10 +942,16 @@ fn emit_to_frontend<P: Serialize + Clone>(app: &AppHandle, event: &str, payload:
 }
 
 /// Records newly discovered peers and tells the frontend about them.
-fn handle_peers_discovered(app: &AppHandle, peers: Vec<PeerId>) {
+///
+/// Discovered peers are also handed to gossipsub, which is what builds the mesh
+/// that group messages travel over. Gossipsub never goes looking for peers
+/// itself; it only uses connections it's told about.
+fn handle_peers_discovered(app: &AppHandle, swarm: &mut Swarm<AppBehaviour>, peers: Vec<PeerId>) {
     let state = app.state::<NetworkState>();
 
     for peer_id in peers {
+        swarm.behaviour_mut().groups.add_explicit_peer(&peer_id);
+
         let peer_id = peer_id.to_string();
 
         match state.active_peers.lock() {
@@ -555,10 +966,12 @@ fn handle_peers_discovered(app: &AppHandle, peers: Vec<PeerId>) {
 }
 
 /// Forgets peers we haven't heard from and tells the frontend they went away.
-fn handle_peers_expired(app: &AppHandle, peers: Vec<PeerId>) {
+fn handle_peers_expired(app: &AppHandle, swarm: &mut Swarm<AppBehaviour>, peers: Vec<PeerId>) {
     let state = app.state::<NetworkState>();
 
     for peer_id in peers {
+        swarm.behaviour_mut().groups.remove_explicit_peer(&peer_id);
+
         let peer_id = peer_id.to_string();
 
         match state.active_peers.lock() {
@@ -569,6 +982,66 @@ fn handle_peers_expired(app: &AppHandle, peers: Vec<PeerId>) {
         }
 
         emit_to_frontend(app, "peer-lost", peer_id);
+    }
+}
+
+/// Handles one inbound group message.
+///
+/// Held to the same rule as direct messages: if the author isn't a contact, it
+/// goes no further. Gossipsub will still relay it onward to other members, which
+/// is what keeps the mesh working for people who do know them.
+fn handle_group_message(app: &AppHandle, message: gossipsub::Message) {
+    // Strict validation guarantees a signature, so this is the peer who wrote
+    // the message rather than whoever forwarded it.
+    let Some(sender) = message.source else {
+        return;
+    };
+
+    let sender_id = sender.to_string();
+    if !is_contact(app, &sender_id) {
+        return;
+    }
+
+    let Some(group_id) = group_id_from_topic(message.topic.as_str()) else {
+        return;
+    };
+
+    let payload = match String::from_utf8(message.data) {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("ignoring a group message that isn't text: {}", error);
+            return;
+        }
+    };
+
+    emit_to_frontend(
+        app,
+        "group-message-received",
+        GroupPayload {
+            group_id: group_id.to_string(),
+            sender: sender_id,
+            message: payload,
+        },
+    );
+}
+
+/// Subscribes to every group already in the database.
+///
+/// Runs once at startup: without it, a restart would leave us in groups we no
+/// longer hear anything from.
+fn subscribe_to_saved_groups(app: &AppHandle, swarm: &mut Swarm<AppBehaviour>) {
+    let groups = match get_groups(app.clone()) {
+        Ok(groups) => groups,
+        Err(error) => {
+            eprintln!("could not load groups to subscribe to: {}", error);
+            return;
+        }
+    };
+
+    for group in groups {
+        if let Err(error) = swarm.behaviour_mut().groups.subscribe(&group_topic(&group.id)) {
+            eprintln!("could not subscribe to group '{}': {}", group.name, error);
+        }
     }
 }
 
@@ -623,12 +1096,19 @@ fn handle_swarm_event(
             // mDNS reports a (peer, address) pair per address; we only need the
             // peer, and the same peer can appear more than once.
             let peers = discovered.into_iter().map(|(peer_id, _address)| peer_id);
-            handle_peers_discovered(app, peers.collect());
+            handle_peers_discovered(app, swarm, peers.collect());
         }
 
         SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(mdns::Event::Expired(expired))) => {
             let peers = expired.into_iter().map(|(peer_id, _address)| peer_id);
-            handle_peers_expired(app, peers.collect());
+            handle_peers_expired(app, swarm, peers.collect());
+        }
+
+        SwarmEvent::Behaviour(AppBehaviourEvent::Groups(gossipsub::Event::Message {
+            message,
+            ..
+        })) => {
+            handle_group_message(app, message);
         }
 
         SwarmEvent::Behaviour(AppBehaviourEvent::Chat(RequestResponseEvent::Message {
@@ -667,6 +1147,35 @@ fn handle_network_command(swarm: &mut Swarm<AppBehaviour>, command: NetworkComma
                 .chat
                 .send_request(&peer_id, ChatRequest(message));
         }
+
+        NetworkCommand::SubscribeToGroup { group_id } => {
+            if let Err(error) = swarm.behaviour_mut().groups.subscribe(&group_topic(&group_id)) {
+                eprintln!("could not subscribe to group '{}': {}", group_id, error);
+            }
+        }
+
+        NetworkCommand::UnsubscribeFromGroup { group_id } => {
+            swarm
+                .behaviour_mut()
+                .groups
+                .unsubscribe(&group_topic(&group_id));
+        }
+
+        NetworkCommand::PublishToGroup {
+            group_id,
+            message,
+            result_tx,
+        } => {
+            let result = swarm
+                .behaviour_mut()
+                .groups
+                .publish(group_topic(&group_id), message.into_bytes())
+                .map(|_message_id| ())
+                .map_err(|error| error.to_string());
+
+            // The caller is gone if the window closed mid-send; nothing to do.
+            let _ = result_tx.send(result);
+        }
     }
 }
 
@@ -689,6 +1198,8 @@ async fn run_network(
     swarm
         .listen_on(listen_address)
         .expect("failed to start listening for connections");
+
+    subscribe_to_saved_groups(&app, &mut swarm);
 
     loop {
         tokio::select! {
@@ -755,9 +1266,19 @@ fn main() {
             update_message_status,
             get_chat_history,
             count_chat_messages,
+            // Groups
+            save_group,
+            get_groups,
+            delete_group,
+            count_group_messages,
+            save_group_message,
+            get_group_history,
             // Network
             get_active_peers,
             send_message,
+            subscribe_group,
+            unsubscribe_group,
+            send_group_message,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

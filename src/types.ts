@@ -7,13 +7,27 @@ export interface Contact {
 }
 
 /**
+ * A group conversation. Mirrors the `Group` struct in Rust.
+ *
+ * `members` includes us. Whoever created the group decides who's in it, and the
+ * list travels with every message so members stay in step.
+ */
+export interface Group {
+  id: string;
+  name: string;
+  members: string[];
+}
+
+/**
  * How far along an outgoing message is.
  *
  * - `sending`: handed to the network, not yet acknowledged.
- * - `delivered`: the other node accepted it.
+ * - `delivered`: the other node accepted it. For a group this means it reached
+ *   the mesh — gossipsub can't tell us who read it, so group messages stop here.
  * - `read`: the other node has the conversation open and saw it.
+ * - `failed`: it didn't go out. Nobody was listening, or the send errored.
  */
-export type MessageStatus = "sending" | "delivered" | "read";
+export type MessageStatus = "sending" | "delivered" | "read" | "failed";
 
 /** One message in a conversation. Mirrors the `ChatMessage` struct in Rust. */
 export interface ChatMessage {
