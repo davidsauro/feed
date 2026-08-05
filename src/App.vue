@@ -11,6 +11,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 import ChatPane from "./components/ChatPane.vue";
+import ConfirmDialog from "./components/ConfirmDialog.vue";
 import ContactList from "./components/ContactList.vue";
 import IdentityBar from "./components/IdentityBar.vue";
 import PeerList from "./components/PeerList.vue";
@@ -36,6 +37,12 @@ const selectedPeerId = ref<string | null>(null);
 /** A short-lived message shown over the UI. Replaces blocking alert() dialogs. */
 const notice = ref<{ text: string; kind: "error" | "info" } | null>(null);
 let noticeTimer = 0;
+
+/**
+ * The contact the user has asked to remove, held here while the confirmation
+ * dialog is open. Non-null is what makes the dialog visible.
+ */
+const pendingRemoval = ref<{ contact: Contact; messageCount: number } | null>(null);
 
 // --- Derived state --------------------------------------------------------
 
@@ -138,6 +145,90 @@ async function renameContact(peerId: string, nickname: string) {
     notify(`Could not rename contact: ${error}`);
   }
 }
+
+/**
+ * Step one of removing a contact: look up what would be lost and open the
+ * confirmation. Nothing is deleted here.
+ */
+async function requestRemoval(contact: Contact) {
+  let messageCount = 0;
+
+  try {
+    messageCount = await invoke<number>("count_chat_messages", {
+      peerId: contact.peer_id,
+    });
+  } catch (error) {
+    // Worth continuing without the count: the user can still make the decision,
+    // and the warning covers the history either way.
+    console.error("Could not count stored messages", error);
+    messageCount = -1;
+  }
+
+  pendingRemoval.value = { contact, messageCount };
+}
+
+/** Step two: the user confirmed, so remove the contact and their history. */
+async function confirmRemoval() {
+  const pending = pendingRemoval.value;
+  if (!pending) {
+    return;
+  }
+
+  const { contact } = pending;
+  pendingRemoval.value = null;
+
+  try {
+    const deleted = await invoke<number>("delete_contact", {
+      peerId: contact.peer_id,
+    });
+
+    // Drop the local copies too, or the conversation would linger on screen
+    // until the next restart.
+    delete messages.value[contact.peer_id];
+    delete unreadStatus.value[contact.peer_id];
+
+    if (selectedPeerId.value === contact.peer_id) {
+      selectedPeerId.value = null;
+    }
+
+    await loadContacts();
+
+    notify(
+      `Removed ${contact.nickname} and deleted ${describeMessageCount(deleted)}.`,
+      "info",
+    );
+  } catch (error) {
+    notify(`Could not remove ${contact.nickname}: ${error}`);
+  }
+}
+
+/** "1 message" / "4 messages", so the dialog and toast read as sentences. */
+function describeMessageCount(count: number): string {
+  return count === 1 ? "1 message" : `${count} messages`;
+}
+
+/**
+ * The consequence spelled out for the confirmation dialog.
+ *
+ * A count of -1 means the lookup failed; the warning still has to be clear that
+ * history goes away.
+ */
+const removalWarning = computed(() => {
+  const pending = pendingRemoval.value;
+  if (!pending) {
+    return "";
+  }
+
+  if (pending.messageCount < 0) {
+    return "Your entire chat history with this contact will be permanently deleted. This cannot be undone.";
+  }
+
+  if (pending.messageCount === 0) {
+    return "There is no chat history with this contact yet, so nothing else will be lost.";
+  }
+
+  return `${describeMessageCount(pending.messageCount)} will be permanently deleted along with them. This cannot be undone.`;
+});
 
 // --- Conversations --------------------------------------------------------
 
@@ -351,6 +442,7 @@ onMounted(async () => {
         :selected-peer-id="selectedPeerId"
         @select="selectContact"
         @rename="renameContact"
+        @remove="requestRemoval"
       />
 
       <PeerList :peers="unregisteredPeers" @add="addContact" />
@@ -395,7 +487,17 @@ onMounted(async () => {
       </div>
     </main>
 
-    <!-- Errors and confirmations, over the UI rather than in a modal dialog. -->
+    <ConfirmDialog
+      v-if="pendingRemoval"
+      title="Remove this contact?"
+      :message="`${pendingRemoval.contact.nickname} will be removed from your contacts, and messages from them will be silently dropped until you add them again.`"
+      :warning="removalWarning"
+      confirm-label="Remove and delete history"
+      @confirm="confirmRemoval"
+      @cancel="pendingRemoval = null"
+    />
+
+    <!-- Errors and one-line confirmations. Replaces the old alert() calls. -->
     <Transition name="notice">
       <div v-if="notice" class="notice" :class="notice.kind">
         <span>{{ notice.text }}</span>
