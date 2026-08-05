@@ -529,7 +529,21 @@ fn get_contacts(app: AppHandle) -> Result<Vec<Contact>, String> {
 // Tauri commands: chat history
 // ---------------------------------------------------------------------------
 
-/// Writes a message to the database, or overwrites it if the id already exists.
+/// Writes a message to the database, keeping what's already there on a clash.
+///
+/// `IGNORE` rather than `REPLACE` on purpose, and it matters. Message ids are
+/// chosen by whoever sent the message, and we hand our own ids to the other side
+/// in the payload so they can be acknowledged — so a contact knows the ids of
+/// messages we sent them. With `REPLACE` they could send a message reusing one of
+/// those ids and overwrite that row, rewriting our copy of the conversation:
+/// putting words in our mouth, or erasing something they said.
+///
+/// Nothing legitimate ever needs to overwrite a stored message. A message is
+/// written once, and later status changes go through `update_message_status`,
+/// which can only move a row we already have.
+///
+/// Returns whether the message was stored. False means one with that id is
+/// already on record, which the caller should treat as "not a new message".
 #[tauri::command]
 fn save_chat_message(
     app: AppHandle,
@@ -538,17 +552,18 @@ fn save_chat_message(
     sender: String,
     text: String,
     status: String,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
 
-    conn.execute(
-        "INSERT OR REPLACE INTO messages (id, peer_id, sender, text, status)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        (&id, &peer_id, &sender, &text, &status),
-    )
-    .map_err(|e| e.to_string())?;
+    let rows_written = conn
+        .execute(
+            "INSERT OR IGNORE INTO messages (id, peer_id, sender, text, status)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (&id, &peer_id, &sender, &text, &status),
+        )
+        .map_err(|e| e.to_string())?;
 
-    Ok(())
+    Ok(rows_written > 0)
 }
 
 /// Moves a message along to its next status: sending, delivered, or read.
@@ -742,11 +757,18 @@ fn count_group_messages(app: AppHandle, group_id: String) -> Result<usize, Strin
     Ok(count.max(0) as usize)
 }
 
-/// Writes a group message to the database.
+/// Writes a group message to the database, keeping what's already there on a
+/// clash — see `save_chat_message` for why that matters.
+///
+/// The reasoning applies with more force here: a group message passes through
+/// every member, so any of them sees the ids in it.
 ///
 /// `peer_id` is stored empty: for a group the conversation is identified by
 /// `group_id`, and leaving `peer_id` blank keeps these rows out of every direct
 /// conversation's history.
+///
+/// Returns whether the message was stored, the same as `save_chat_message`. This
+/// is also what makes gossipsub's duplicate deliveries harmless.
 #[tauri::command]
 fn save_group_message(
     app: AppHandle,
@@ -755,17 +777,18 @@ fn save_group_message(
     sender: String,
     text: String,
     status: String,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
 
-    conn.execute(
-        "INSERT OR REPLACE INTO messages (id, peer_id, group_id, sender, text, status)
-         VALUES (?1, '', ?2, ?3, ?4, ?5)",
-        (&id, &group_id, &sender, &text, &status),
-    )
-    .map_err(|e| e.to_string())?;
+    let rows_written = conn
+        .execute(
+            "INSERT OR IGNORE INTO messages (id, peer_id, group_id, sender, text, status)
+             VALUES (?1, '', ?2, ?3, ?4, ?5)",
+            (&id, &group_id, &sender, &text, &status),
+        )
+        .map_err(|e| e.to_string())?;
 
-    Ok(())
+    Ok(rows_written > 0)
 }
 
 /// Returns one group conversation, oldest message first.

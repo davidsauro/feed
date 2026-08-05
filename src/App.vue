@@ -412,25 +412,26 @@ async function receiveGroupMessage(
     }
   }
 
-  const key = conversationKey("group", groupId);
-  if (!messages.value[key]) {
-    messages.value[key] = [];
-  }
-
-  // Gossipsub can deliver the same message twice on a mesh with loops.
-  if (messages.value[key].some((message) => message.id === id)) {
-    return;
-  }
-
-  messages.value[key].push({ id, sender, text, status: "delivered" });
-
-  await invoke("save_group_message", {
+  // As with a direct message, the database decides whether this is new. Here it
+  // also absorbs the duplicate deliveries gossipsub produces on a mesh with
+  // loops, which are routine rather than suspicious.
+  const stored = await invoke<boolean>("save_group_message", {
     id,
     groupId,
     sender,
     text,
     status: "delivered",
   });
+
+  if (!stored) {
+    return;
+  }
+
+  const key = conversationKey("group", groupId);
+  if (!messages.value[key]) {
+    messages.value[key] = [];
+  }
+  messages.value[key].push({ id, sender, text, status: "delivered" });
 
   if (selection.value?.kind !== "group" || selection.value.id !== groupId) {
     unread.value[key] = true;
@@ -573,8 +574,31 @@ async function sendMessage(text: string) {
   }
 }
 
-/** Handles a direct chat message from a contact. */
+/**
+ * Handles a direct chat message from a contact.
+ *
+ * Storing it comes first, and whether the database accepted it decides whether
+ * it is shown. Ids are chosen by whoever sent the message, and a contact knows
+ * the ids of messages we sent them — we include them so they can be
+ * acknowledged — so a reused id is either a duplicate delivery or an attempt to
+ * talk over a message we already have. The stored one wins in both cases, and
+ * asking the database is what makes that true even for a conversation we
+ * haven't loaded.
+ */
 async function receiveChatMessage(sender: string, id: string, text: string) {
+  const stored = await invoke<boolean>("save_chat_message", {
+    id,
+    peerId: sender,
+    sender,
+    text,
+    status: "delivered",
+  });
+
+  if (!stored) {
+    console.warn(`Ignored a message from ${sender} reusing the id ${id}`);
+    return;
+  }
+
   const key = conversationKey("contact", sender);
   const message: ChatMessage = { id, sender, text, status: "delivered" };
 
@@ -582,14 +606,6 @@ async function receiveChatMessage(sender: string, id: string, text: string) {
     messages.value[key] = [];
   }
   messages.value[key].push(message);
-
-  await invoke("save_chat_message", {
-    id,
-    peerId: sender,
-    sender,
-    text,
-    status: "delivered",
-  });
 
   // If their conversation is already on screen, it's read the moment it lands.
   if (selection.value?.kind === "contact" && selection.value.id === sender) {
