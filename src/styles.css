@@ -1,0 +1,173 @@
+/*
+ * Theme tokens and base styles.
+ *
+ * Every color in the app comes from a custom property defined here, so the
+ * light and dark palettes are the only two places colors are chosen. Component
+ * styles reference the tokens and never hardcode a hex value.
+ *
+ * Which palette applies is decided by `<html data-theme="light|dark">`, which
+ * theme.ts sets. There is deliberately no `prefers-color-scheme` query here:
+ * under WSL2 it reports the GTK theme rather than the Windows one, so the choice
+ * is resolved in JavaScript where a manual override can win.
+ */
+
+:root {
+  /* Tells the browser to render form controls and scrollbars to match. */
+  color-scheme: light;
+
+  /* Surfaces, from the bottom of the stack up. */
+  --bg-sunken: #eef0f4;
+  --bg: #ffffff;
+  --bg-sidebar: #f7f8fa;
+  --bg-hover: rgba(16, 24, 40, 0.04);
+  --bg-active: rgba(47, 111, 237, 0.1);
+
+  --border: #e3e6eb;
+  --border-strong: #cdd3dc;
+
+  /* Text, from most to least prominent. */
+  --text: #1a1d21;
+  --text-muted: #5c6470;
+  --text-faint: #8a91a0;
+
+  --accent: #2f6fed;
+  --accent-hover: #2359c9;
+  --accent-contrast: #ffffff;
+
+  /* Chat bubbles. Outgoing keeps white text in both themes, so its background
+     has to stay dark enough to carry it. */
+  --bubble-out-bg: #2f6fed;
+  --bubble-out-text: #ffffff;
+  --bubble-in-bg: #eceef2;
+  --bubble-in-text: var(--text);
+
+  --online: #1fa855;
+  --offline: #b6bcc6;
+  --danger: #c8342f;
+  --danger-bg: #fdecec;
+
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-bubble: 14px;
+  --radius-pill: 999px;
+
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.06);
+
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg-sunken: #0f1216;
+  --bg: #14171c;
+  --bg-sidebar: #171b21;
+  --bg-hover: rgba(255, 255, 255, 0.05);
+  --bg-active: rgba(76, 141, 255, 0.14);
+
+  --border: #262b33;
+  --border-strong: #363d48;
+
+  --text: #e6e9ef;
+  --text-muted: #9aa3b2;
+  --text-faint: #6b7484;
+
+  --accent: #6ba0ff;
+  --accent-hover: #8ab5ff;
+  --accent-contrast: #0b0e12;
+
+  --bubble-out-bg: #3b6fd6;
+  --bubble-out-text: #ffffff;
+  --bubble-in-bg: #242a33;
+
+  --online: #34c76a;
+  --offline: #4a515c;
+  --danger: #ff8a85;
+  --danger-bg: #2c1a1a;
+
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+  background-color: var(--bg);
+  /* The app manages its own scroll regions; the window itself never scrolls. */
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Shared form control styling, so every input and button in the app matches. */
+input,
+button,
+textarea {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+
+input[type="text"],
+input:not([type]) {
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background-color: var(--bg);
+  color: var(--text);
+}
+
+input::placeholder {
+  color: var(--text-faint);
+}
+
+button {
+  cursor: pointer;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background-color: transparent;
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+/* One visible focus style everywhere, drawn outside the element so it never
+   shifts layout. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Slim scrollbars that don't dominate the narrow sidebar. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: var(--radius-pill);
+  background-clip: content-box;
+  background-color: var(--border-strong);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--text-faint);
+}

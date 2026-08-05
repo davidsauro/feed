@@ -46,6 +46,8 @@ npm run tauri dev
 
 > **Note for WSL2 Users:** If you see `libEGL` or `MESA` warnings in your terminal and want to suppress them, or if the window fails to render properly, force software rendering by prepending this environment variable:
 > `LIBGL_ALWAYS_SOFTWARE=1 npm run tauri dev`
+>
+> **Theme detection under WSL2:** the webview is `webkit2gtk`, so CSS `prefers-color-scheme` reports the GTK theme inside your Linux distro rather than the Windows setting — it will say "light" even when Windows is in dark mode. Use the Light / Dark switch in the bottom of the sidebar; the choice is saved and overrides detection. Setting a dark GTK theme (`gsettings set org.gnome.desktop.interface color-scheme prefer-dark`) makes the "System" option work too.
 
 ---
 
@@ -70,7 +72,12 @@ The UI includes an Instance indicator in the bottom right corner to help keep tr
 
 ## Project Structure
 
-* `/src`: Contains the Vue frontend code (`App.vue`, styles, components).
+* `/src`: Contains the Vue frontend code.
+  * `/src/App.vue`: Application shell. Owns all state and every call into the Rust backend.
+  * `/src/components/`: Presentational components — `IdentityBar`, `ContactList`, `PeerList`, `ChatPane`, `MessageBubble`, `ThemeToggle`.
+  * `/src/styles.css`: Theme tokens (light and dark) and base styles. Every color in the app comes from here.
+  * `/src/theme.ts`: Resolves the light/dark choice and applies it as `<html data-theme>`. Persists to `localStorage`.
+  * `/src/types.ts`: Types shared between `App.vue` and its components.
 * `/src-tauri`: Contains the Rust backend code.
   * `/src-tauri/src/main.rs`: The entry point for the Rust backend, SQLite initialization, and Tauri IPC commands.
   * `/src-tauri/Cargo.toml`: Rust dependencies (including libp2p, tokio, and rusqlite).
