@@ -59,6 +59,21 @@ const COMMAND_CHANNEL_CAPACITY: usize = 100;
 /// How long a connection with no traffic on it is kept open.
 const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How often we ask the local network who's out there.
+///
+/// This is also how often a peer that's still alive refreshes its record, so it
+/// has to be comfortably shorter than the TTL below or live peers would flicker
+/// offline between queries.
+const MDNS_QUERY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long a peer stays "online" without us hearing from it again.
+///
+/// This is what decides how quickly a node that went away is shown as offline. A
+/// process that is killed has no chance to announce that it's leaving, so the
+/// record expiring is the only signal we get. libp2p defaults to six minutes,
+/// which leaves a dead node looking online for far too long.
+const MDNS_RECORD_TTL: Duration = Duration::from_secs(30);
+
 /// Reads the ID of this node from the environment.
 ///
 /// Called from several places (identity file name, database file name, and the
@@ -493,11 +508,14 @@ fn build_swarm(keypair: Keypair) -> Swarm<AppBehaviour> {
         )
         .expect("failed to configure the TCP transport")
         .with_behaviour(|key| {
-            let mdns = mdns::tokio::Behaviour::new(
-                mdns::Config::default(),
-                key.public().to_peer_id(),
-            )
-            .expect("failed to start mDNS discovery");
+            let mdns_config = mdns::Config {
+                ttl: MDNS_RECORD_TTL,
+                query_interval: MDNS_QUERY_INTERVAL,
+                ..mdns::Config::default()
+            };
+
+            let mdns = mdns::tokio::Behaviour::new(mdns_config, key.public().to_peer_id())
+                .expect("failed to start mDNS discovery");
 
             AppBehaviour { mdns, chat }
         })
