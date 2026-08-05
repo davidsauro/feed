@@ -21,6 +21,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   select: [contact: Contact];
   rename: [peerId: string, nickname: string];
+  /** Asks to remove the contact. App.vue confirms before anything is deleted. */
+  remove: [contact: Contact];
 }>();
 
 const renamingPeerId = ref<string | null>(null);
@@ -114,13 +116,35 @@ function isOnline(peerId: string): boolean {
 
           <span v-if="unread[contact.peer_id]" class="unread" title="New message" />
 
-          <button
-            class="icon-button rename-button"
-            title="Rename"
-            @click.stop="startRename(contact)"
-          >
-            ✎
-          </button>
+          <span class="row-actions">
+            <button
+              class="icon-button"
+              title="Rename"
+              @click.stop="startRename(contact)"
+            >
+              ✎
+            </button>
+
+            <button
+              class="icon-button remove"
+              title="Remove contact"
+              @click.stop="emit('remove', contact)"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                width="13"
+                height="13"
+                stroke="currentColor"
+                stroke-width="2"
+                fill="none"
+                stroke-linecap="round"
+              >
+                <polyline points="3 6 5 6 21 6" />
+                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+              </svg>
+            </button>
+          </span>
         </div>
       </li>
     </ul>
@@ -246,15 +270,23 @@ function isOnline(peerId: string): boolean {
   color: var(--online);
 }
 
-/* The rename affordance stays hidden until the row is hovered, so the resting
-   state of the list is just names. */
-.rename-button {
+/* Row actions stay hidden until the row is hovered, so the resting state of the
+   list is just names. Focus reveals them too, for keyboard use. */
+.row-actions {
+  display: flex;
+  gap: 2px;
+  flex: none;
   opacity: 0;
 }
 
-.row:hover .rename-button,
-.rename-button:focus-visible {
+.row:hover .row-actions,
+.row-actions:focus-within {
   opacity: 1;
+}
+
+.remove:hover:not(:disabled) {
+  background-color: var(--danger-bg);
+  color: var(--danger);
 }
 
 .rename {

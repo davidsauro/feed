@@ -43,8 +43,13 @@
 
   --online: #1fa855;
   --offline: #b6bcc6;
+
+  /* --danger is for text and borders on --danger-bg; --danger-solid is for a
+     filled destructive button, which needs its own contrasting text color. */
   --danger: #c8342f;
   --danger-bg: #fdecec;
+  --danger-solid: #c8342f;
+  --danger-solid-text: #ffffff;
 
   --radius-sm: 6px;
   --radius: 10px;
@@ -87,6 +92,8 @@
   --offline: #4a515c;
   --danger: #ff8a85;
   --danger-bg: #2c1a1a;
+  --danger-solid: #cf3f3a;
+  --danger-solid-text: #ffffff;
 
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
 }

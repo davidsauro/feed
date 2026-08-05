@@ -278,6 +278,54 @@ fn save_contact(app: AppHandle, peer_id: String, nickname: String) -> Result<(),
     Ok(())
 }
 
+/// Removes a contact along with the whole conversation with them, and returns
+/// how many messages were deleted.
+///
+/// Both deletes run in one transaction, so a failure leaves the contact and
+/// their history intact rather than half-erasing one of them.
+///
+/// There is no undo. The frontend is responsible for confirming with the user
+/// before calling this.
+#[tauri::command]
+fn delete_contact(app: AppHandle, peer_id: String) -> Result<usize, String> {
+    let mut conn = get_db_connection(&app).map_err(|e| e.to_string())?;
+
+    let transaction = conn.transaction().map_err(|e| e.to_string())?;
+
+    let deleted_messages = transaction
+        .execute("DELETE FROM messages WHERE peer_id = ?1", [&peer_id])
+        .map_err(|e| e.to_string())?;
+
+    transaction
+        .execute("DELETE FROM contacts WHERE peer_id = ?1", [&peer_id])
+        .map_err(|e| e.to_string())?;
+
+    transaction.commit().map_err(|e| e.to_string())?;
+
+    Ok(deleted_messages)
+}
+
+/// Returns how many messages are stored for one peer.
+///
+/// Used to tell the user what they're about to lose when removing a contact,
+/// without loading every message to count them.
+#[tauri::command]
+fn count_chat_messages(app: AppHandle, peer_id: String) -> Result<usize, String> {
+    let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
+
+    // SQLite counts are signed integers, so the count comes back as i64 and is
+    // widened to usize for the frontend.
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(1) FROM messages WHERE peer_id = ?1",
+            [&peer_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+
+    Ok(count.max(0) as usize)
+}
+
 /// Returns every saved contact.
 #[tauri::command]
 fn get_contacts(app: AppHandle) -> Result<Vec<Contact>, String> {
@@ -683,10 +731,12 @@ fn main() {
             // Contacts
             save_contact,
             get_contacts,
+            delete_contact,
             // Chat history
             save_chat_message,
             update_message_status,
             get_chat_history,
+            count_chat_messages,
             // Network
             get_active_peers,
             send_message,

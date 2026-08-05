@@ -11,7 +11,7 @@ A decentralized, peer-to-peer communication application built with a web fronten
 ## Current Features
 * **Cryptographic Identity:** Uses `rust-libp2p` to generate an Ed25519 keypair, uniquely identifying the node on the network.
 * **Local Peer Discovery:** Automatically discovers and connects to other active nodes on the local network using the mDNS protocol.
-* **Persistent Storage & Address Book:** Uses local SQLite databases to save recognized contacts, custom nicknames, and chat history natively to the host OS.
+* **Persistent Storage & Address Book:** Uses local SQLite databases to save recognized contacts, custom nicknames, and chat history natively to the host OS. Contacts can be renamed, or removed along with their chat history in a single transaction (with a confirmation warning, since there is no undo).
 * **Spam-Resistant Direct Messaging:** Secure 1-to-1 chat using the `libp2p-request-response` protocol. The backend performs a database lookup to silently drop inbound messages from non-contacts.
 * **Rich Chat UI:** Features real-time online/offline status indicators and Telegram-style read receipts (Sending / Delivered / Read) driven by hidden JSON network payloads and SVGs.
 * **Asynchronous IPC Bridge:** Utilizes Tokio `mpsc` channels and Tauri State to seamlessly pass network events between the background Rust network loop and the reactive Vue frontend without race conditions.
