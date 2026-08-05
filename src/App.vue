@@ -1,340 +1,548 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from "vue";
+/**
+ * Application shell.
+ *
+ * This component owns all state and every call into the Rust backend. The
+ * components under it are presentational: they take props and report what the
+ * user did, and this file decides what that means.
+ */
+import { computed, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
+import ChatPane from "./components/ChatPane.vue";
+import ContactList from "./components/ContactList.vue";
+import IdentityBar from "./components/IdentityBar.vue";
+import PeerList from "./components/PeerList.vue";
+import ThemeToggle from "./components/ThemeToggle.vue";
+import type { ChatMessage, Contact } from "./types";
+
+// --- State ----------------------------------------------------------------
+
 const myPeerId = ref("");
-const errorMessage = ref("");
-const nicknameInput = ref("");
-const nodeInstance = ref("Loading...");
+const nodeInstance = ref("…");
 
+/** Peer IDs mDNS can currently see, contacts and strangers alike. */
 const activePeers = ref<Set<string>>(new Set());
-const savedContacts = ref<{ peer_id: string, nickname: string }[]>([]);
+const savedContacts = ref<Contact[]>([]);
 
-const editingContact = ref<string | null>(null);
-const editNicknameInput = ref("");
-
-interface ChatMessage {
-  id: string;
-  sender: string;
-  text: string;
-  status: 'sending' | 'delivered' | 'read';
-}
-
-const selectedContact = ref<{ peer_id: string, nickname: string } | null>(null);
-const chatInput = ref("");
+/** Conversations, keyed by the other peer's ID. */
 const messages = ref<Record<string, ChatMessage[]>>({});
+/** Which contacts have a message we haven't shown yet. */
 const unreadStatus = ref<Record<string, boolean>>({});
 
-const unregisteredActivePeers = computed(() => {
-  return Array.from(activePeers.value).filter(
-    (peer) => !savedContacts.value.some((contact) => contact.peer_id === peer)
+const selectedPeerId = ref<string | null>(null);
+
+/** A short-lived message shown over the UI. Replaces blocking alert() dialogs. */
+const notice = ref<{ text: string; kind: "error" | "info" } | null>(null);
+let noticeTimer = 0;
+
+// --- Derived state --------------------------------------------------------
+
+/**
+ * Looked up rather than stored, so a rename shows up in the chat header without
+ * having to update two places.
+ */
+const selectedContact = computed<Contact | null>(() => {
+  const found = savedContacts.value.find(
+    (contact) => contact.peer_id === selectedPeerId.value,
   );
+
+  return found ?? null;
 });
+
+/** Discovered peers we haven't saved as contacts yet. */
+const unregisteredPeers = computed(() =>
+  Array.from(activePeers.value).filter(
+    (peer) => !savedContacts.value.some((contact) => contact.peer_id === peer),
+  ),
+);
 
 const currentMessages = computed(() => {
-  if (!selectedContact.value) return [];
-  return messages.value[selectedContact.value.peer_id] || [];
+  if (!selectedPeerId.value) {
+    return [];
+  }
+
+  return messages.value[selectedPeerId.value] ?? [];
 });
 
+const selectedIsOnline = computed(
+  () => selectedPeerId.value !== null && activePeers.value.has(selectedPeerId.value),
+);
+
+// --- Notices --------------------------------------------------------------
+
+function notify(text: string, kind: "error" | "info" = "error") {
+  notice.value = { text, kind };
+
+  window.clearTimeout(noticeTimer);
+  noticeTimer = window.setTimeout(() => {
+    notice.value = null;
+  }, 6000);
+}
+
+// --- Loading --------------------------------------------------------------
+
 async function loadIdentity() {
-  try { myPeerId.value = await invoke("get_identity"); } 
-  catch (e) { errorMessage.value = `Error: ${e}`; }
+  try {
+    myPeerId.value = await invoke<string>("get_identity");
+  } catch (error) {
+    notify(`Could not load this node's identity: ${error}`);
+  }
 }
 
+/**
+ * Loads contacts, then checks each one's history for messages that arrived
+ * while the app was closed so their unread dot survives a restart.
+ */
 async function loadContacts() {
-  try { 
-    savedContacts.value = await invoke("get_contacts"); 
-    
-    // Check database for any unread messages from these contacts
-    for (const contact of savedContacts.value) {
-      const history: ChatMessage[] = await invoke("get_chat_history", { peerId: contact.peer_id });
-      const hasUnread = history.some(m => m.sender === contact.peer_id && m.status !== 'read');
-      unreadStatus.value[contact.peer_id] = hasUnread;
-    }
-  } 
-  catch (e) { console.error("Failed to load contacts", e); }
-}
-
-async function saveContact(peerId: string) {
-  if (!nicknameInput.value.trim()) return alert("Nickname is required!");
   try {
-    await invoke("save_contact", { peerId: peerId, nickname: nicknameInput.value.trim() });
-    nicknameInput.value = "";
-    await loadContacts();
-  } catch (e) { alert(`Error saving contact: ${e}`); }
-}
-
-function startEdit(contact: { peer_id: string, nickname: string }) {
-  editingContact.value = contact.peer_id;
-  editNicknameInput.value = contact.nickname;
-}
-
-async function saveEdit(peerId: string) {
-  if (!editNicknameInput.value.trim()) return;
-  try {
-    await invoke("save_contact", { peerId, nickname: editNicknameInput.value.trim() });
-    editingContact.value = null;
-    await loadContacts();
-    if (selectedContact.value && selectedContact.value.peer_id === peerId) {
-      selectedContact.value.nickname = editNicknameInput.value.trim();
-    }
-  } catch (e) { alert(`Error saving edit: ${e}`); }
-}
-
-async function sendReadReceipt(peerId: string, ids: string[]) {
-  const payload = JSON.stringify({ type: 'read', messageIds: ids });
-  try { await invoke("send_message", { peerId, message: payload }); } catch(e) {}
-}
-
-async function selectContact(contact: { peer_id: string, nickname: string }) {
-  selectedContact.value = contact;
-  
-  // Load history from SQLite
-  messages.value[contact.peer_id] = await invoke("get_chat_history", { peerId: contact.peer_id });
-  
-  // Process Unreads
-  if (unreadStatus.value[contact.peer_id]) {
-    unreadStatus.value[contact.peer_id] = false;
+    savedContacts.value = await invoke<Contact[]>("get_contacts");
+  } catch (error) {
+    notify(`Could not load contacts: ${error}`);
+    return;
   }
-  
-  const unreadMsgs = messages.value[contact.peer_id].filter(m => m.sender === contact.peer_id && m.status !== 'read');
-  if (unreadMsgs.length > 0) {
-    const unreadIds = unreadMsgs.map(m => m.id);
-    sendReadReceipt(contact.peer_id, unreadIds);
-    
-    // Mark as read in our local UI and Database
-    unreadMsgs.forEach(m => {
-      m.status = 'read';
-      invoke("update_message_status", { id: m.id, status: 'read' }).catch(()=>{});
-    });
+
+  for (const contact of savedContacts.value) {
+    try {
+      const history = await invoke<ChatMessage[]>("get_chat_history", {
+        peerId: contact.peer_id,
+      });
+
+      unreadStatus.value[contact.peer_id] = history.some(
+        (message) => message.sender === contact.peer_id && message.status !== "read",
+      );
+    } catch (error) {
+      console.error(`Could not check unread messages for ${contact.peer_id}`, error);
+    }
   }
 }
 
-async function sendMessage() {
-  if (!chatInput.value.trim() || !selectedContact.value) return;
-  const text = chatInput.value.trim();
-  const peerId = selectedContact.value.peer_id;
-  
-  const id = crypto.randomUUID();
-  const payload = JSON.stringify({ type: 'chat', id, text });
-  
-  if (!messages.value[peerId]) messages.value[peerId] = [];
-  const msgObj: ChatMessage = { id, sender: myPeerId.value, text, status: 'sending' };
-  messages.value[peerId].push(msgObj);
-  chatInput.value = "";
-  
-  // Save to SQLite
-  await invoke("save_chat_message", { id, peerId, sender: myPeerId.value, text, status: 'sending' });
-  
+// --- Contacts -------------------------------------------------------------
+
+async function addContact(peerId: string, nickname: string) {
+  try {
+    await invoke("save_contact", { peerId, nickname });
+    await loadContacts();
+    notify(`Added ${nickname}.`, "info");
+  } catch (error) {
+    notify(`Could not add contact: ${error}`);
+  }
+}
+
+async function renameContact(peerId: string, nickname: string) {
+  try {
+    await invoke("save_contact", { peerId, nickname });
+    await loadContacts();
+  } catch (error) {
+    notify(`Could not rename contact: ${error}`);
+  }
+}
+
+// --- Conversations --------------------------------------------------------
+
+/**
+ * Tells the other node which of its messages we've read. Sent as a hidden JSON
+ * payload over the same channel as chat messages.
+ */
+async function sendReadReceipt(peerId: string, messageIds: string[]) {
+  const payload = JSON.stringify({ type: "read", messageIds });
+
   try {
     await invoke("send_message", { peerId, message: payload });
-    msgObj.status = 'delivered';
-    await invoke("update_message_status", { id, status: 'delivered' });
-  } catch (e) {
-    alert("Failed to send: " + e);
+  } catch (error) {
+    // A receipt that doesn't arrive is not worth interrupting the user over;
+    // they'll get one next time the conversation is opened.
+    console.error("Could not send read receipt", error);
   }
 }
 
+/**
+ * Opens a conversation: loads its history, clears the unread dot, and tells the
+ * other side we've read what they sent.
+ */
+async function selectContact(contact: Contact) {
+  selectedPeerId.value = contact.peer_id;
+
+  try {
+    messages.value[contact.peer_id] = await invoke<ChatMessage[]>("get_chat_history", {
+      peerId: contact.peer_id,
+    });
+  } catch (error) {
+    notify(`Could not load this conversation: ${error}`);
+    return;
+  }
+
+  unreadStatus.value[contact.peer_id] = false;
+
+  const unread = messages.value[contact.peer_id].filter(
+    (message) => message.sender === contact.peer_id && message.status !== "read",
+  );
+
+  if (unread.length === 0) {
+    return;
+  }
+
+  sendReadReceipt(
+    contact.peer_id,
+    unread.map((message) => message.id),
+  );
+
+  for (const message of unread) {
+    message.status = "read";
+    markMessageRead(message.id);
+  }
+}
+
+/** Records a status change in SQLite. Best effort: the UI has already moved on. */
+function markMessageRead(id: string) {
+  invoke("update_message_status", { id, status: "read" }).catch((error) => {
+    console.error(`Could not mark ${id} as read`, error);
+  });
+}
+
+/**
+ * Sends a message, showing it in the conversation right away.
+ *
+ * The message is saved as "sending" before it goes out so it survives a crash
+ * mid-send, then promoted to "delivered" once the other node accepts it.
+ */
+async function sendMessage(text: string) {
+  const contact = selectedContact.value;
+  if (!contact) {
+    return;
+  }
+
+  const peerId = contact.peer_id;
+  const id = crypto.randomUUID();
+
+  const message: ChatMessage = {
+    id,
+    sender: myPeerId.value,
+    text,
+    status: "sending",
+  };
+
+  if (!messages.value[peerId]) {
+    messages.value[peerId] = [];
+  }
+  messages.value[peerId].push(message);
+
+  try {
+    await invoke("save_chat_message", {
+      id,
+      peerId,
+      sender: myPeerId.value,
+      text,
+      status: "sending",
+    });
+
+    await invoke("send_message", {
+      peerId,
+      message: JSON.stringify({ type: "chat", id, text }),
+    });
+
+    message.status = "delivered";
+    await invoke("update_message_status", { id, status: "delivered" });
+  } catch (error) {
+    notify(`Could not send to ${contact.nickname}: ${error}`);
+  }
+}
+
+// --- Inbound network events ----------------------------------------------
+
+/** Handles a chat message from a contact. */
+async function receiveChatMessage(sender: string, id: string, text: string) {
+  const message: ChatMessage = { id, sender, text, status: "delivered" };
+
+  if (!messages.value[sender]) {
+    messages.value[sender] = [];
+  }
+  messages.value[sender].push(message);
+
+  await invoke("save_chat_message", {
+    id,
+    peerId: sender,
+    sender,
+    text,
+    status: "delivered",
+  });
+
+  // If their conversation is already on screen, it's read the moment it lands.
+  if (selectedPeerId.value === sender) {
+    sendReadReceipt(sender, [id]);
+    message.status = "read";
+    markMessageRead(id);
+  } else {
+    unreadStatus.value[sender] = true;
+  }
+}
+
+/** Handles the other side telling us they read our messages. */
+function receiveReadReceipt(sender: string, messageIds: string[]) {
+  const conversation = messages.value[sender];
+  if (!conversation) {
+    return;
+  }
+
+  for (const message of conversation) {
+    if (messageIds.includes(message.id)) {
+      message.status = "read";
+      markMessageRead(message.id);
+    }
+  }
+}
+
+// --- Startup --------------------------------------------------------------
+
 onMounted(async () => {
-  nodeInstance.value = await invoke("get_node_id");
+  nodeInstance.value = await invoke<string>("get_node_id");
   await loadIdentity();
   await loadContacts();
 
+  // Catch up on peers discovered before this window started listening.
   try {
     const initialPeers = await invoke<string[]>("get_active_peers");
-    initialPeers.forEach(p => activePeers.value.add(p));
-  } catch(e) {}
+    initialPeers.forEach((peer) => activePeers.value.add(peer));
+  } catch (error) {
+    console.error("Could not load the current peer list", error);
+  }
 
-  await listen<string>("peer-discovered", (event) => activePeers.value.add(event.payload));
-  await listen<string>("peer-lost", (event) => activePeers.value.delete(event.payload));
+  await listen<string>("peer-discovered", (event) => {
+    activePeers.value.add(event.payload);
+  });
 
-  await listen<{ sender: string, message: string }>("chat-received", async (event) => {
+  await listen<string>("peer-lost", (event) => {
+    activePeers.value.delete(event.payload);
+  });
+
+  await listen<{ sender: string; message: string }>("chat-received", async (event) => {
     const { sender, message } = event.payload;
+
+    // The backend passes the payload through untouched, so anything malformed
+    // gets dropped here rather than breaking the listener.
+    let data: { type?: string; id?: string; text?: string; messageIds?: string[] };
     try {
-      const data = JSON.parse(message);
-      
-      if (data.type === 'chat') {
-        
-        const msgObj = { 
-          id: data.id, 
-          sender, 
-          text: data.text, 
-          status: 'delivered' 
-        } as ChatMessage;
-        
-        if (!messages.value[sender]) messages.value[sender] = [];
-        messages.value[sender].push(msgObj);
-        
-        // Save received message to SQLite
-        await invoke("save_chat_message", { id: data.id, peerId: sender, sender, text: data.text, status: 'delivered' });
-        
-        if (selectedContact.value?.peer_id === sender) {
-          sendReadReceipt(sender, [data.id]);
-          msgObj.status = 'read';
-          await invoke("update_message_status", { id: data.id, status: 'read' });
-        } else {
-          unreadStatus.value[sender] = true;
-        }
-      } 
-      else if (data.type === 'read') {
-        if (messages.value[sender]) {
-          for (const msg of messages.value[sender]) {
-            if (data.messageIds.includes(msg.id)) {
-              msg.status = 'read';
-              invoke("update_message_status", { id: msg.id, status: 'read' }).catch(()=>{});
-            }
-          }
-        }
-      }
-    } catch (e) { }
+      data = JSON.parse(message);
+    } catch {
+      console.error("Ignoring an unreadable payload from", sender);
+      return;
+    }
+
+    if (data.type === "chat" && data.id && typeof data.text === "string") {
+      await receiveChatMessage(sender, data.id, data.text);
+    } else if (data.type === "read" && Array.isArray(data.messageIds)) {
+      receiveReadReceipt(sender, data.messageIds);
+    }
   });
 });
 </script>
 
 <template>
-  <main class="container">
-    <h1>P2P Mesh Node</h1>
-    <p v-if="myPeerId" class="success">My ID: {{ myPeerId }}</p>
-    <p v-if="errorMessage" class="error">{{ errorMessage }}</p>
+  <div class="app">
+    <aside class="sidebar">
+      <IdentityBar :peer-id="myPeerId" />
 
-    <div class="grid">
-      <div class="card">
-        <h2>Discovered</h2>
-        <ul v-if="unregisteredActivePeers.length > 0">
-          <li v-for="peer in unregisteredActivePeers" :key="peer">
-            <span class="peer-id">{{ peer }}</span>
-            <div class="action-row">
-              <input v-model="nicknameInput" placeholder="Required..." />
-              <button @click="saveContact(peer)">Save</button>
-            </div>
-          </li>
-        </ul>
-        <p v-else>No unregistered peers.</p>
+      <ContactList
+        class="fill"
+        :contacts="savedContacts"
+        :online-peers="activePeers"
+        :unread="unreadStatus"
+        :selected-peer-id="selectedPeerId"
+        @select="selectContact"
+        @rename="renameContact"
+      />
+
+      <PeerList :peers="unregisteredPeers" @add="addContact" />
+
+      <footer class="footer">
+        <span class="node-badge">
+          <span class="dot" />
+          Node {{ nodeInstance }}
+        </span>
+
+        <ThemeToggle />
+      </footer>
+    </aside>
+
+    <main class="content">
+      <ChatPane
+        v-if="selectedContact"
+        :key="selectedContact.peer_id"
+        :contact="selectedContact"
+        :messages="currentMessages"
+        :online="selectedIsOnline"
+        :my-peer-id="myPeerId"
+        @send="sendMessage"
+      />
+
+      <div v-else class="placeholder">
+        <svg
+          viewBox="0 0 24 24"
+          width="40"
+          height="40"
+          stroke="currentColor"
+          stroke-width="1.5"
+          fill="none"
+        >
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+        </svg>
+
+        <p class="placeholder-title">No conversation open</p>
+        <p class="placeholder-hint">
+          Pick a contact, or add a discovered peer to start talking to them.
+        </p>
       </div>
+    </main>
 
-      <div class="card">
-        <h2>Contacts</h2>
-        <ul v-if="savedContacts.length > 0">
-          <li v-for="contact in savedContacts" :key="contact.peer_id" 
-              @click="selectContact(contact)"
-              class="contact-item" :class="{ selected: selectedContact?.peer_id === contact.peer_id }">
-            
-            <!-- Normal View -->
-            <div class="contact-header" v-if="editingContact !== contact.peer_id">
-              <span class="status-dot" :class="{ online: activePeers.has(contact.peer_id) }"></span>
-              <strong>{{ contact.nickname }}</strong>
-              
-              <!-- SVG Unread Icon -->
-              <span v-if="unreadStatus[contact.peer_id]" class="unread-icon" title="New Message">
-                <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none">
-                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
-                </svg>
-              </span>
-
-              <button class="icon-btn edit-btn" @click.stop="startEdit(contact)">✎</button>
-            </div>
-
-            <!-- Edit View -->
-            <div class="edit-row" v-else @click.stop>
-              <input v-model="editNicknameInput" @keyup.enter="saveEdit(contact.peer_id)" />
-              <button @click="saveEdit(contact.peer_id)">✓</button>
-              <button @click="editingContact = null">✕</button>
-            </div>
-
-            <div class="peer-id-small">{{ contact.peer_id }}</div>
-          </li>
-        </ul>
-        <p v-else>No contacts.</p>
+    <!-- Errors and confirmations, over the UI rather than in a modal dialog. -->
+    <Transition name="notice">
+      <div v-if="notice" class="notice" :class="notice.kind">
+        <span>{{ notice.text }}</span>
+        <button class="dismiss" title="Dismiss" @click="notice = null">✕</button>
       </div>
-
-      <div class="card chat-panel" v-if="selectedContact">
-        <h2>Chat: {{ selectedContact.nickname }}</h2>
-        <div class="message-history">
-          <div v-for="msg in currentMessages" :key="msg.id"
-               :class="['message', msg.sender === myPeerId ? 'sent' : 'received']">
-            <div class="msg-text">{{ msg.text }}</div>
-            <div class="msg-meta" v-if="msg.sender === myPeerId">
-              
-              <!-- SVG Clock (Sending) -->
-              <span v-if="msg.status === 'sending'" class="status-icon">
-                <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2.5" fill="none">
-                  <circle cx="12" cy="12" r="10"></circle>
-                  <polyline points="12 6 12 12 16 14"></polyline>
-                </svg>
-              </span>
-
-              <!-- SVG Single Check (Delivered) -->
-              <span v-if="msg.status === 'delivered'" class="status-icon">
-                <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="3" fill="none">
-                  <polyline points="20 6 9 17 4 12"></polyline>
-                </svg>
-              </span>
-
-              <!-- SVG Double Check (Read) -->
-              <span v-if="msg.status === 'read'" class="status-icon">
-                <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="3" fill="none">
-                  <polyline points="18 6 7 17 2 12"></polyline>
-                  <polyline points="22 6 12 16 11 15"></polyline>
-                </svg>
-              </span>
-
-            </div>
-          </div>
-        </div>
-        <div class="action-row">
-          <input v-model="chatInput" placeholder="Message..." @keyup.enter="sendMessage" />
-          <button @click="sendMessage">Send</button>
-        </div>
-      </div>
-    </div>
-    
-    <div class="port-indicator">Instance: Node {{ nodeInstance }}</div>
-  </main>
+    </Transition>
+  </div>
 </template>
 
 <style scoped>
-.container { font-family: sans-serif; padding: 20px; max-width: 1000px; margin: 0 auto; }
-.success { color: green; font-family: monospace; font-size: 1.1em; text-align: center; }
-.error { color: red; text-align: center; }
-.grid { display: flex; gap: 20px; margin-top: 20px; align-items: stretch; }
-.card { flex: 1; border: 1px solid #ccc; padding: 15px; border-radius: 8px; display: flex; flex-direction: column; }
-ul { list-style: none; padding: 0; margin: 0; }
-li { padding: 10px 0; border-bottom: 1px solid #eee; }
+.app {
+  display: flex;
+  height: 100%;
+  overflow: hidden;
+  background-color: var(--bg);
+}
 
-.contact-item { cursor: pointer; padding: 10px; border-radius: 4px; transition: background 0.2s; position: relative; }
-.contact-item:hover { background-color: #f5f5f5; }
-.contact-item.selected { background-color: #e3f2fd; border: 1px solid #90caf9; }
+/* Sidebar ---------------------------------------------------------------- */
 
-.peer-id { font-family: monospace; font-size: 0.8em; word-break: break-all; color: #555; }
-.peer-id-small { font-family: monospace; font-size: 0.7em; color: #888; margin-top: 4px; }
-.action-row { display: flex; gap: 10px; margin-top: 8px; }
-input { flex: 1; padding: 5px; }
-button { padding: 5px 10px; cursor: pointer; }
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  flex: none;
+  width: 272px;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+  background-color: var(--bg-sidebar);
+}
 
-/* Contact Header & Icons */
-.contact-header { display: flex; align-items: center; gap: 8px; }
-.status-dot { width: 10px; height: 10px; border-radius: 50%; background-color: #ff4444; display: inline-block; }
-.status-dot.online { background-color: #00C851; }
-.unread-icon { font-size: 0.9em; margin-left: 5px; }
-.icon-btn { background: none; border: none; font-size: 1.2em; padding: 0; color: #666; opacity: 0; transition: opacity 0.2s; }
-.contact-item:hover .icon-btn { opacity: 1; }
-.icon-btn:hover { color: #000; }
-.edit-row { display: flex; gap: 5px; align-items: center; width: 100%; }
+/* Applied to ContactList's root: it takes the leftover height and scrolls,
+   which keeps the discovered list and node badge pinned to the bottom. */
+.fill {
+  flex: 1;
+  min-height: 0;
+}
 
-/* Chat Styling */
-.message-history { flex: 1; overflow-y: auto; padding: 10px; border: 1px solid #eee; border-radius: 4px; margin-bottom: 10px; min-height: 250px; display: flex; flex-direction: column; gap: 8px; }
-.message { padding: 8px 12px; border-radius: 12px; max-width: 80%; width: fit-content; position: relative; }
-.message.sent { background-color: #007bff; color: white; align-self: flex-end; padding-bottom: 18px; }
-.message.received { background-color: #e9ecef; color: black; align-self: flex-start; }
-.msg-text { word-wrap: break-word; }
-.msg-meta { position: absolute; bottom: 4px; right: 8px; font-size: 0.65em; opacity: 0.8; letter-spacing: 1px; }
+.footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex: none;
+  padding: 7px 10px 7px 14px;
+  border-top: 1px solid var(--border);
+}
 
-.port-indicator { position: fixed; bottom: 15px; right: 15px; background-color: #333; color: #fff; padding: 6px 12px; border-radius: 20px; font-family: monospace; font-size: 0.85em; opacity: 0.8; }
+.node-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+}
 
-.unread-icon { display: flex; align-items: center; color: #007bff; margin-left: auto; padding-right: 5px; }
-.status-icon { display: flex; align-items: center; justify-content: center; opacity: 0.9; }
-.msg-meta { display: flex; align-items: center; justify-content: flex-end; position: absolute; bottom: 4px; right: 8px; }
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: var(--online);
+}
 
+/* Main area ------------------------------------------------------------- */
+
+.content {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  flex: 1;
+  padding: 24px;
+  text-align: center;
+  background-color: var(--bg-sunken);
+  color: var(--text-faint);
+}
+
+.placeholder-title {
+  margin: 8px 0 0;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.placeholder-hint {
+  margin: 0;
+  max-width: 34ch;
+  font-size: 13px;
+}
+
+/* Notices --------------------------------------------------------------- */
+
+.notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: min(90vw, 520px);
+  padding: 8px 8px 8px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background-color: var(--bg);
+  box-shadow: var(--shadow);
+  font-size: 13px;
+}
+
+.notice.error {
+  border-color: var(--danger);
+  background-color: var(--danger-bg);
+  color: var(--danger);
+}
+
+.dismiss {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+  opacity: 0.7;
+}
+
+.dismiss:hover {
+  background-color: var(--bg-hover);
+  opacity: 1;
+}
+
+.notice-enter-active,
+.notice-leave-active {
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.notice-enter-from,
+.notice-leave-to {
+  opacity: 0;
+  transform: translate(-50%, -8px);
+}
 </style>
-
