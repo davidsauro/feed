@@ -221,10 +221,16 @@ struct DatabaseKey {
 
 /// Shared state that Tauri hands to commands that ask for it.
 struct NetworkState {
-    /// Peers mDNS has seen recently and not yet reported as expired.
+    /// Peers we hold a connection to.
     active_peers: Mutex<HashSet<String>>,
     /// The sending half of the channel into the background network task.
     network_tx: Mutex<mpsc::Sender<NetworkCommand>>,
+    /// The receiving half, waiting for the network task to be started.
+    ///
+    /// Held here rather than passed straight to the task because the network
+    /// doesn't start until the app is unlocked. Taking it is what starts the
+    /// task, and it can only be taken once, so there is no way to start twice.
+    command_rx: Mutex<Option<mpsc::Receiver<NetworkCommand>>>,
 }
 
 /// The bytes we send when we send a chat message.
@@ -287,14 +293,52 @@ fn get_or_create_keypair(app_data_dir: &Path, node_id: &str) -> Result<Keypair, 
     if key_path.exists() {
         let bytes = fs::read(&key_path).map_err(|e| e.to_string())?;
         let keypair = Keypair::from_protobuf_encoding(&bytes).map_err(|e| e.to_string())?;
+
+        // Also applied on load, not just on creation, so a key written by an
+        // older version of the app is tightened up rather than left as it was.
+        restrict_to_owner(&key_path);
+
         return Ok(keypair);
     }
 
     let keypair = Keypair::generate_ed25519();
     let bytes = keypair.to_protobuf_encoding().map_err(|e| e.to_string())?;
     fs::write(&key_path, bytes).map_err(|e| e.to_string())?;
+    restrict_to_owner(&key_path);
 
     Ok(keypair)
+}
+
+/// Restricts a file to the account that owns it.
+///
+/// Both files this is used on are worth keeping to ourselves: the identity key
+/// is the whole of this node's authority on the network — anyone who copies it
+/// can be this node — and the database is the whole of its history. They were
+/// being written world-readable, which on a shared machine means every other
+/// account could take one or read the other.
+///
+/// Reported rather than fatal: a file we couldn't tighten is still usable, and
+/// refusing to start would be a worse outcome than a warning.
+///
+/// Unix only. Windows models permissions differently, and Tauri's data directory
+/// there is already inside the user's own profile.
+fn restrict_to_owner(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Owner read and write, nothing for anyone else.
+        if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+            eprintln!(
+                "could not restrict permissions on {}: {}",
+                path.display(),
+                error
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 // ---------------------------------------------------------------------------
@@ -525,6 +569,7 @@ fn unlock_database(app: AppHandle, passphrase: String) -> Result<(), String> {
     verify_readable(&conn).map_err(|_| "That passphrase didn't work.".to_string())?;
 
     create_tables(&conn).map_err(|e| e.to_string())?;
+    restrict_to_owner(&db_path(&app));
 
     let state = app.state::<DatabaseKey>();
     let mut stored = state.passphrase.lock().map_err(|e| e.to_string())?;
@@ -555,6 +600,11 @@ fn enable_encryption(app: AppHandle, passphrase: String) -> Result<(), String> {
     export_database(&source, None, &target, Some(&passphrase))?;
 
     fs::rename(&target, &source).map_err(|e| e.to_string())?;
+
+    // The swapped-in file is newly created, so it carries default permissions
+    // rather than the ones the database had.
+    restrict_to_owner(&source);
+
     fs::write(encryption_marker_path(&app), ENCRYPTION_MARKER_NOTE).map_err(|e| e.to_string())?;
 
     let state = app.state::<DatabaseKey>();
@@ -583,6 +633,8 @@ fn disable_encryption(app: AppHandle) -> Result<(), String> {
     export_database(&source, Some(&passphrase), &target, None)?;
 
     fs::rename(&target, &source).map_err(|e| e.to_string())?;
+    restrict_to_owner(&source);
+
     fs::remove_file(encryption_marker_path(&app)).map_err(|e| e.to_string())?;
 
     let state = app.state::<DatabaseKey>();
@@ -687,6 +739,7 @@ fn reset_all_data(app: AppHandle) -> Result<(), String> {
 
     let conn = Connection::open(&database).map_err(|e| e.to_string())?;
     create_tables(&conn).map_err(|e| e.to_string())?;
+    restrict_to_owner(&database);
 
     Ok(())
 }
@@ -1097,6 +1150,37 @@ fn get_group_history(app: AppHandle, group_id: String) -> Result<Vec<ChatMessage
 // ---------------------------------------------------------------------------
 // Tauri commands: network
 // ---------------------------------------------------------------------------
+
+/// Starts the background network task.
+///
+/// Called once the app is actually usable, which for an encrypted node means
+/// after the passphrase has been accepted. Until then this node does not listen,
+/// does not answer mDNS, and dials nobody — so it is not merely unreachable but
+/// invisible, and never appears online in anyone else's contact list.
+///
+/// That matters because presence is based on connections. A locked node that had
+/// started its network would look perfectly online while silently dropping every
+/// message sent to it, which is worse than being plainly offline.
+///
+/// Safe to call more than once: the receiving half of the command channel can
+/// only be taken once, and later calls do nothing.
+#[tauri::command]
+fn start_network(app: AppHandle, state: State<'_, NetworkState>) -> Result<(), String> {
+    let command_rx = {
+        let mut guard = state.command_rx.lock().map_err(|e| e.to_string())?;
+        guard.take()
+    };
+
+    let Some(command_rx) = command_rx else {
+        return Ok(());
+    };
+
+    let keypair = get_or_create_keypair(&app_data_dir(&app), &current_node_id())?;
+
+    tauri::async_runtime::spawn(run_network(app, keypair, command_rx));
+
+    Ok(())
+}
 
 /// Returns the peers currently visible on the local network.
 ///
@@ -1599,14 +1683,15 @@ fn main() {
         .setup(|app| {
             let app_handle = app.handle().clone();
 
-            // The channel the frontend uses to reach the network task. The
-            // sending half goes into Tauri state so commands can find it; the
-            // receiving half goes to the network task.
+            // The channel the frontend uses to reach the network task. Both
+            // halves go into Tauri state: the sending half so commands can find
+            // it, the receiving half until the network is started.
             let (network_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
 
             app_handle.manage(NetworkState {
                 active_peers: Mutex::new(HashSet::new()),
                 network_tx: Mutex::new(network_tx),
+                command_rx: Mutex::new(Some(command_rx)),
             });
 
             // Managed before anything can reach the database, since opening one
@@ -1623,20 +1708,15 @@ fn main() {
                 match get_db_connection(&app_handle) {
                     Ok(conn) => {
                         create_tables(&conn).expect("failed to create the database tables");
+                        restrict_to_owner(&db_path(&app_handle));
                     }
                     Err(error) => eprintln!("could not open the database: {}", error),
                 }
             }
 
-            let app_data_dir = app
-                .path()
-                .app_local_data_dir()
-                .expect("no local data directory for this app");
-
-            let keypair = get_or_create_keypair(&app_data_dir, &current_node_id())
-                .expect("failed to load or create this node's identity");
-
-            tauri::async_runtime::spawn(run_network(app_handle, keypair, command_rx));
+            // Nothing touches the network here. The frontend starts it once the
+            // app is usable, which for an encrypted node is after unlocking —
+            // see `start_network`.
 
             Ok(())
         })
@@ -1667,6 +1747,7 @@ fn main() {
             save_group_message,
             get_group_history,
             // Network
+            start_network,
             get_active_peers,
             send_message,
             subscribe_group,
@@ -1786,6 +1867,33 @@ mod tests {
         verify_readable(&conn).expect("an awkward passphrase should still work");
         assert_eq!(stored_nickname(&conn), "Ada");
         drop(conn);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file written by an older version is world-readable; loading it should
+    /// tighten it rather than leave it that way.
+    #[cfg(unix)]
+    #[test]
+    fn restricts_a_world_readable_file_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("permissions");
+        let key = dir.join("identity.bin");
+
+        fs::write(&key, b"not really a key").expect("could not write the file");
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o644))
+            .expect("could not loosen the permissions");
+
+        restrict_to_owner(&key);
+
+        let mode = fs::metadata(&key)
+            .expect("could not read the file back")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(mode, 0o600, "the file should be readable only by its owner");
 
         let _ = fs::remove_dir_all(&dir);
     }

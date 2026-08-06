@@ -853,6 +853,15 @@ async function disableEncryption() {
  * until the user has entered their passphrase.
  */
 async function startSession() {
+  // Starts listening, answering mDNS, and connecting. Deliberately not done at
+  // launch: a locked node stays off the network entirely rather than appearing
+  // online to everyone while dropping every message sent to it.
+  try {
+    await invoke("start_network");
+  } catch (error) {
+    notify(`Could not start networking: ${error}`);
+  }
+
   await loadIdentity();
   await loadContacts();
   await loadGroups();
