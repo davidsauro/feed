@@ -371,7 +371,6 @@ fn stored_passphrase(app: &AppHandle) -> Option<String> {
     // `inner` ties the reference to the app rather than to the temporary handle
     // that `state` returns, which would otherwise be dropped too early.
     let state: &DatabaseKey = app.state::<DatabaseKey>().inner();
-
     match state.passphrase.lock() {
         Ok(passphrase) => passphrase.clone(),
         Err(error) => {
