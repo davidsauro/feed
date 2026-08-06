@@ -14,6 +14,8 @@
 //! frontend sends work to the network task through an mpsc channel, and the
 //! network task sends news back to the frontend as Tauri events.
 
+mod group_crypto;
+
 use futures::stream::StreamExt;
 use libp2p::gossipsub;
 use libp2p::identity::Keypair;
@@ -1461,7 +1463,7 @@ fn handle_peer_disconnected(app: &AppHandle, peer_id: PeerId) {
 /// Held to the same rule as direct messages: if the author isn't a contact, it
 /// goes no further. Gossipsub will still relay it onward to other members, which
 /// is what keeps the mesh working for people who do know them.
-fn handle_group_message(app: &AppHandle, message: gossipsub::Message) {
+fn handle_group_message(app: &AppHandle, keypair: &Keypair, message: gossipsub::Message) {
     // Strict validation guarantees a signature, so this is the peer who wrote
     // the message rather than whoever forwarded it.
     let Some(sender) = message.source else {
@@ -1477,7 +1479,18 @@ fn handle_group_message(app: &AppHandle, message: gossipsub::Message) {
         return;
     };
 
-    let payload = match String::from_utf8(message.data) {
+    // Only the members a message was sealed for can read it. Everyone else on
+    // the topic still relays it, and gets this far, and stops here — which is
+    // ordinary rather than suspicious, so it isn't reported to the user.
+    let plaintext = match group_crypto::open(keypair, group_id, &sender, &message.data) {
+        Ok(plaintext) => plaintext,
+        Err(error) => {
+            eprintln!("ignoring a group message we cannot read: {}", error);
+            return;
+        }
+    };
+
+    let payload = match String::from_utf8(plaintext) {
         Ok(payload) => payload,
         Err(error) => {
             eprintln!("ignoring a group message that isn't text: {}", error);
@@ -1560,6 +1573,7 @@ fn complete_send(
 fn handle_swarm_event(
     app: &AppHandle,
     swarm: &mut Swarm<AppBehaviour>,
+    keypair: &Keypair,
     pending_sends: &mut PendingSends,
     event: SwarmEvent<AppBehaviourEvent>,
 ) {
@@ -1612,7 +1626,7 @@ fn handle_swarm_event(
             message,
             ..
         })) => {
-            handle_group_message(app, message);
+            handle_group_message(app, keypair, message);
         }
 
         SwarmEvent::Behaviour(AppBehaviourEvent::Chat(RequestResponseEvent::Message {
@@ -1648,7 +1662,9 @@ fn handle_swarm_event(
 
 /// Carries out one command the frontend queued up.
 fn handle_network_command(
+    app: &AppHandle,
     swarm: &mut Swarm<AppBehaviour>,
+    keypair: &Keypair,
     pending_sends: &mut PendingSends,
     command: NetworkCommand,
 ) {
@@ -1694,10 +1710,20 @@ fn handle_network_command(
             message,
             result_tx,
         } => {
+            // Sealed before it goes anywhere, so the peers that relay it carry
+            // something none of them can read.
+            let sealed = match seal_for_group(app, keypair, &group_id, &message) {
+                Ok(sealed) => sealed,
+                Err(error) => {
+                    let _ = result_tx.send(Err(error));
+                    return;
+                }
+            };
+
             let result = swarm
                 .behaviour_mut()
                 .groups
-                .publish(group_topic(&group_id), message.into_bytes())
+                .publish(group_topic(&group_id), sealed)
                 .map(|_message_id| ())
                 .map_err(|error| error.to_string());
 
@@ -1705,6 +1731,41 @@ fn handle_network_command(
             let _ = result_tx.send(result);
         }
     }
+}
+
+/// Encrypts a message for everyone else in a group.
+///
+/// The member list comes from our own database rather than from the caller, so
+/// there is one answer to "who is in this group" and the send path can't be
+/// talked into addressing someone who isn't.
+///
+/// Ourselves excepted: gossipsub doesn't deliver our own messages back to us,
+/// and our copy is already stored locally when we send it.
+fn seal_for_group(
+    app: &AppHandle,
+    keypair: &Keypair,
+    group_id: &str,
+    message: &str,
+) -> Result<Vec<u8>, String> {
+    let conn = get_db_connection(app).map_err(|e| e.to_string())?;
+    let members = get_group_members(&conn, group_id).map_err(|e| e.to_string())?;
+
+    let me = PeerId::from(keypair.public());
+    let mut recipients = Vec::new();
+
+    for member in members {
+        match member.parse::<PeerId>() {
+            Ok(peer) if peer == me => {}
+            Ok(peer) => recipients.push(peer),
+            Err(error) => eprintln!("ignoring the unreadable member id '{}': {}", member, error),
+        }
+    }
+
+    if recipients.is_empty() {
+        return Err("this group has nobody else in it".to_string());
+    }
+
+    group_crypto::seal(keypair, group_id, &recipients, message.as_bytes())
 }
 
 /// Runs the network for as long as the app is open.
@@ -1717,6 +1778,10 @@ async fn run_network(
     keypair: Keypair,
     mut command_rx: mpsc::Receiver<NetworkCommand>,
 ) {
+    // Kept for sealing and opening group messages. The swarm takes ownership of
+    // the original for its own signing and handshakes.
+    let keypair_for_crypto = keypair.clone();
+
     let mut swarm = build_swarm(keypair);
 
     let listen_address = LISTEN_ADDRESS
@@ -1732,6 +1797,7 @@ async fn run_network(
     // unreadable until the user has entered their passphrase, which is long
     // after this task starts. Commands sent before this loop begins wait in the
     // channel, so nothing is missed.
+
     // Callers waiting on a direct message they've sent. Only this task touches
     // it, so it needs no lock.
     let mut pending_sends: PendingSends = HashMap::new();
@@ -1739,11 +1805,23 @@ async fn run_network(
     loop {
         tokio::select! {
             swarm_event = swarm.select_next_some() => {
-                handle_swarm_event(&app, &mut swarm, &mut pending_sends, swarm_event);
+                handle_swarm_event(
+                    &app,
+                    &mut swarm,
+                    &keypair_for_crypto,
+                    &mut pending_sends,
+                    swarm_event,
+                );
             }
 
             Some(command) = command_rx.recv() => {
-                handle_network_command(&mut swarm, &mut pending_sends, command);
+                handle_network_command(
+                    &app,
+                    &mut swarm,
+                    &keypair_for_crypto,
+                    &mut pending_sends,
+                    command,
+                );
             }
         }
     }
