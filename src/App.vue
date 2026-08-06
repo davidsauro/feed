@@ -22,7 +22,8 @@ import GroupList from "./components/GroupList.vue";
 import IdentityBar from "./components/IdentityBar.vue";
 import NewGroupDialog from "./components/NewGroupDialog.vue";
 import PeerList from "./components/PeerList.vue";
-import ThemeToggle from "./components/ThemeToggle.vue";
+import SettingsDialog from "./components/SettingsDialog.vue";
+import UnlockScreen from "./components/UnlockScreen.vue";
 import type { ChatMessage, Contact, Group } from "./types";
 import { shortPeerId } from "./types";
 
@@ -67,6 +68,27 @@ const pendingRemoval = ref<{
 } | null>(null);
 
 const creatingGroup = ref(false);
+const settingsOpen = ref(false);
+
+/**
+ * Whether the database is encrypted, and whether it can be read yet.
+ *
+ * Until this says unlocked, nothing else may touch the database, so the app
+ * shows the unlock screen and loads nothing. Assumed locked until the backend
+ * says otherwise, so a slow answer can't flash the UI on screen first.
+ */
+const encryption = ref({ enabled: false, unlocked: false });
+const unlockError = ref("");
+const unlocking = ref(false);
+
+/**
+ * Whether the status above has been answered yet.
+ *
+ * Nothing renders until it has. Without this the window would show the unlock
+ * screen for a moment on every ordinary startup, since "locked" is what we
+ * assume before the backend replies.
+ */
+const encryptionChecked = ref(false);
 
 /** Identifies a conversation across the `messages` and `unread` maps. */
 function conversationKey(kind: ConversationKind, id: string): string {
@@ -750,11 +772,91 @@ const removalWarning = computed(() => {
 
 // --- Startup --------------------------------------------------------------
 
-onMounted(async () => {
-  nodeInstance.value = await invoke<string>("get_node_id");
+// --- Encryption at rest ---------------------------------------------------
+
+async function refreshEncryptionStatus() {
+  try {
+    encryption.value = await invoke<{ enabled: boolean; unlocked: boolean }>(
+      "get_encryption_status",
+    );
+  } catch (error) {
+    // Assume the worst rather than starting a session against a database we
+    // might not be able to read.
+    console.error("Could not read the encryption status", error);
+    encryption.value = { enabled: true, unlocked: false };
+  }
+}
+
+/** Tries a passphrase, and starts the session if it works. */
+async function unlockDatabase(passphrase: string) {
+  unlocking.value = true;
+  unlockError.value = "";
+
+  try {
+    await invoke("unlock_database", { passphrase });
+    encryption.value = { enabled: true, unlocked: true };
+    await startSession();
+  } catch (error) {
+    unlockError.value = `${error}`;
+  } finally {
+    unlocking.value = false;
+  }
+}
+
+/** Throws away the unreadable database and starts fresh. */
+async function resetEverything() {
+  unlocking.value = true;
+
+  try {
+    await invoke("reset_all_data");
+    encryption.value = { enabled: false, unlocked: true };
+    unlockError.value = "";
+    await startSession();
+    notify("All data deleted. Starting fresh.", "info");
+  } catch (error) {
+    unlockError.value = `Could not delete the data: ${error}`;
+  } finally {
+    unlocking.value = false;
+  }
+}
+
+async function enableEncryption(passphrase: string) {
+  try {
+    await invoke("enable_encryption", { passphrase });
+    await refreshEncryptionStatus();
+    settingsOpen.value = false;
+    notify("Your data is now encrypted on this device.", "info");
+  } catch (error) {
+    settingsOpen.value = false;
+    notify(`Could not encrypt your data: ${error}`);
+  }
+}
+
+async function disableEncryption() {
+  try {
+    await invoke("disable_encryption");
+    await refreshEncryptionStatus();
+    settingsOpen.value = false;
+    notify("Encryption turned off. Your data is stored unencrypted.", "info");
+  } catch (error) {
+    settingsOpen.value = false;
+    notify(`Could not turn off encryption: ${error}`);
+  }
+}
+
+// --- Startup --------------------------------------------------------------
+
+/**
+ * Loads everything and starts listening.
+ *
+ * Split out from mounting because with encryption on none of it can happen
+ * until the user has entered their passphrase.
+ */
+async function startSession() {
   await loadIdentity();
   await loadContacts();
   await loadGroups();
+  await subscribeToSavedGroups();
 
   await listen<string>("peer-discovered", (event) => {
     activePeers.value.add(event.payload);
@@ -817,6 +919,35 @@ onMounted(async () => {
       );
     },
   );
+}
+
+/**
+ * Subscribes to the groups we're already in.
+ *
+ * The backend can't do this at startup any more: with encryption on, the
+ * database is unreadable until the passphrase arrives, which is long after the
+ * network task begins.
+ */
+async function subscribeToSavedGroups() {
+  for (const group of groups.value) {
+    try {
+      await invoke("subscribe_group", { groupId: group.id });
+    } catch (error) {
+      console.error(`Could not subscribe to ${group.name}`, error);
+    }
+  }
+}
+
+onMounted(async () => {
+  nodeInstance.value = await invoke<string>("get_node_id");
+
+  // Nothing else may touch the database until we know it can be read.
+  await refreshEncryptionStatus();
+  encryptionChecked.value = true;
+
+  if (encryption.value.unlocked) {
+    await startSession();
+  }
 });
 
 /**
@@ -847,7 +978,19 @@ function parsePayload(
 </script>
 
 <template>
-  <div class="app">
+  <!-- Nothing at all until we know whether the database can be read, so the
+       window never shows one screen and then replaces it with the other. -->
+  <template v-if="encryptionChecked">
+    <!-- Nothing behind this: with no passphrase there is nothing to show. -->
+    <UnlockScreen
+      v-if="!encryption.unlocked"
+      :error="unlockError"
+      :busy="unlocking"
+      @unlock="unlockDatabase"
+      @reset="resetEverything"
+    />
+
+    <div v-else class="app">
     <aside class="sidebar">
       <IdentityBar :peer-id="myPeerId" />
 
@@ -880,7 +1023,21 @@ function parsePayload(
           Node {{ nodeInstance }}
         </span>
 
-        <ThemeToggle />
+        <button class="settings-button" title="Settings" @click="settingsOpen = true">
+          <svg
+            viewBox="0 0 24 24"
+            width="15"
+            height="15"
+            stroke="currentColor"
+            stroke-width="2"
+            fill="none"
+          >
+            <circle cx="12" cy="12" r="3" />
+            <path
+              d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"
+            />
+          </svg>
+        </button>
       </footer>
     </aside>
 
@@ -928,6 +1085,14 @@ function parsePayload(
       </div>
     </main>
 
+    <SettingsDialog
+      v-if="settingsOpen"
+      :encryption-enabled="encryption.enabled"
+      @enable="enableEncryption"
+      @disable="disableEncryption"
+      @close="settingsOpen = false"
+    />
+
     <NewGroupDialog
       v-if="creatingGroup"
       :contacts="savedContacts"
@@ -945,14 +1110,15 @@ function parsePayload(
       @cancel="pendingRemoval = null"
     />
 
-    <!-- Errors and one-line confirmations. Replaces the old alert() calls. -->
-    <Transition name="notice">
-      <div v-if="notice" class="notice" :class="notice.kind">
-        <span>{{ notice.text }}</span>
-        <button class="dismiss" title="Dismiss" @click="notice = null">✕</button>
-      </div>
-    </Transition>
-  </div>
+      <!-- Errors and one-line confirmations. Replaces the old alert() calls. -->
+      <Transition name="notice">
+        <div v-if="notice" class="notice" :class="notice.kind">
+          <span>{{ notice.text }}</span>
+          <button class="dismiss" title="Dismiss" @click="notice = null">✕</button>
+        </div>
+      </Transition>
+    </div>
+  </template>
 </template>
 
 <style scoped>
@@ -1007,6 +1173,22 @@ function parsePayload(
   height: 6px;
   border-radius: 50%;
   background-color: var(--online);
+}
+
+.settings-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+}
+
+.settings-button:hover {
+  background-color: var(--bg-hover);
+  color: var(--text);
 }
 
 /* Main area ------------------------------------------------------------- */

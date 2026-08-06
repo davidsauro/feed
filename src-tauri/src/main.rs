@@ -209,6 +209,16 @@ enum NetworkCommand {
     },
 }
 
+/// The passphrase for the encrypted database, held only in memory.
+///
+/// `None` means either that encryption is off, or that it is on and the database
+/// hasn't been unlocked yet; `is_encryption_enabled` tells those apart. It is
+/// never written to disk — forgetting it is the whole point, and the reason the
+/// UI warns that losing it loses the data.
+struct DatabaseKey {
+    passphrase: Mutex<Option<String>>,
+}
+
 /// Shared state that Tauri hands to commands that ask for it.
 struct NetworkState {
     /// Peers mDNS has seen recently and not yet reported as expired.
@@ -291,19 +301,84 @@ fn get_or_create_keypair(app_data_dir: &Path, node_id: &str) -> Result<Keypair, 
 // Database
 // ---------------------------------------------------------------------------
 
+/// Where this node's data lives on disk.
+fn app_data_dir(app: &AppHandle) -> std::path::PathBuf {
+    app.path()
+        .app_local_data_dir()
+        .expect("no local data directory for this app")
+}
+
+/// This node's database file.
+fn db_path(app: &AppHandle) -> std::path::PathBuf {
+    app_data_dir(app).join(format!("contacts_{}.db", current_node_id()))
+}
+
+/// Marker file recording that the database is encrypted.
+///
+/// A flag on the filesystem rather than a row in the database, because we have to
+/// know whether a passphrase is needed *before* we can read anything.
+fn encryption_marker_path(app: &AppHandle) -> std::path::PathBuf {
+    app_data_dir(app).join(format!("encrypted_{}.flag", current_node_id()))
+}
+
+/// Whether this node's database is encrypted.
+fn is_encryption_enabled(app: &AppHandle) -> bool {
+    encryption_marker_path(app).exists()
+}
+
+/// Unlocks a connection with the passphrase held in memory.
+///
+/// SQLCipher requires the key before anything else touches the connection, so
+/// this runs immediately after opening.
+fn apply_key(conn: &Connection, passphrase: &str) -> SqlResult<()> {
+    conn.pragma_update(None, "key", passphrase)
+}
+
+/// Checks that a connection can actually read the database.
+///
+/// With the wrong key SQLCipher fails on the first read rather than at the point
+/// the key was set, so this is what turns a bad passphrase into an error.
+fn verify_readable(conn: &Connection) -> SqlResult<()> {
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map(|_| ())
+}
+
 /// Opens this node's SQLite database, creating the file if it isn't there yet.
 ///
 /// Connections are cheap and are not thread safe, so every caller opens its own
 /// rather than sharing one.
+///
+/// If a passphrase is held in memory it is applied here, which is what makes
+/// every command work the same whether or not encryption is on. While the
+/// database is encrypted and still locked there is no passphrase to apply, so
+/// reads fail — including the contact lookup that admits inbound messages, which
+/// means a locked node quietly accepts nothing. That is the intended behavior:
+/// nothing should be written to a database we can't read.
 fn get_db_connection(app: &AppHandle) -> SqlResult<Connection> {
-    let app_data_dir = app
-        .path()
-        .app_local_data_dir()
-        .expect("no local data directory for this app");
+    let conn = Connection::open(db_path(app))?;
 
-    let db_path = app_data_dir.join(format!("contacts_{}.db", current_node_id()));
+    if let Some(passphrase) = stored_passphrase(app) {
+        apply_key(&conn, &passphrase)?;
+    }
 
-    Connection::open(db_path)
+    Ok(conn)
+}
+
+/// The passphrase for this session, if the database has been unlocked.
+fn stored_passphrase(app: &AppHandle) -> Option<String> {
+    // `inner` ties the reference to the app rather than to the temporary handle
+    // that `state` returns, which would otherwise be dropped too early.
+    let state: &DatabaseKey = app.state::<DatabaseKey>().inner();
+
+    match state.passphrase.lock() {
+        Ok(passphrase) => passphrase.clone(),
+        Err(error) => {
+            eprintln!("could not read the database passphrase: {}", error);
+            None
+        }
+    }
 }
 
 /// Creates the tables the app needs, if they don't already exist.
@@ -407,6 +482,214 @@ fn is_contact(app: &AppHandle, peer_id: &str) -> bool {
     let count: i64 = statement.query_row([peer_id], |row| row.get(0)).unwrap_or(0);
 
     count > 0
+}
+
+// ---------------------------------------------------------------------------
+// Tauri commands: encryption at rest
+// ---------------------------------------------------------------------------
+
+/// What the frontend needs to know before it can load anything.
+#[derive(Serialize)]
+struct EncryptionStatus {
+    /// Whether the database on disk is encrypted.
+    enabled: bool,
+    /// Whether it can be read right now. False means the passphrase is needed.
+    unlocked: bool,
+}
+
+#[tauri::command]
+fn get_encryption_status(app: AppHandle) -> EncryptionStatus {
+    let enabled = is_encryption_enabled(&app);
+
+    EncryptionStatus {
+        enabled,
+        unlocked: !enabled || stored_passphrase(&app).is_some(),
+    }
+}
+
+/// Opens the database with a passphrase, keeping it in memory if it works.
+///
+/// Also creates the tables, which is what makes turning encryption on before
+/// there is anything to store work the same as turning it on later.
+#[tauri::command]
+fn unlock_database(app: AppHandle, passphrase: String) -> Result<(), String> {
+    if !is_encryption_enabled(&app) {
+        return Ok(());
+    }
+
+    let conn = Connection::open(db_path(&app)).map_err(|e| e.to_string())?;
+    apply_key(&conn, &passphrase).map_err(|e| e.to_string())?;
+
+    // A wrong passphrase surfaces here, as an unreadable file, rather than at the
+    // point the key was set. Deliberately not passed through to the UI verbatim:
+    // "file is not a database" describes the symptom, not the cause.
+    verify_readable(&conn).map_err(|_| "That passphrase didn't work.".to_string())?;
+
+    create_tables(&conn).map_err(|e| e.to_string())?;
+
+    let state = app.state::<DatabaseKey>();
+    let mut stored = state.passphrase.lock().map_err(|e| e.to_string())?;
+    *stored = Some(passphrase);
+
+    Ok(())
+}
+
+/// Encrypts the database in place and remembers the passphrase for this session.
+///
+/// Works by exporting every row into a new encrypted file and swapping it in,
+/// which is SQLCipher's own migration path. The swap only happens once the
+/// export has fully succeeded, so a failure part way through leaves the original
+/// untouched.
+#[tauri::command]
+fn enable_encryption(app: AppHandle, passphrase: String) -> Result<(), String> {
+    if passphrase.is_empty() {
+        return Err("A passphrase is required.".to_string());
+    }
+
+    if is_encryption_enabled(&app) {
+        return Err("This database is already encrypted.".to_string());
+    }
+
+    let source = db_path(&app);
+    let target = migration_path(&app);
+
+    export_database(&source, None, &target, Some(&passphrase))?;
+
+    fs::rename(&target, &source).map_err(|e| e.to_string())?;
+    fs::write(encryption_marker_path(&app), ENCRYPTION_MARKER_NOTE).map_err(|e| e.to_string())?;
+
+    let state = app.state::<DatabaseKey>();
+    let mut stored = state.passphrase.lock().map_err(|e| e.to_string())?;
+    *stored = Some(passphrase);
+
+    Ok(())
+}
+
+/// Decrypts the database in place, leaving it readable without a passphrase.
+///
+/// Only possible while unlocked, since the current passphrase is needed to read
+/// what's being copied out.
+#[tauri::command]
+fn disable_encryption(app: AppHandle) -> Result<(), String> {
+    if !is_encryption_enabled(&app) {
+        return Err("This database is not encrypted.".to_string());
+    }
+
+    let passphrase =
+        stored_passphrase(&app).ok_or_else(|| "The database is locked.".to_string())?;
+
+    let source = db_path(&app);
+    let target = migration_path(&app);
+
+    export_database(&source, Some(&passphrase), &target, None)?;
+
+    fs::rename(&target, &source).map_err(|e| e.to_string())?;
+    fs::remove_file(encryption_marker_path(&app)).map_err(|e| e.to_string())?;
+
+    let state = app.state::<DatabaseKey>();
+    let mut stored = state.passphrase.lock().map_err(|e| e.to_string())?;
+    *stored = None;
+
+    Ok(())
+}
+
+/// Copies one database into a new file, changing the key on the way.
+///
+/// `None` for either passphrase means that side is plaintext, which is what
+/// makes this serve both encrypting and decrypting.
+fn export_database(
+    source: &std::path::Path,
+    source_passphrase: Option<&str>,
+    target: &std::path::Path,
+    target_passphrase: Option<&str>,
+) -> Result<(), String> {
+    let target_name = target
+        .to_str()
+        .ok_or_else(|| "the database path is not valid UTF-8".to_string())?;
+
+    // Left over from an attempt that failed before the swap.
+    if target.exists() {
+        fs::remove_file(target).map_err(|e| e.to_string())?;
+    }
+
+    let conn = Connection::open(source).map_err(|e| e.to_string())?;
+
+    if let Some(passphrase) = source_passphrase {
+        apply_key(&conn, passphrase).map_err(|e| e.to_string())?;
+    }
+
+    verify_readable(&conn).map_err(|e| e.to_string())?;
+
+    // An empty key means plaintext, which is how SQLCipher spells "no
+    // encryption". Both values are bound rather than interpolated, so a
+    // passphrase containing quotes is no different from any other.
+    conn.execute(
+        "ATTACH DATABASE ?1 AS migration KEY ?2",
+        (target_name, target_passphrase.unwrap_or("")),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let export = conn
+        .query_row("SELECT sqlcipher_export('migration')", [], |_| Ok(()))
+        .map_err(|e| e.to_string());
+
+    // Detach whether or not the export worked, so the temporary file isn't left
+    // open by this connection.
+    let detach = conn
+        .execute("DETACH DATABASE migration", [])
+        .map_err(|e| e.to_string());
+
+    export?;
+    detach?;
+
+    Ok(())
+}
+
+/// Temporary file the re-keyed copy is written to before being swapped in.
+fn migration_path(app: &AppHandle) -> std::path::PathBuf {
+    app_data_dir(app).join(format!("contacts_{}.db.migrating", current_node_id()))
+}
+
+/// Written into the marker file. Nothing reads it; it is there for anyone who
+/// finds the file and wonders what it is.
+const ENCRYPTION_MARKER_NOTE: &str =
+    "This node's database is encrypted with SQLCipher. Deleting this file will \
+     not decrypt it — it only records that a passphrase is needed.\n";
+
+/// Deletes this node's database and starts over with an empty one.
+///
+/// The escape hatch for a forgotten passphrase: the data is unrecoverable, so
+/// the only thing left is to abandon it. The identity keypair is deliberately
+/// kept, so contacts who saved this node still recognise it afterwards.
+#[tauri::command]
+fn reset_all_data(app: AppHandle) -> Result<(), String> {
+    let database = db_path(&app);
+
+    // SQLite may leave a journal or write-ahead log beside the database. They
+    // would be meaningless next to a new file, so they go too.
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let path = std::path::PathBuf::from(format!("{}{}", database.display(), suffix));
+
+        if path.exists() {
+            fs::remove_file(&path).map_err(|e| e.to_string())?;
+        }
+    }
+
+    let marker = encryption_marker_path(&app);
+    if marker.exists() {
+        fs::remove_file(&marker).map_err(|e| e.to_string())?;
+    }
+
+    let state = app.state::<DatabaseKey>();
+    {
+        let mut stored = state.passphrase.lock().map_err(|e| e.to_string())?;
+        *stored = None;
+    }
+
+    let conn = Connection::open(&database).map_err(|e| e.to_string())?;
+    create_tables(&conn).map_err(|e| e.to_string())?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,26 +1387,6 @@ fn handle_group_message(app: &AppHandle, message: gossipsub::Message) {
     );
 }
 
-/// Subscribes to every group already in the database.
-///
-/// Runs once at startup: without it, a restart would leave us in groups we no
-/// longer hear anything from.
-fn subscribe_to_saved_groups(app: &AppHandle, swarm: &mut Swarm<AppBehaviour>) {
-    let groups = match get_groups(app.clone()) {
-        Ok(groups) => groups,
-        Err(error) => {
-            eprintln!("could not load groups to subscribe to: {}", error);
-            return;
-        }
-    };
-
-    for group in groups {
-        if let Err(error) = swarm.behaviour_mut().groups.subscribe(&group_topic(&group.id)) {
-            eprintln!("could not subscribe to group '{}': {}", group.name, error);
-        }
-    }
-}
-
 /// Handles one inbound chat message.
 ///
 /// Messages from peers that are not in our contacts are dropped without a
@@ -1310,8 +1573,11 @@ async fn run_network(
         .listen_on(listen_address)
         .expect("failed to start listening for connections");
 
-    subscribe_to_saved_groups(&app, &mut swarm);
-
+    // Subscribing to saved groups is left to the frontend, which does it after
+    // loading them. It can't happen here: with encryption on, the database is
+    // unreadable until the user has entered their passphrase, which is long
+    // after this task starts. Commands sent before this loop begins wait in the
+    // channel, so nothing is missed.
     loop {
         tokio::select! {
             swarm_event = swarm.select_next_some() => {
@@ -1344,12 +1610,23 @@ fn main() {
                 network_tx: Mutex::new(network_tx),
             });
 
-            // Make sure the database is usable before anything reads from it.
-            match get_db_connection(&app_handle) {
-                Ok(conn) => {
-                    create_tables(&conn).expect("failed to create the database tables");
+            // Managed before anything can reach the database, since opening one
+            // reads the passphrase from here.
+            app_handle.manage(DatabaseKey {
+                passphrase: Mutex::new(None),
+            });
+
+            // An encrypted database can't be touched until the user has entered
+            // their passphrase, so setting it up waits for `unlock_database`.
+            if is_encryption_enabled(&app_handle) {
+                println!("database is encrypted; waiting for a passphrase");
+            } else {
+                match get_db_connection(&app_handle) {
+                    Ok(conn) => {
+                        create_tables(&conn).expect("failed to create the database tables");
+                    }
+                    Err(error) => eprintln!("could not open the database: {}", error),
                 }
-                Err(error) => eprintln!("could not open the database: {}", error),
             }
 
             let app_data_dir = app
@@ -1365,6 +1642,12 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            // Encryption at rest
+            get_encryption_status,
+            unlock_database,
+            enable_encryption,
+            disable_encryption,
+            reset_all_data,
             // Identity
             get_node_id,
             get_identity,
@@ -1393,4 +1676,135 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// Covers the encryption migration, which is the one place in the app where a
+/// mistake destroys data rather than just misbehaving.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A private directory for one test to work in.
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("feed-test-{}-{}", std::process::id(), name));
+
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("could not create the scratch directory");
+
+        dir
+    }
+
+    /// An ordinary unencrypted database with one contact in it.
+    fn seed_plaintext(path: &std::path::Path) {
+        let conn = Connection::open(path).expect("could not create the database");
+        create_tables(&conn).expect("could not create the tables");
+
+        conn.execute(
+            "INSERT INTO contacts (peer_id, nickname) VALUES ('peer-1', 'Ada')",
+            (),
+        )
+        .expect("could not insert the contact");
+    }
+
+    fn stored_nickname(conn: &Connection) -> String {
+        conn.query_row(
+            "SELECT nickname FROM contacts WHERE peer_id = 'peer-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("could not read the contact back")
+    }
+
+    /// Encrypting keeps the data, and only the right passphrase gets it back.
+    #[test]
+    fn round_trips_through_encryption() {
+        let dir = scratch_dir("round-trip");
+        let database = dir.join("contacts.db");
+        let migration = dir.join("contacts.db.migrating");
+        let passphrase = "correct horse battery staple";
+
+        seed_plaintext(&database);
+
+        export_database(&database, None, &migration, Some(passphrase)).expect("encrypting failed");
+        fs::rename(&migration, &database).expect("could not swap in the encrypted file");
+
+        // The right passphrase reads what was there before.
+        let conn = Connection::open(&database).unwrap();
+        apply_key(&conn, passphrase).unwrap();
+        verify_readable(&conn).expect("the correct passphrase should open the database");
+        assert_eq!(stored_nickname(&conn), "Ada");
+        drop(conn);
+
+        // No passphrase does not.
+        let conn = Connection::open(&database).unwrap();
+        assert!(
+            verify_readable(&conn).is_err(),
+            "an encrypted database must not be readable without a passphrase"
+        );
+        drop(conn);
+
+        // Nor does the wrong one.
+        let conn = Connection::open(&database).unwrap();
+        apply_key(&conn, "not the passphrase").unwrap();
+        assert!(
+            verify_readable(&conn).is_err(),
+            "the wrong passphrase must not open the database"
+        );
+        drop(conn);
+
+        // And decrypting gives back an ordinary database.
+        export_database(&database, Some(passphrase), &migration, None).expect("decrypting failed");
+        fs::rename(&migration, &database).expect("could not swap in the decrypted file");
+
+        let conn = Connection::open(&database).unwrap();
+        verify_readable(&conn).expect("a decrypted database should need no passphrase");
+        assert_eq!(stored_nickname(&conn), "Ada");
+        drop(conn);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The passphrase is bound as a parameter rather than pasted into SQL, so
+    /// quotes and semicolons in it are just characters.
+    #[test]
+    fn accepts_an_awkward_passphrase() {
+        let dir = scratch_dir("awkward");
+        let database = dir.join("contacts.db");
+        let migration = dir.join("contacts.db.migrating");
+        let passphrase = "it's \"quoted\"; DROP TABLE contacts; --";
+
+        seed_plaintext(&database);
+
+        export_database(&database, None, &migration, Some(passphrase)).expect("encrypting failed");
+        fs::rename(&migration, &database).expect("could not swap in the encrypted file");
+
+        let conn = Connection::open(&database).unwrap();
+        apply_key(&conn, passphrase).unwrap();
+        verify_readable(&conn).expect("an awkward passphrase should still work");
+        assert_eq!(stored_nickname(&conn), "Ada");
+        drop(conn);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A half-finished attempt leaves a temporary file behind; the next one must
+    /// not trip over it.
+    #[test]
+    fn overwrites_a_leftover_migration_file() {
+        let dir = scratch_dir("leftover");
+        let database = dir.join("contacts.db");
+        let migration = dir.join("contacts.db.migrating");
+
+        seed_plaintext(&database);
+        fs::write(&migration, b"not a database").expect("could not write the leftover file");
+
+        export_database(&database, None, &migration, Some("passphrase"))
+            .expect("a leftover file should be replaced, not fatal");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
