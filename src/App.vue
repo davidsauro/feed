@@ -15,6 +15,7 @@ import { computed, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
+import AddMembersDialog from "./components/AddMembersDialog.vue";
 import ChatPane from "./components/ChatPane.vue";
 import ConfirmDialog from "./components/ConfirmDialog.vue";
 import ContactList from "./components/ContactList.vue";
@@ -24,7 +25,7 @@ import NewGroupDialog from "./components/NewGroupDialog.vue";
 import PeerList from "./components/PeerList.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import UnlockScreen from "./components/UnlockScreen.vue";
-import type { ChatMessage, Contact, Group } from "./types";
+import type { ChatMessage, Contact, Group, MessageStatus } from "./types";
 import { shortPeerId } from "./types";
 
 /** Which kind of thing a conversation is with. */
@@ -79,6 +80,7 @@ const pendingRemoval = ref<{
 } | null>(null);
 
 const creatingGroup = ref(false);
+const addingMembers = ref(false);
 const settingsOpen = ref(false);
 
 /**
@@ -368,6 +370,119 @@ async function createGroup(name: string, memberPeerIds: string[]) {
   }
 }
 
+/**
+ * Tells the rest of a group that we're leaving it.
+ *
+ * Not waited on. Each notice waits to hear that it arrived, and an unreachable
+ * member takes the full timeout to give up — nobody should sit watching a
+ * spinner to leave a conversation. The notices are already handed to the
+ * network, so they still go out after the group is gone from here.
+ *
+ * A member who is offline for this will go on believing we're in the group. In
+ * a group this size that's a wrong number on a screen, and they find out the
+ * next time we speak to them, which is never — so it stays wrong. Fixing that
+ * properly means versioned membership; it isn't worth it yet.
+ */
+function announceDeparture(groupId: string, members: string[]) {
+  const notice = JSON.stringify({ type: "group-leave", groupId });
+
+  for (const peerId of members) {
+    invoke("send_message", { peerId, message: notice }).catch((error) => {
+      console.error(`Could not tell ${peerId} that we left`, error);
+    });
+  }
+}
+
+/** Contacts who could be added to the open group. */
+const addableContacts = computed(() => {
+  const group = selectedGroup.value;
+  if (!group) {
+    return [];
+  }
+
+  return savedContacts.value.filter((contact) => !group.members.includes(contact.peer_id));
+});
+
+/**
+ * Adds contacts to the open group, and tells everyone who is now in it.
+ *
+ * The invite carries the whole membership rather than just the newcomers, so it
+ * serves twice over: the people being added learn the group exists, and the
+ * people already in it learn who else to encrypt for. Without that second part a
+ * new member would only ever hear from whoever added them.
+ */
+async function addMembers(peerIds: string[]) {
+  const group = selectedGroup.value;
+  addingMembers.value = false;
+
+  if (!group || peerIds.length === 0) {
+    return;
+  }
+
+  const members = [...group.members, ...peerIds];
+
+  try {
+    await invoke("save_group", { id: group.id, name: group.name, members });
+    await loadGroups();
+  } catch (error) {
+    notify(`Could not add anyone to ${group.name}: ${error}`);
+    return;
+  }
+
+  const invite = JSON.stringify({
+    type: "group-invite",
+    groupId: group.id,
+    groupName: group.name,
+    members,
+  });
+
+  const recipients = members.filter((member) => member !== myPeerId.value);
+  const results = await Promise.all(
+    recipients.map(async (peerId) => {
+      try {
+        await invoke("send_message", { peerId, message: invite });
+        return null;
+      } catch (error) {
+        console.error(`Could not tell ${peerId} about the new members`, error);
+        return peerId;
+      }
+    }),
+  );
+
+  const unreachable = results.filter((peerId): peerId is string => peerId !== null);
+  const added = peerIds.map(displayName).join(", ");
+
+  if (unreachable.length > 0) {
+    // Anyone who missed this keeps an older idea of who's in the group, and
+    // will neither send to nor hear from the new members until they're told.
+    notify(
+      `Added ${added}, but could not reach ${unreachable.map(displayName).join(", ")}.`,
+    );
+  } else {
+    notify(`Added ${added} to ${group.name}.`, "info");
+  }
+}
+
+/** Handles someone announcing that they've left a group we're in. */
+async function receiveDeparture(sender: string, groupId: string) {
+  const group = groups.value.find((candidate) => candidate.id === groupId);
+
+  if (!group || !group.members.includes(sender)) {
+    return;
+  }
+
+  const members = group.members.filter((member) => member !== sender);
+
+  try {
+    await invoke("save_group", { id: groupId, name: group.name, members });
+    await loadGroups();
+
+    notify(`${displayName(sender)} left ${group.name}.`, "info");
+  } catch (error) {
+    console.error("Could not record that a member left", error);
+  }
+}
+
 /** Handles an invite from a contact by joining the group they made. */
 async function receiveInvite(
   sender: string,
@@ -375,12 +490,21 @@ async function receiveInvite(
   groupName: string,
   members: string[],
 ) {
+  // The same message serves as an invitation and as "here is who is in this
+  // group now", so which it is depends on whether we already know the group.
+  const alreadyIn = groups.value.some((group) => group.id === groupId);
+
   try {
     await invoke("save_group", { id: groupId, name: groupName, members });
     await invoke("subscribe_group", { groupId });
     await loadGroups();
 
-    notify(`${displayName(sender)} added you to ${groupName}.`, "info");
+    notify(
+      alreadyIn
+        ? `${displayName(sender)} changed who's in ${groupName}.`
+        : `${displayName(sender)} added you to ${groupName}.`,
+      "info",
+    );
   } catch (error) {
     console.error("Could not join a group we were invited to", error);
   }
@@ -422,68 +546,27 @@ async function sendGroupMessage(text: string) {
       status: "sending",
     });
 
-    // The name and members ride along so anyone whose copy is out of date
-    // catches up without a separate sync.
     await invoke("send_group_message", {
       groupId: group.id,
-      message: JSON.stringify({
-        type: "group-chat",
-        id,
-        text,
-        groupName: group.name,
-        members: group.members,
-      }),
+      message: JSON.stringify({ type: "group-chat", id, text }),
     });
 
-    message.status = "delivered";
+    setMessageStatus(key, id, "delivered");
     await invoke("update_message_status", { id, status: "delivered" });
   } catch (error) {
-    message.status = "failed";
+    setMessageStatus(key, id, "failed");
     invoke("update_message_status", { id, status: "failed" }).catch(() => {});
     notify(`Could not send to ${group.name}: ${error}`);
   }
 }
 
-/**
- * Whether an inbound message describes a group differently to how we have it.
- *
- * Members are compared as sets, since nothing guarantees the order two nodes
- * store them in.
- */
-function groupDetailsChanged(groupId: string, name: string, members: string[]): boolean {
-  const known = groups.value.find((group) => group.id === groupId);
-  if (!known) {
-    return true;
-  }
-
-  if (known.name !== name || known.members.length !== members.length) {
-    return true;
-  }
-
-  const knownMembers = new Set(known.members);
-
-  return members.some((member) => !knownMembers.has(member));
-}
-
 /** Handles a group message from a contact. */
-async function receiveGroupMessage(
-  groupId: string,
-  sender: string,
-  id: string,
-  text: string,
-  groupName?: string,
-  members?: string[],
-) {
-  // Keep our copy of the group in step with the sender's, but only write when
-  // something actually changed: this runs on every inbound message.
-  if (groupName && Array.isArray(members) && groupDetailsChanged(groupId, groupName, members)) {
-    try {
-      await invoke("save_group", { id: groupId, name: groupName, members });
-      await loadGroups();
-    } catch (error) {
-      console.error("Could not update group details", error);
-    }
-  }
+async function receiveGroupMessage(groupId: string, sender: string, id: string, text: string) {
+  // Membership deliberately isn't taken from the message. It used to be, so a
+  // node with an out-of-date copy would catch up — but it also meant that a
+  // member who left was put straight back by the next message from anyone who
+  // hadn't heard yet. Membership now changes only when someone is invited or
+  // announces they've left.
 
   // As with a direct message, the database decides whether this is new. Here it
   // also absorbs the duplicate deliveries gossipsub produces on a mesh with
@@ -589,6 +672,25 @@ async function selectGroup(group: Group) {
   unread.value[key] = false;
 }
 
+/**
+ * Changes a message's status so the screen actually shows it.
+ *
+ * Has to go through the conversation rather than through the object that was
+ * pushed into it. Pushing stores the object as it is, and Vue only wraps it in
+ * something it can watch when the array is read back — so assigning to the
+ * original updates the data while leaving the display exactly as it was. That
+ * was why a sent group message kept its clock: the status did change, but
+ * nothing knew to repaint it, and unlike a direct message no read receipt came
+ * along later to force the issue.
+ */
+function setMessageStatus(key: string, id: string, status: MessageStatus) {
+  const message = messages.value[key]?.find((candidate) => candidate.id === id);
+
+  if (message) {
+    message.status = status;
+  }
+}
+
 /** Records a status change in SQLite. Best effort: the UI has already moved on. */
 function markMessageRead(id: string) {
   invoke("update_message_status", { id, status: "read" }).catch((error) => {
@@ -638,10 +740,10 @@ async function sendMessage(text: string) {
       message: JSON.stringify({ type: "chat", id, text }),
     });
 
-    message.status = "delivered";
+    setMessageStatus(key, id, "delivered");
     await invoke("update_message_status", { id, status: "delivered" });
   } catch (error) {
-    message.status = "failed";
+    setMessageStatus(key, id, "failed");
     invoke("update_message_status", { id, status: "failed" }).catch(() => {});
     notify(`Could not send to ${contact.nickname}: ${error}`);
   }
@@ -683,7 +785,7 @@ async function receiveChatMessage(sender: string, id: string, text: string) {
   // If their conversation is already on screen, it's read the moment it lands.
   if (selection.value?.kind === "contact" && selection.value.id === sender) {
     sendReadReceipt(sender, [id]);
-    message.status = "read";
+    setMessageStatus(key, id, "read");
     markMessageRead(id);
   } else {
     unread.value[key] = true;
@@ -748,6 +850,12 @@ async function confirmRemoval() {
       deleted = await invoke<number>("delete_contact", { peerId: pending.id });
       await loadContacts();
     } else {
+      // Tell the others before the group is gone from here, while we still
+      // know who they are.
+      const group = groups.value.find((candidate) => candidate.id === pending.id);
+      const others = (group?.members ?? []).filter((member) => member !== myPeerId.value);
+      announceDeparture(pending.id, others);
+
       // Stop listening before forgetting the group, or messages would keep
       // arriving for a conversation we no longer have.
       await invoke("unsubscribe_group", { groupId: pending.id });
@@ -961,6 +1069,8 @@ async function startSession() {
       Array.isArray(data.members)
     ) {
       await receiveInvite(sender, data.groupId, data.groupName, data.members);
+    } else if (data.type === "group-leave" && data.groupId) {
+      await receiveDeparture(sender, data.groupId);
     }
   });
 
@@ -974,14 +1084,7 @@ async function startSession() {
         return;
       }
 
-      await receiveGroupMessage(
-        groupId,
-        sender,
-        data.id,
-        data.text,
-        data.groupName,
-        data.members,
-      );
+      await receiveGroupMessage(groupId, sender, data.id, data.text);
     },
   );
 }
@@ -1127,7 +1230,9 @@ function parsePayload(
         :messages="currentMessages"
         :my-peer-id="myPeerId"
         :sender-labels="groupSenderLabels"
+        :can-add-members="true"
         @send="sendGroupMessage"
+        @add-members="addingMembers = true"
       />
 
       <div v-else class="placeholder">
@@ -1158,6 +1263,14 @@ function parsePayload(
       @disable="disableEncryption"
       @rename="changeDisplayName"
       @close="settingsOpen = false"
+    />
+
+    <AddMembersDialog
+      v-if="addingMembers && selectedGroup"
+      :group-name="selectedGroup.name"
+      :candidates="addableContacts"
+      @add="addMembers"
+      @cancel="addingMembers = false"
     />
 
     <NewGroupDialog

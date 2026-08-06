@@ -32,10 +32,13 @@ const props = defineProps<{
    * person named in the header.
    */
   senderLabels?: Record<string, string>;
+  /** Shows the button for adding people. Groups only. */
+  canAddMembers?: boolean;
 }>();
 
 const emit = defineEmits<{
   send: [text: string];
+  addMembers: [];
 }>();
 
 const draft = ref("");
@@ -79,6 +82,28 @@ watch(
         <span class="status-dot" />
         {{ online ? "Online" : "Offline" }}
       </span>
+
+      <button
+        v-if="canAddMembers"
+        class="add-members"
+        title="Add people to this group"
+        @click="emit('addMembers')"
+      >
+        <svg
+          viewBox="0 0 24 24"
+          width="15"
+          height="15"
+          stroke="currentColor"
+          stroke-width="2"
+          fill="none"
+          stroke-linecap="round"
+        >
+          <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+          <circle cx="9" cy="7" r="4" />
+          <line x1="19" y1="8" x2="19" y2="14" />
+          <line x1="22" y1="11" x2="16" y2="11" />
+        </svg>
+      </button>
     </header>
 
     <div ref="history" class="history">
@@ -176,6 +201,23 @@ watch(
   flex: none;
   font-size: 12px;
   color: var(--text-muted);
+}
+
+.add-members {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  margin-left: auto;
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+}
+
+.add-members:hover {
+  background-color: var(--bg-hover);
+  color: var(--text);
 }
 
 .status-dot {
