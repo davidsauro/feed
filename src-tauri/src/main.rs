@@ -67,6 +67,10 @@ const CHAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// a node join the conversation.
 const GROUP_TOPIC_PREFIX: &str = "/group/1.0.0/";
 
+/// Prefix for the gossipsub topic a one-to-one conversation travels on. What
+/// follows it is derived from the secret the two peers share.
+const DIRECT_TOPIC_PREFIX: &str = "/direct/1.0.0/";
+
 /// How often gossipsub maintains its mesh. The default is one second, which is
 /// more upkeep than a handful of nodes on a LAN needs.
 const GOSSIPSUB_HEARTBEAT: Duration = Duration::from_secs(10);
@@ -155,6 +159,10 @@ struct Group {
 /// `status` is one of "sending", "delivered", "read", or "failed". Group
 /// messages stop at "delivered": gossipsub tells us a message reached the mesh,
 /// not who read it.
+/// `sent_at` is when the sender says they wrote it, in milliseconds since the
+/// epoch, and is what conversations are ordered by. It travels inside the
+/// sealed payload, so nothing that carries the message can alter it. Null for
+/// messages stored before this existed.
 #[derive(Serialize, Deserialize)]
 struct ChatMessage {
     id: String,
@@ -163,6 +171,7 @@ struct ChatMessage {
     sender: String,
     text: String,
     status: String,
+    sent_at: i64,
 }
 
 /// Emitted to the frontend as the `chat-received` event.
@@ -224,6 +233,23 @@ enum NetworkCommand {
     /// Tell everyone currently connected what to call this node.
     AnnounceName {
         name: String,
+    },
+    /// Start receiving one contact's messages.
+    SubscribeToDirect {
+        peer_id: String,
+    },
+    /// Stop receiving them, on removing the contact.
+    UnsubscribeFromDirect {
+        peer_id: String,
+    },
+    /// Send to one contact, sealed for them alone.
+    ///
+    /// Reports back like `PublishToGroup`, and for the same reason: publishing
+    /// with nobody listening is a failure the sender needs to know about.
+    PublishToDirect {
+        peer_id: String,
+        message: String,
+        result_tx: oneshot::Sender<Result<(), String>>,
     },
     /// Publish to a group.
     ///
@@ -300,6 +326,22 @@ struct AppBehaviour {
 /// The gossipsub topic a group's messages travel on.
 fn group_topic(group_id: &str) -> gossipsub::IdentTopic {
     gossipsub::IdentTopic::new(format!("{}{}", GROUP_TOPIC_PREFIX, group_id))
+}
+
+/// The gossipsub topic our conversation with one peer travels on.
+///
+/// Direct messages go the same way as group messages rather than over a
+/// connection to the peer itself. That is what lets them work between two nodes
+/// that can never connect to each other — behind separate home routers, say —
+/// as long as both can reach something in the middle. Nobody has to accept an
+/// incoming connection.
+fn direct_topic(keypair: &Keypair, peer: &PeerId) -> Result<gossipsub::IdentTopic, String> {
+    let name = group_crypto::direct_topic_id(keypair, peer)?;
+
+    Ok(gossipsub::IdentTopic::new(format!(
+        "{}{}",
+        DIRECT_TOPIC_PREFIX, name
+    )))
 }
 
 /// Recovers a group id from the topic a message arrived on.
@@ -520,27 +562,42 @@ fn create_tables(conn: &Connection) -> SqlResult<()> {
 /// Checked rather than attempted-and-ignored, because SQLite gives no way to say
 /// "add this column only if it's missing".
 fn add_missing_columns(conn: &Connection) -> SqlResult<()> {
-    let has_group_id = {
+    let existing = {
         let mut statement = conn.prepare("PRAGMA table_info(messages)")?;
 
         // Column 1 of table_info is the column name.
         let names = statement.query_map([], |row| row.get::<_, String>(1))?;
 
-        let mut found = false;
+        let mut existing = HashSet::new();
         for name in names {
-            if name? == "group_id" {
-                found = true;
-            }
+            existing.insert(name?);
         }
-        found
+        existing
     };
 
-    if !has_group_id {
+    if !existing.contains("group_id") {
         conn.execute("ALTER TABLE messages ADD COLUMN group_id TEXT", ())?;
+    }
+
+    if !existing.contains("sent_at") {
+        conn.execute("ALTER TABLE messages ADD COLUMN sent_at INTEGER", ())?;
     }
 
     Ok(())
 }
+
+/// Orders a conversation by when each message was written rather than when it
+/// reached us.
+///
+/// Those were the same thing when every message crossed one hop of a local
+/// network. Once messages travel by different routes they can arrive out of
+/// order, and a conversation that reads in the wrong order is worse than one
+/// that arrives slowly.
+///
+/// Rows written before `sent_at` existed fall back to their arrival time, which
+/// is the best that can be said about them.
+const EFFECTIVE_SENT_AT: &str =
+    "COALESCE(sent_at, CAST(strftime('%s', timestamp) AS INTEGER) * 1000)";
 
 /// Answers whether we have saved this peer as a contact.
 ///
@@ -1005,14 +1062,15 @@ fn save_chat_message(
     sender: String,
     text: String,
     status: String,
+    sent_at: i64,
 ) -> Result<bool, String> {
     let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
 
     let rows_written = conn
         .execute(
-            "INSERT OR IGNORE INTO messages (id, peer_id, sender, text, status)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            (&id, &peer_id, &sender, &text, &status),
+            "INSERT OR IGNORE INTO messages (id, peer_id, sender, text, status, sent_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (&id, &peer_id, &sender, &text, &status, sent_at),
         )
         .map_err(|e| e.to_string())?;
 
@@ -1040,10 +1098,13 @@ fn get_chat_history(app: AppHandle, peer_id: String) -> Result<Vec<ChatMessage>,
 
     let mut statement = conn
         .prepare(
-            "SELECT id, peer_id, group_id, sender, text, status
-             FROM messages
-             WHERE peer_id = ?1 AND group_id IS NULL
-             ORDER BY timestamp ASC",
+            &format!(
+                "SELECT id, peer_id, group_id, sender, text, status, {effective} AS sent_at
+                 FROM messages
+                 WHERE peer_id = ?1 AND group_id IS NULL
+                 ORDER BY sent_at ASC",
+                effective = EFFECTIVE_SENT_AT
+            ),
         )
         .map_err(|e| e.to_string())?;
 
@@ -1064,6 +1125,7 @@ fn read_chat_message(row: &rusqlite::Row) -> SqlResult<ChatMessage> {
         sender: row.get(3)?,
         text: row.get(4)?,
         status: row.get(5)?,
+        sent_at: row.get(6)?,
     })
 }
 
@@ -1230,14 +1292,15 @@ fn save_group_message(
     sender: String,
     text: String,
     status: String,
+    sent_at: i64,
 ) -> Result<bool, String> {
     let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
 
     let rows_written = conn
         .execute(
-            "INSERT OR IGNORE INTO messages (id, peer_id, group_id, sender, text, status)
-             VALUES (?1, '', ?2, ?3, ?4, ?5)",
-            (&id, &group_id, &sender, &text, &status),
+            "INSERT OR IGNORE INTO messages (id, peer_id, group_id, sender, text, status, sent_at)
+             VALUES (?1, '', ?2, ?3, ?4, ?5, ?6)",
+            (&id, &group_id, &sender, &text, &status, sent_at),
         )
         .map_err(|e| e.to_string())?;
 
@@ -1251,10 +1314,13 @@ fn get_group_history(app: AppHandle, group_id: String) -> Result<Vec<ChatMessage
 
     let mut statement = conn
         .prepare(
-            "SELECT id, peer_id, group_id, sender, text, status
-             FROM messages
-             WHERE group_id = ?1
-             ORDER BY timestamp ASC",
+            &format!(
+                "SELECT id, peer_id, group_id, sender, text, status, {effective} AS sent_at
+                 FROM messages
+                 WHERE group_id = ?1
+                 ORDER BY sent_at ASC",
+                effective = EFFECTIVE_SENT_AT
+            ),
         )
         .map_err(|e| e.to_string())?;
 
@@ -1349,6 +1415,83 @@ fn network_sender(state: &State<'_, NetworkState>) -> Result<mpsc::Sender<Networ
     let guard = state.network_tx.lock().map_err(|e| e.to_string())?;
 
     Ok(guard.clone())
+}
+
+/// Starts receiving one contact's messages.
+///
+/// Called for every contact once the app is unlocked, and whenever one is
+/// added. A conversation we aren't listening to is one we never hear, which is
+/// exactly what should happen for people who aren't contacts.
+#[tauri::command]
+async fn subscribe_direct(state: State<'_, NetworkState>, peer_id: String) -> Result<(), String> {
+    let network_tx = network_sender(&state)?;
+
+    network_tx
+        .send(NetworkCommand::SubscribeToDirect { peer_id })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Stops receiving one contact's messages, on removing them.
+#[tauri::command]
+async fn unsubscribe_direct(state: State<'_, NetworkState>, peer_id: String) -> Result<(), String> {
+    let network_tx = network_sender(&state)?;
+
+    network_tx
+        .send(NetworkCommand::UnsubscribeFromDirect { peer_id })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Sends to one contact and waits to hear whether it went out.
+///
+/// Success means the message reached somewhere that carries this conversation,
+/// not that the recipient has it — on a local network those are the same thing,
+/// but with a server in the middle they are not. The recipient's own
+/// acknowledgement is what confirms delivery.
+#[tauri::command]
+async fn send_direct(
+    state: State<'_, NetworkState>,
+    peer_id: String,
+    message: String,
+) -> Result<(), String> {
+    let network_tx = network_sender(&state)?;
+    let (result_tx, result_rx) = oneshot::channel();
+
+    network_tx
+        .send(NetworkCommand::PublishToDirect {
+            peer_id,
+            message,
+            result_tx,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    result_rx
+        .await
+        .map_err(|_| "the network task stopped before it could answer".to_string())?
+}
+
+/// Marks messages left mid-flight by a previous run as failed.
+///
+/// A message sits at "sending" until the recipient acknowledges it. If the app
+/// closes before that happens, no acknowledgement is ever coming, and the clock
+/// beside it would otherwise spin forever.
+#[tauri::command]
+fn fail_stale_sends(app: AppHandle) -> Result<(), String> {
+    let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "UPDATE messages SET status = 'failed' WHERE status = 'sending'",
+        (),
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
 }
 
 /// Starts receiving a group's messages.
@@ -1565,7 +1708,12 @@ fn handle_peer_disconnected(app: &AppHandle, peer_id: PeerId) {
 /// Held to the same rule as direct messages: if the author isn't a contact, it
 /// goes no further. Gossipsub will still relay it onward to other members, which
 /// is what keeps the mesh working for people who do know them.
-fn handle_group_message(app: &AppHandle, keypair: &Keypair, message: gossipsub::Message) {
+/// Routes one gossipsub message to the conversation it belongs to.
+///
+/// Both kinds arrive here. A group topic names itself; a direct topic can't be
+/// read back, so it's recognised by deriving what this sender's conversation
+/// with us would be called and seeing whether that is where the message landed.
+fn handle_gossipsub_message(app: &AppHandle, keypair: &Keypair, message: gossipsub::Message) {
     // Strict validation guarantees a signature, so this is the peer who wrote
     // the message rather than whoever forwarded it.
     let Some(sender) = message.source else {
@@ -1577,14 +1725,85 @@ fn handle_group_message(app: &AppHandle, keypair: &Keypair, message: gossipsub::
         return;
     }
 
-    let Some(group_id) = group_id_from_topic(message.topic.as_str()) else {
+    let topic = message.topic.as_str().to_string();
+
+    if topic.starts_with(DIRECT_TOPIC_PREFIX) {
+        handle_direct_message(app, keypair, sender, &topic, message.data);
+    } else {
+        handle_group_message(app, keypair, sender, &topic, message.data);
+    }
+}
+
+/// Handles one message from a contact, sent to just us.
+///
+/// Emitted as `chat-received`, exactly as a message arriving over a direct
+/// connection would be, so everything above this is unaware of which way it
+/// came.
+fn handle_direct_message(
+    app: &AppHandle,
+    keypair: &Keypair,
+    sender: PeerId,
+    topic: &str,
+    data: Vec<u8>,
+) {
+    let name = match group_crypto::direct_topic_id(keypair, &sender) {
+        Ok(name) => name,
+        Err(error) => {
+            eprintln!("could not work out our conversation with {}: {}", sender, error);
+            return;
+        }
+    };
+
+    // Anything else is a conversation between two other people that we happen to
+    // be carrying, and is none of our business.
+    if topic != format!("{}{}", DIRECT_TOPIC_PREFIX, name) {
+        return;
+    }
+
+    let plaintext = match group_crypto::open(keypair, &name, &sender, &data) {
+        Ok(plaintext) => plaintext,
+        Err(error) => {
+            eprintln!("ignoring a message we cannot read from {}: {}", sender, error);
+            return;
+        }
+    };
+
+    let payload = match String::from_utf8(plaintext) {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("ignoring a message that isn't text: {}", error);
+            return;
+        }
+    };
+
+    emit_to_frontend(
+        app,
+        "chat-received",
+        ChatPayload {
+            sender: sender.to_string(),
+            message: payload,
+        },
+    );
+}
+
+/// Handles one inbound group message.
+fn handle_group_message(
+    app: &AppHandle,
+    keypair: &Keypair,
+    sender: PeerId,
+    topic: &str,
+    data: Vec<u8>,
+) {
+    let sender_id = sender.to_string();
+
+    let Some(group_id) = group_id_from_topic(topic) else {
         return;
     };
 
     // Only the members a message was sealed for can read it. Everyone else on
     // the topic still relays it, and gets this far, and stops here — which is
     // ordinary rather than suspicious, so it isn't reported to the user.
-    let plaintext = match group_crypto::open(keypair, group_id, &sender, &message.data) {
+    let plaintext = match group_crypto::open(keypair, group_id, &sender, &data) {
         Ok(plaintext) => plaintext,
         Err(error) => {
             eprintln!("ignoring a group message we cannot read: {}", error);
@@ -1827,7 +2046,7 @@ fn handle_swarm_event(
             message,
             ..
         })) => {
-            handle_group_message(app, keypair, message);
+            handle_gossipsub_message(app, keypair, message);
         }
 
         SwarmEvent::Behaviour(AppBehaviourEvent::Chat(RequestResponseEvent::Message {
@@ -1906,6 +2125,35 @@ fn handle_network_command(
                 .unsubscribe(&group_topic(&group_id));
         }
 
+        NetworkCommand::SubscribeToDirect { peer_id } => {
+            match parse_peer(&peer_id).and_then(|peer| direct_topic(keypair, &peer)) {
+                Ok(topic) => {
+                    if let Err(error) = swarm.behaviour_mut().groups.subscribe(&topic) {
+                        eprintln!("could not listen for messages from {}: {}", peer_id, error);
+                    }
+                }
+                Err(error) => eprintln!("cannot listen for {}: {}", peer_id, error),
+            }
+        }
+
+        NetworkCommand::UnsubscribeFromDirect { peer_id } => {
+            match parse_peer(&peer_id).and_then(|peer| direct_topic(keypair, &peer)) {
+                Ok(topic) => {
+                    swarm.behaviour_mut().groups.unsubscribe(&topic);
+                }
+                Err(error) => eprintln!("cannot stop listening for {}: {}", peer_id, error),
+            }
+        }
+
+        NetworkCommand::PublishToDirect {
+            peer_id,
+            message,
+            result_tx,
+        } => {
+            let result = publish_direct(swarm, keypair, &peer_id, &message);
+            let _ = result_tx.send(result);
+        }
+
         NetworkCommand::AnnounceName { name } => {
             let announcement = name_announcement(&name);
 
@@ -1947,6 +2195,37 @@ fn handle_network_command(
             let _ = result_tx.send(result);
         }
     }
+}
+
+/// Reads a peer id, with an error worth showing rather than a parse failure.
+fn parse_peer(peer_id: &str) -> Result<PeerId, String> {
+    peer_id
+        .parse::<PeerId>()
+        .map_err(|error| format!("'{}' is not a peer id: {}", peer_id, error))
+}
+
+/// Seals a message for one contact and publishes it to the conversation they
+/// share with us.
+///
+/// The conversation's name doubles as what the encryption is bound to, so a
+/// message cannot be lifted into a different conversation any more than it can
+/// be lifted into a different group.
+fn publish_direct(
+    swarm: &mut Swarm<AppBehaviour>,
+    keypair: &Keypair,
+    peer_id: &str,
+    message: &str,
+) -> Result<(), String> {
+    let peer = parse_peer(peer_id)?;
+    let name = group_crypto::direct_topic_id(keypair, &peer)?;
+    let sealed = group_crypto::seal(keypair, &name, &[peer], message.as_bytes())?;
+
+    swarm
+        .behaviour_mut()
+        .groups
+        .publish(direct_topic(keypair, &peer)?, sealed)
+        .map(|_message_id| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Encrypts a message for everyone else in a group.
@@ -2121,6 +2400,10 @@ fn main() {
             get_group_history,
             // Network
             start_network,
+            subscribe_direct,
+            unsubscribe_direct,
+            send_direct,
+            fail_stale_sends,
             get_active_peers,
             send_message,
             subscribe_group,

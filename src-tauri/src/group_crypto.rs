@@ -47,6 +47,7 @@
 //! of work.
 
 use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -64,6 +65,10 @@ const ENVELOPE_VERSION: u8 = 1;
 /// Separates this use of a shared secret from any other. Two systems deriving
 /// keys from the same secret should never arrive at the same key.
 const KEY_WRAP_INFO: &[u8] = b"feed/group-key-wrap/v1";
+
+/// Separates the conversation-naming use of a shared secret from the key-wrapping
+/// use of the very same secret.
+const DIRECT_TOPIC_INFO: &[u8] = b"feed/direct-topic/v1";
 
 /// The multihash code meaning "this is the key itself, not a hash of it".
 const MULTIHASH_IDENTITY_CODE: u64 = 0x00;
@@ -241,6 +246,34 @@ pub fn open(
         .map_err(|_| "the message could not be decrypted".to_string())
 }
 
+/// Names the topic two peers use for their conversation with each other.
+///
+/// Derived from the secret the two of them share, so both arrive at the same
+/// name and nobody else can work it out — not even a server carrying the
+/// traffic, which sees only an opaque string. Naming it after either peer id
+/// would let anyone subscribe and collect the ciphertext and the timing of
+/// everything sent to them.
+///
+/// Note what this does and doesn't prevent. Nobody outside the pair can derive
+/// the name, so no third party can read or publish into a conversation between
+/// two other people. A stranger *can* derive the name they would use to talk to
+/// us, since that only needs our public id and their own key — but we subscribe
+/// only to the conversations we have with contacts, so nothing they publish
+/// there ever reaches us.
+pub fn direct_topic_id(keypair: &Keypair, peer: &PeerId) -> Result<String, String> {
+    let shared = our_encryption_key(keypair)?.diffie_hellman(&encryption_key_of(peer)?);
+
+    // No salt: the secret is already unique to this pair, and both sides have to
+    // derive the same name without any exchange.
+    let hkdf = Hkdf::<Sha256>::new(None, shared.as_bytes());
+
+    let mut name = [0u8; 32];
+    hkdf.expand(DIRECT_TOPIC_INFO, &mut name)
+        .map_err(|_| "could not derive the conversation name".to_string())?;
+
+    Ok(URL_SAFE_NO_PAD.encode(name))
+}
+
 /// What the encryption is tied to: the format, the group, and who sent it.
 ///
 /// Passed as associated data, so decryption fails if any of them differ from
@@ -344,6 +377,55 @@ mod tests {
 
             assert_eq!(opened, message);
         }
+    }
+
+    /// Both ends have to arrive at the same name with no exchange at all, or
+    /// they'd be talking in different places.
+    #[test]
+    fn two_peers_name_their_conversation_the_same() {
+        let alice = node();
+        let bob = node();
+
+        let from_alice = direct_topic_id(&alice, &peer(&bob)).unwrap();
+        let from_bob = direct_topic_id(&bob, &peer(&alice)).unwrap();
+
+        assert_eq!(from_alice, from_bob);
+    }
+
+    /// And a third person must arrive somewhere else entirely, or they could
+    /// simply subscribe and listen in.
+    #[test]
+    fn a_third_peer_names_a_different_conversation() {
+        let alice = node();
+        let bob = node();
+        let carol = node();
+
+        let alice_and_bob = direct_topic_id(&alice, &peer(&bob)).unwrap();
+        let alice_and_carol = direct_topic_id(&alice, &peer(&carol)).unwrap();
+        let carol_and_bob = direct_topic_id(&carol, &peer(&bob)).unwrap();
+
+        assert_ne!(alice_and_bob, alice_and_carol);
+        assert_ne!(alice_and_bob, carol_and_bob);
+    }
+
+    /// The conversation name and the key that wraps messages come from the same
+    /// shared secret, and must not come out the same.
+    #[test]
+    fn the_topic_name_is_not_the_wrapping_key() {
+        let alice = node();
+        let bob = node();
+
+        let name = direct_topic_id(&alice, &peer(&bob)).unwrap();
+        let shared = our_encryption_key(&alice)
+            .unwrap()
+            .diffie_hellman(&encryption_key_of(&peer(&bob)).unwrap());
+        let wrapping = derive_wrapping_key(shared.as_bytes(), &name).unwrap();
+
+        assert_ne!(
+            URL_SAFE_NO_PAD.encode(wrapping),
+            name,
+            "the name a conversation is published under must not be its key"
+        );
     }
 
     /// The whole point: someone left out cannot read it, even though gossipsub

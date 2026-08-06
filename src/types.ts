@@ -35,6 +35,14 @@ export interface ChatMessage {
   sender: string;
   text: string;
   status: MessageStatus;
+  /**
+   * When the sender says they wrote it, in milliseconds since the epoch.
+   *
+   * Conversations are ordered by this rather than by arrival, because messages
+   * can now take different routes and arrive out of order. It travels inside the
+   * sealed payload, so nothing carrying the message can alter it.
+   */
+  sent_at: number;
 }
 
 /**

@@ -6,10 +6,10 @@
  * components under it are presentational: they take props and report what the
  * user did, and this file decides what that means.
  *
- * Two kinds of conversation live here. Direct messages go peer to peer over the
- * request-response protocol. Group messages go over gossipsub, where they can
- * reach members we have no direct connection to, because peers in the middle
- * relay them.
+ * Both kinds of conversation travel the same way: over gossipsub, on a topic
+ * only the people involved can name. Nothing requires a connection to the person
+ * being written to, so two nodes that could never reach each other directly can
+ * still talk as long as both can reach something in the middle.
  */
 import { computed, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
@@ -110,6 +110,53 @@ const unlocking = ref(false);
  * assume before the backend replies.
  */
 const encryptionChecked = ref(false);
+
+/**
+ * How far ahead of us a sender's clock may be before we stop believing it.
+ *
+ * A clock running fast would pin its messages to the bottom of a conversation
+ * for as long as the conversation exists. One running slow only misplaces them
+ * once, on arrival, so only the fast direction is worth guarding against.
+ */
+const CLOCK_SKEW_TOLERANCE_MS = 5 * 60 * 1000;
+
+/**
+ * Reads the time a message claims it was written.
+ *
+ * Falls back to now for anything missing or nonsensical, which covers senders
+ * running an older version as well as senders being difficult.
+ */
+function claimedSentAt(claimed: unknown): number {
+  const now = Date.now();
+
+  if (typeof claimed !== "number" || !Number.isFinite(claimed) || claimed <= 0) {
+    return now;
+  }
+
+  return Math.min(claimed, now + CLOCK_SKEW_TOLERANCE_MS);
+}
+
+/**
+ * Puts a message into a conversation in the position its timestamp calls for.
+ *
+ * Appending would be wrong now that messages can arrive out of order: the
+ * screen has to match what reopening the conversation would show, and that
+ * comes back from the database sorted by when each one was written.
+ */
+function insertMessage(key: string, message: ChatMessage) {
+  if (!messages.value[key]) {
+    messages.value[key] = [];
+  }
+
+  const conversation = messages.value[key];
+  const at = conversation.findIndex((existing) => existing.sent_at > message.sent_at);
+
+  if (at === -1) {
+    conversation.push(message);
+  } else {
+    conversation.splice(at, 0, message);
+  }
+}
 
 /** Identifies a conversation across the `messages` and `unread` maps. */
 function conversationKey(kind: ConversationKind, id: string): string {
@@ -297,6 +344,7 @@ async function loadGroups() {
 async function addContact(peerId: string, nickname: string) {
   try {
     await invoke("save_contact", { peerId, nickname });
+    await invoke("subscribe_direct", { peerId });
     await loadContacts();
     notify(`Added ${nickname}.`, "info");
   } catch (error) {
@@ -356,7 +404,7 @@ async function createGroup(name: string, memberPeerIds: string[]) {
   const results = await Promise.all(
     memberPeerIds.map(async (peerId) => {
       try {
-        await invoke("send_message", { peerId, message: invite });
+        await invoke("send_direct", { peerId, message: invite });
         return null;
       } catch (error) {
         console.error(`Could not invite ${peerId}`, error);
@@ -395,7 +443,7 @@ function announceDeparture(groupId: string, members: string[]) {
   const notice = JSON.stringify({ type: "group-leave", groupId });
 
   for (const peerId of members) {
-    invoke("send_message", { peerId, message: notice }).catch((error) => {
+    invoke("send_direct", { peerId, message: notice }).catch((error) => {
       console.error(`Could not tell ${peerId} that we left`, error);
     });
   }
@@ -448,7 +496,7 @@ async function addMembers(peerIds: string[]) {
   const results = await Promise.all(
     recipients.map(async (peerId) => {
       try {
-        await invoke("send_message", { peerId, message: invite });
+        await invoke("send_direct", { peerId, message: invite });
         return null;
       } catch (error) {
         console.error(`Could not tell ${peerId} about the new members`, error);
@@ -532,18 +580,16 @@ async function sendGroupMessage(text: string) {
   }
 
   const id = crypto.randomUUID();
-  const message: ChatMessage = {
+  const sentAt = Date.now();
+
+  const key = conversationKey("group", group.id);
+  insertMessage(key, {
     id,
     sender: myPeerId.value,
     text,
     status: "sending",
-  };
-
-  const key = conversationKey("group", group.id);
-  if (!messages.value[key]) {
-    messages.value[key] = [];
-  }
-  messages.value[key].push(message);
+    sent_at: sentAt,
+  });
 
   try {
     await invoke("save_group_message", {
@@ -552,11 +598,12 @@ async function sendGroupMessage(text: string) {
       sender: myPeerId.value,
       text,
       status: "sending",
+      sentAt,
     });
 
     await invoke("send_group_message", {
       groupId: group.id,
-      message: JSON.stringify({ type: "group-chat", id, text }),
+      message: JSON.stringify({ type: "group-chat", id, text, sentAt }),
     });
 
     setMessageStatus(key, id, "delivered");
@@ -569,7 +616,13 @@ async function sendGroupMessage(text: string) {
 }
 
 /** Handles a group message from a contact. */
-async function receiveGroupMessage(groupId: string, sender: string, id: string, text: string) {
+async function receiveGroupMessage(
+  groupId: string,
+  sender: string,
+  id: string,
+  text: string,
+  sentAt: number,
+) {
   // Membership deliberately isn't taken from the message. It used to be, so a
   // node with an out-of-date copy would catch up — but it also meant that a
   // member who left was put straight back by the next message from anyone who
@@ -585,6 +638,7 @@ async function receiveGroupMessage(groupId: string, sender: string, id: string, 
     sender,
     text,
     status: "delivered",
+    sentAt,
   });
 
   if (!stored) {
@@ -592,10 +646,7 @@ async function receiveGroupMessage(groupId: string, sender: string, id: string, 
   }
 
   const key = conversationKey("group", groupId);
-  if (!messages.value[key]) {
-    messages.value[key] = [];
-  }
-  messages.value[key].push({ id, sender, text, status: "delivered" });
+  insertMessage(key, { id, sender, text, status: "delivered", sent_at: sentAt });
 
   if (selection.value?.kind !== "group" || selection.value.id !== groupId) {
     unread.value[key] = true;
@@ -612,7 +663,7 @@ async function sendReadReceipt(peerId: string, messageIds: string[]) {
   const payload = JSON.stringify({ type: "read", messageIds });
 
   try {
-    await invoke("send_message", { peerId, message: payload });
+    await invoke("send_direct", { peerId, message: payload });
   } catch (error) {
     // A receipt that doesn't arrive is not worth interrupting the user over;
     // they'll get one next time the conversation is opened.
@@ -720,19 +771,16 @@ async function sendMessage(text: string) {
 
   const peerId = contact.peer_id;
   const id = crypto.randomUUID();
+  const sentAt = Date.now();
 
-  const message: ChatMessage = {
+  const key = conversationKey("contact", peerId);
+  insertMessage(key, {
     id,
     sender: myPeerId.value,
     text,
     status: "sending",
-  };
-
-  const key = conversationKey("contact", peerId);
-  if (!messages.value[key]) {
-    messages.value[key] = [];
-  }
-  messages.value[key].push(message);
+    sent_at: sentAt,
+  });
 
   try {
     await invoke("save_chat_message", {
@@ -741,20 +789,55 @@ async function sendMessage(text: string) {
       sender: myPeerId.value,
       text,
       status: "sending",
+      sentAt,
     });
 
-    await invoke("send_message", {
+    // Reaching the conversation is not the same as reaching the person: with
+    // anything in the middle, this only means it was carried. It stays at
+    // "sending" until they acknowledge it.
+    await invoke("send_direct", {
       peerId,
-      message: JSON.stringify({ type: "chat", id, text }),
+      message: JSON.stringify({ type: "chat", id, text, sentAt }),
     });
-
-    setMessageStatus(key, id, "delivered");
-    await invoke("update_message_status", { id, status: "delivered" });
   } catch (error) {
     setMessageStatus(key, id, "failed");
     invoke("update_message_status", { id, status: "failed" }).catch(() => {});
     notify(`Could not send to ${contact.nickname}: ${error}`);
   }
+}
+
+/**
+ * Tells a contact their message arrived, which is what turns their clock into a
+ * tick.
+ *
+ * Sent by the receiving node, so it means the message is stored here — a
+ * stronger claim than anything the network layer can make on its own.
+ */
+async function sendAck(peerId: string, id: string) {
+  try {
+    await invoke("send_direct", {
+      peerId,
+      message: JSON.stringify({ type: "ack", id }),
+    });
+  } catch (error) {
+    console.error(`Could not acknowledge ${id}`, error);
+  }
+}
+
+/** Handles a contact confirming they have one of our messages. */
+function receiveAck(sender: string, id: string) {
+  const key = conversationKey("contact", sender);
+  const message = messages.value[key]?.find((candidate) => candidate.id === id);
+
+  // A read receipt says more than an acknowledgement, so never go backwards.
+  if (message && message.status !== "sending") {
+    return;
+  }
+
+  setMessageStatus(key, id, "delivered");
+  invoke("update_message_status", { id, status: "delivered" }).catch((error) => {
+    console.error(`Could not record the acknowledgement of ${id}`, error);
+  });
 }
 
 /**
@@ -768,13 +851,14 @@ async function sendMessage(text: string) {
  * asking the database is what makes that true even for a conversation we
  * haven't loaded.
  */
-async function receiveChatMessage(sender: string, id: string, text: string) {
+async function receiveChatMessage(sender: string, id: string, text: string, sentAt: number) {
   const stored = await invoke<boolean>("save_chat_message", {
     id,
     peerId: sender,
     sender,
     text,
     status: "delivered",
+    sentAt,
   });
 
   if (!stored) {
@@ -782,13 +866,12 @@ async function receiveChatMessage(sender: string, id: string, text: string) {
     return;
   }
 
-  const key = conversationKey("contact", sender);
-  const message: ChatMessage = { id, sender, text, status: "delivered" };
+  // Told before anything else, so their clock turns into a tick even if we
+  // never open the conversation.
+  sendAck(sender, id);
 
-  if (!messages.value[key]) {
-    messages.value[key] = [];
-  }
-  messages.value[key].push(message);
+  const key = conversationKey("contact", sender);
+  insertMessage(key, { id, sender, text, status: "delivered", sent_at: sentAt });
 
   // If their conversation is already on screen, it's read the moment it lands.
   if (selection.value?.kind === "contact" && selection.value.id === sender) {
@@ -889,6 +972,7 @@ async function confirmRemoval() {
       }
 
       deleted += await invoke<number>("delete_contact", { peerId: pending.id });
+      await invoke("unsubscribe_direct", { peerId: pending.id });
       await loadContacts();
       await loadGroups();
     } else {
@@ -1107,9 +1191,17 @@ async function startSession() {
     notify(`Could not start networking: ${error}`);
   }
 
+  // Anything left mid-flight by the last run will never be acknowledged now.
+  try {
+    await invoke("fail_stale_sends");
+  } catch (error) {
+    console.error("Could not settle unfinished sends", error);
+  }
+
   await loadIdentity();
   await loadNames();
   await loadContacts();
+  await subscribeToContacts();
   await loadGroups();
   await subscribeToSavedGroups();
 
@@ -1145,7 +1237,9 @@ async function startSession() {
     }
 
     if (data.type === "chat" && data.id && typeof data.text === "string") {
-      await receiveChatMessage(sender, data.id, data.text);
+      await receiveChatMessage(sender, data.id, data.text, claimedSentAt(data.sentAt));
+    } else if (data.type === "ack" && data.id) {
+      receiveAck(sender, data.id);
     } else if (data.type === "read" && Array.isArray(data.messageIds)) {
       receiveReadReceipt(sender, data.messageIds);
     } else if (
@@ -1170,7 +1264,13 @@ async function startSession() {
         return;
       }
 
-      await receiveGroupMessage(groupId, sender, data.id, data.text);
+      await receiveGroupMessage(
+        groupId,
+        sender,
+        data.id,
+        data.text,
+        claimedSentAt(data.sentAt),
+      );
     },
   );
 }
@@ -1182,6 +1282,23 @@ async function startSession() {
  * database is unreadable until the passphrase arrives, which is long after the
  * network task begins.
  */
+/**
+ * Starts listening to each contact's conversation.
+ *
+ * Only contacts, which is what keeps strangers out: anyone can work out the name
+ * of the conversation they would have with us, but nothing published there
+ * reaches a node that isn't listening for it.
+ */
+async function subscribeToContacts() {
+  for (const contact of savedContacts.value) {
+    try {
+      await invoke("subscribe_direct", { peerId: contact.peer_id });
+    } catch (error) {
+      console.error(`Could not listen for ${contact.nickname}`, error);
+    }
+  }
+}
+
 async function subscribeToSavedGroups() {
   for (const group of groups.value) {
     try {
@@ -1218,6 +1335,7 @@ function parsePayload(
   id?: string;
   text?: string;
   messageIds?: string[];
+  sentAt?: number;
   groupId?: string;
   groupName?: string;
   members?: string[];
