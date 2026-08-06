@@ -95,9 +95,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
           <div class="row">
             <div class="row-text">
               <span class="label">Theme</span>
-              <span class="hint">
-                System follows your desktop, which is unreliable under WSL2.
-              </span>
+              <span class="hint">Mirror system, light or dark</span>
             </div>
             <ThemeToggle />
           </div>
