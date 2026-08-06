@@ -10,6 +10,8 @@ import { shortPeerId } from "../types";
 
 const props = defineProps<{
   peerId: string;
+  /** The name chosen in Settings, which other nodes are told. Empty if unset. */
+  name: string;
 }>();
 
 const justCopied = ref(false);
@@ -35,9 +37,15 @@ async function copyPeerId() {
     <span class="label">My node</span>
 
     <div class="row">
-      <code class="peer-id" :title="peerId">
-        {{ peerId ? shortPeerId(peerId) : "…" }}
-      </code>
+      <span class="text">
+        <span v-if="name" class="name">{{ name }}</span>
+
+        <!-- Drops to a subtitle once there's a name above it, since the id is
+             then only needed for reading out or copying. -->
+        <code class="peer-id" :class="{ secondary: name }" :title="peerId">
+          {{ peerId ? shortPeerId(peerId) : "…" }}
+        </code>
+      </span>
 
       <button
         class="copy"
@@ -97,14 +105,32 @@ async function copyPeerId() {
   gap: 6px;
 }
 
-.peer-id {
+.text {
+  display: flex;
+  flex-direction: column;
   flex: 1;
+  min-width: 0;
+}
+
+.name {
+  overflow: hidden;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.peer-id {
   overflow: hidden;
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--text);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.peer-id.secondary {
+  font-size: 10px;
+  color: var(--text-faint);
 }
 
 .copy {

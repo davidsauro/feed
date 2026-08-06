@@ -77,6 +77,14 @@ const pendingRemoval = ref<{
   id: string;
   name: string;
   messageCount: number;
+  /**
+   * Groups that go with this, which is only ever the case for a contact.
+   *
+   * Staying in a group with someone we've removed would mean sitting in a
+   * conversation with a hole in it: their messages are dropped on arrival, so
+   * the group would look complete while a third of it silently never appeared.
+   */
+  groups: { id: string; name: string; messageCount: number }[];
 } | null>(null);
 
 const creatingGroup = ref(false);
@@ -831,7 +839,33 @@ async function requestRemoval(kind: ConversationKind, id: string, name: string) 
     console.error("Could not count stored messages", error);
   }
 
-  pendingRemoval.value = { kind, id, name, messageCount };
+  // Removing a contact means leaving the groups they're in, so those have to be
+  // counted up before asking, not sprung afterwards.
+  const shared = kind === "contact" ? groupsContaining(id) : [];
+  const sharedGroups = await Promise.all(
+    shared.map(async (group) => ({
+      id: group.id,
+      name: group.name,
+      messageCount: await countGroupMessages(group.id),
+    })),
+  );
+
+  pendingRemoval.value = { kind, id, name, messageCount, groups: sharedGroups };
+}
+
+/** The groups a peer is a member of. */
+function groupsContaining(peerId: string): Group[] {
+  return groups.value.filter((group) => group.members.includes(peerId));
+}
+
+/** How many messages a group holds, or 0 if that can't be established. */
+async function countGroupMessages(groupId: string): Promise<number> {
+  try {
+    return await invoke<number>("count_group_messages", { groupId });
+  } catch (error) {
+    console.error(`Could not count the messages in ${groupId}`, error);
+    return 0;
+  }
 }
 
 /** Step two: the user confirmed, so delete. */
@@ -844,43 +878,78 @@ async function confirmRemoval() {
   pendingRemoval.value = null;
 
   try {
-    let deleted: number;
+    let deleted = 0;
 
     if (pending.kind === "contact") {
-      deleted = await invoke<number>("delete_contact", { peerId: pending.id });
-      await loadContacts();
-    } else {
-      // Tell the others before the group is gone from here, while we still
-      // know who they are.
-      const group = groups.value.find((candidate) => candidate.id === pending.id);
-      const others = (group?.members ?? []).filter((member) => member !== myPeerId.value);
-      announceDeparture(pending.id, others);
+      // Groups first, so their departure notices are on their way before
+      // anything else changes. Each one needs the member list that is about to
+      // be deleted with it.
+      for (const group of pending.groups) {
+        deleted += await leaveGroup(group.id);
+      }
 
-      // Stop listening before forgetting the group, or messages would keep
-      // arriving for a conversation we no longer have.
-      await invoke("unsubscribe_group", { groupId: pending.id });
-      deleted = await invoke<number>("delete_group", { groupId: pending.id });
+      deleted += await invoke<number>("delete_contact", { peerId: pending.id });
+      await loadContacts();
+      await loadGroups();
+    } else {
+      deleted = await leaveGroup(pending.id);
       await loadGroups();
     }
 
     // Drop the local copies too, or the conversation would linger on screen
     // until the next restart.
-    const key = conversationKey(pending.kind, pending.id);
-    delete messages.value[key];
-    delete unread.value[key];
+    forgetConversation(pending.kind, pending.id);
 
-    if (selection.value?.kind === pending.kind && selection.value.id === pending.id) {
-      selection.value = null;
-    }
-
-    const action = pending.kind === "contact" ? "Removed" : "Left";
-    notify(
-      `${action} ${pending.name} and deleted ${describeMessageCount(deleted)}.`,
-      "info",
-    );
+    notify(describeRemoval(pending, deleted), "info");
   } catch (error) {
     notify(`Could not remove ${pending.name}: ${error}`);
   }
+}
+
+/**
+ * Leaves one group: tells the others, stops listening, and deletes it here.
+ *
+ * Returns how many messages went with it.
+ */
+async function leaveGroup(groupId: string): Promise<number> {
+  // Tell the others while we still know who they are.
+  const group = groups.value.find((candidate) => candidate.id === groupId);
+  const others = (group?.members ?? []).filter((member) => member !== myPeerId.value);
+  announceDeparture(groupId, others);
+
+  // Stop listening before forgetting the group, or messages would keep arriving
+  // for a conversation we no longer have.
+  await invoke("unsubscribe_group", { groupId });
+  const deleted = await invoke<number>("delete_group", { groupId });
+
+  forgetConversation("group", groupId);
+
+  return deleted;
+}
+
+/** Drops a conversation from the screen and from what's held in memory. */
+function forgetConversation(kind: ConversationKind, id: string) {
+  const key = conversationKey(kind, id);
+  delete messages.value[key];
+  delete unread.value[key];
+
+  if (selection.value?.kind === kind && selection.value.id === id) {
+    selection.value = null;
+  }
+}
+
+/** Says what just happened, including the groups if any went with it. */
+function describeRemoval(
+  pending: NonNullable<typeof pendingRemoval.value>,
+  deleted: number,
+): string {
+  const action = pending.kind === "contact" ? "Removed" : "Left";
+  const groups =
+    pending.groups.length > 0
+      ? ` and left ${pending.groups.length === 1 ? "1 group" : `${pending.groups.length} groups`}`
+      : "";
+
+  return `${action} ${pending.name}${groups}, deleting ${describeMessageCount(deleted)}.`;
 }
 
 const removalTitle = computed(() =>
@@ -903,6 +972,10 @@ const removalMessage = computed(() => {
     return `You'll stop receiving messages from ${pending.name}. The other members carry on without you, and you can be invited back.`;
   }
 
+  if (pending.groups.length > 0) {
+    return `${pending.name} will be removed from your contacts, and messages from them will be silently dropped until you add them again — including in groups, which is why you'll also leave the ${pending.groups.length === 1 ? "group" : "groups"} you share with them rather than sit in a conversation missing everything they say.`;
+  }
+
   return `${pending.name} will be removed from your contacts, and messages from them will be silently dropped until you add them again.`;
 });
 
@@ -918,15 +991,28 @@ const removalWarning = computed(() => {
     return "";
   }
 
+  // Naming the groups matters: they hold conversations with other people, who
+  // have nothing to do with the contact being removed.
+  const groupNames = pending.groups.map((group) => group.name).join(", ");
+  const groupMessages = pending.groups.reduce(
+    (total, group) => total + group.messageCount,
+    0,
+  );
+
+  const alsoLeaving =
+    pending.groups.length > 0
+      ? ` You will also leave ${groupNames}, deleting a further ${describeMessageCount(groupMessages)}.`
+      : "";
+
   if (pending.messageCount < 0) {
-    return "Your entire chat history with this conversation will be permanently deleted. This cannot be undone.";
+    return `Your entire chat history with this conversation will be permanently deleted.${alsoLeaving} This cannot be undone.`;
   }
 
-  if (pending.messageCount === 0) {
+  if (pending.messageCount === 0 && pending.groups.length === 0) {
     return "There is no chat history here yet, so nothing else will be lost.";
   }
 
-  return `${describeMessageCount(pending.messageCount)} will be permanently deleted along with it. This cannot be undone.`;
+  return `${describeMessageCount(pending.messageCount)} will be permanently deleted along with it.${alsoLeaving} This cannot be undone.`;
 });
 
 // --- Startup --------------------------------------------------------------
@@ -1160,7 +1246,7 @@ function parsePayload(
 
     <div v-else class="app">
     <aside class="sidebar">
-      <IdentityBar :peer-id="myPeerId" />
+      <IdentityBar :peer-id="myPeerId" :name="myDisplayName" />
 
       <ContactList
         class="fill"
