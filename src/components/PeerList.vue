@@ -8,8 +8,16 @@
 import { ref } from "vue";
 import { shortPeerId } from "../types";
 
-defineProps<{
+const props = defineProps<{
   peers: string[];
+  /**
+   * What each node calls itself, by peer id.
+   *
+   * A claim rather than an identity — anyone can call themselves anything — so
+   * the peer id stays on screen beside it, and this only ever fills in the
+   * nickname box as a starting point.
+   */
+  names: Record<string, string>;
 }>();
 
 const emit = defineEmits<{
@@ -17,14 +25,21 @@ const emit = defineEmits<{
 }>();
 
 const expanded = ref(true);
+
+/** Edits in progress. A peer with no entry hasn't been typed over yet. */
 const drafts = ref<Record<string, string>>({});
 
+/** What's in the box: what the user typed, or the name the node offered. */
 function draftFor(peerId: string): string {
-  return (drafts.value[peerId] ?? "").trim();
+  return drafts.value[peerId] ?? props.names[peerId] ?? "";
+}
+
+function setDraft(peerId: string, value: string) {
+  drafts.value[peerId] = value;
 }
 
 function add(peerId: string) {
-  const nickname = draftFor(peerId);
+  const nickname = draftFor(peerId).trim();
   if (!nickname) {
     return;
   }
@@ -49,18 +64,20 @@ function add(peerId: string) {
 
       <ul v-else class="list">
         <li v-for="peer in peers" :key="peer" class="row">
+          <span v-if="names[peer]" class="claimed-name">{{ names[peer] }}</span>
           <code class="peer-id" :title="peer">{{ shortPeerId(peer) }}</code>
 
           <div class="add-row">
             <input
-              v-model="drafts[peer]"
               type="text"
               placeholder="Name this peer…"
+              :value="draftFor(peer)"
+              @input="setDraft(peer, ($event.target as HTMLInputElement).value)"
               @keyup.enter="add(peer)"
             />
             <button
               class="add-button"
-              :disabled="!draftFor(peer)"
+              :disabled="!draftFor(peer).trim()"
               title="Add as contact"
               @click="add(peer)"
             >
@@ -142,6 +159,14 @@ function add(peerId: string) {
 
 .row + .row {
   border-top: 1px solid var(--border);
+}
+
+.claimed-name {
+  display: block;
+  overflow: hidden;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .peer-id {

@@ -35,6 +35,17 @@ type ConversationKind = "contact" | "group";
 const myPeerId = ref("");
 const nodeInstance = ref("…");
 
+/** The name this node asks others to call it. */
+const myDisplayName = ref("");
+
+/**
+ * What other nodes call themselves, by peer id.
+ *
+ * Only a suggestion: it fills in the nickname box when adding a contact, and
+ * whatever the user settles on is theirs and is never overwritten by this.
+ */
+const peerNames = ref<Record<string, string>>({});
+
 /** Peer IDs mDNS can currently see, contacts and strangers alike. */
 const activePeers = ref<Set<string>>(new Set());
 const savedContacts = ref<Contact[]>([]);
@@ -230,6 +241,36 @@ async function loadContacts() {
     } catch (error) {
       console.error(`Could not check unread messages for ${contact.peer_id}`, error);
     }
+  }
+}
+
+/** Loads this node's own name, and the names other nodes have announced. */
+async function loadNames() {
+  try {
+    myDisplayName.value = await invoke<string>("get_display_name");
+  } catch (error) {
+    console.error("Could not load this node's name", error);
+  }
+
+  try {
+    peerNames.value = await invoke<Record<string, string>>("get_peer_names");
+  } catch (error) {
+    console.error("Could not load the names of other nodes", error);
+  }
+}
+
+/** Changes this node's name and tells everyone currently connected. */
+async function changeDisplayName(name: string) {
+  try {
+    await invoke("set_display_name", { name });
+    myDisplayName.value = name;
+
+    notify(
+      name ? `Other nodes will see you as ${name}.` : "Your name has been cleared.",
+      "info",
+    );
+  } catch (error) {
+    notify(`Could not save your name: ${error}`);
   }
 }
 
@@ -873,6 +914,7 @@ async function startSession() {
   }
 
   await loadIdentity();
+  await loadNames();
   await loadContacts();
   await loadGroups();
   await subscribeToSavedGroups();
@@ -883,6 +925,10 @@ async function startSession() {
 
   await listen<string>("peer-lost", (event) => {
     activePeers.value.delete(event.payload);
+  });
+
+  await listen<{ peer_id: string; name: string }>("peer-name", (event) => {
+    peerNames.value[event.payload.peer_id] = event.payload.name;
   });
 
   // Catch up on peers that connected before this window started listening.
@@ -1034,7 +1080,7 @@ function parsePayload(
         @leave="(group) => requestRemoval('group', group.id, group.name)"
       />
 
-      <PeerList :peers="unregisteredPeers" @add="addContact" />
+      <PeerList :peers="unregisteredPeers" :names="peerNames" @add="addContact" />
 
       <footer class="footer">
         <span class="node-badge">
@@ -1107,8 +1153,10 @@ function parsePayload(
     <SettingsDialog
       v-if="settingsOpen"
       :encryption-enabled="encryption.enabled"
+      :display-name="myDisplayName"
       @enable="enableEncryption"
       @disable="disableEncryption"
+      @rename="changeDisplayName"
       @close="settingsOpen = false"
     />
 

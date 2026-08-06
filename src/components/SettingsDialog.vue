@@ -12,13 +12,29 @@ import ThemeToggle from "./ThemeToggle.vue";
 
 const props = defineProps<{
   encryptionEnabled: boolean;
+  /** The name this node asks others to call it. */
+  displayName: string;
 }>();
 
 const emit = defineEmits<{
   enable: [passphrase: string];
   disable: [];
+  rename: [name: string];
   close: [];
 }>();
+
+/** Longest name the backend will advertise; kept in step with MAX_DISPLAY_NAME. */
+const NAME_LIMIT = 32;
+
+const nameDraft = ref(props.displayName);
+
+function saveName() {
+  const name = nameDraft.value.trim();
+
+  if (name !== props.displayName.trim()) {
+    emit("rename", name);
+  }
+}
 
 /** Which confirmation is on screen, if any. */
 const pending = ref<"enable" | "disable" | null>(null);
@@ -89,6 +105,30 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
             ✕
           </button>
         </header>
+
+        <section class="section">
+          <h3 class="section-title">This node</h3>
+
+          <div class="row">
+            <div class="row-text">
+              <span class="label">Your name</span>
+              <span class="hint">
+                Shown to other nodes that discover you. They can still call you
+                something else once they add you.
+              </span>
+            </div>
+
+            <input
+              v-model="nameDraft"
+              class="name-input"
+              type="text"
+              placeholder="Unnamed"
+              :maxlength="NAME_LIMIT"
+              @blur="saveName"
+              @keyup.enter="saveName"
+            />
+          </div>
+        </section>
 
         <section class="section">
           <h3 class="section-title">Appearance</h3>
@@ -292,6 +332,11 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
 .hint {
   font-size: 12px;
   color: var(--text-muted);
+}
+
+.name-input {
+  flex: none;
+  width: 150px;
 }
 
 /* Switch ---------------------------------------------------------------- */

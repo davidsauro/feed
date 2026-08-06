@@ -175,6 +175,13 @@ struct ChatPayload {
     message: String,
 }
 
+/// Emitted to the frontend as the `peer-name` event.
+#[derive(Clone, Serialize)]
+struct PeerNamePayload {
+    peer_id: String,
+    name: String,
+}
+
 /// Emitted to the frontend as the `group-message-received` event.
 ///
 /// Same shape as `ChatPayload` plus the group it belongs to. `sender` is taken
@@ -214,6 +221,10 @@ enum NetworkCommand {
     UnsubscribeFromGroup {
         group_id: String,
     },
+    /// Tell everyone currently connected what to call this node.
+    AnnounceName {
+        name: String,
+    },
     /// Publish to a group.
     ///
     /// Unlike a direct message this reports back, because gossipsub refuses to
@@ -239,6 +250,12 @@ struct DatabaseKey {
 struct NetworkState {
     /// Peers we hold a connection to.
     active_peers: Mutex<HashSet<String>>,
+    /// What other nodes have told us to call them, by peer id.
+    ///
+    /// Held in memory only. These come from nodes we haven't added as contacts,
+    /// so nothing they say is worth writing to disk; a node that matters will
+    /// say it again the next time we connect.
+    peer_names: Mutex<HashMap<String, String>>,
     /// The sending half of the channel into the background network task.
     network_tx: Mutex<mpsc::Sender<NetworkCommand>>,
     /// The receiving half, waiting for the network task to be started.
@@ -479,6 +496,14 @@ fn create_tables(conn: &Connection) -> SqlResult<()> {
             group_id TEXT NOT NULL,
             peer_id  TEXT NOT NULL,
             PRIMARY KEY (group_id, peer_id)
+        )",
+        (),
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         )",
         (),
     )?;
@@ -778,6 +803,83 @@ fn get_identity(app: AppHandle) -> Result<String, String> {
     let peer_id = PeerId::from(keypair.public());
 
     Ok(peer_id.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Tauri commands: this node's own name
+// ---------------------------------------------------------------------------
+
+/// Where the node's own display name is kept in the settings table.
+const DISPLAY_NAME_KEY: &str = "display_name";
+
+/// Longest display name we will advertise or accept.
+///
+/// Names arrive from nodes we haven't added as contacts, so this is a limit on
+/// what a stranger can put on our screen as much as it is a tidiness rule.
+const MAX_DISPLAY_NAME: usize = 32;
+
+/// Returns the name this node tells others to call it, empty if never set.
+#[tauri::command]
+fn get_display_name(app: AppHandle) -> Result<String, String> {
+    let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
+
+    let name = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            [DISPLAY_NAME_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_default();
+
+    Ok(name)
+}
+
+/// Sets this node's own name and tells everyone currently connected.
+///
+/// Only a suggestion to the people who receive it: they see it beside a peer id
+/// they haven't added yet, and whatever nickname they choose when adding us as a
+/// contact is theirs alone and is never overwritten by this.
+#[tauri::command]
+async fn set_display_name(
+    app: AppHandle,
+    state: State<'_, NetworkState>,
+    name: String,
+) -> Result<(), String> {
+    let name = trim_display_name(&name);
+
+    {
+        let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            (DISPLAY_NAME_KEY, &name),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    let network_tx = network_sender(&state)?;
+    network_tx
+        .send(NetworkCommand::AnnounceName { name })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Trims a display name and cuts it to length, counting characters rather than
+/// bytes so a name in any script is treated the same.
+fn trim_display_name(name: &str) -> String {
+    name.trim().chars().take(MAX_DISPLAY_NAME).collect()
+}
+
+/// Returns the names other nodes have told us to call them, by peer id.
+///
+/// The frontend also listens for `peer-name`; this exists so a window that just
+/// opened knows about names announced before it started listening.
+#[tauri::command]
+fn get_peer_names(state: State<'_, NetworkState>) -> Result<HashMap<String, String>, String> {
+    let names = state.peer_names.lock().map_err(|e| e.to_string())?;
+
+    Ok(names.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -1509,11 +1611,96 @@ fn handle_group_message(app: &AppHandle, keypair: &Keypair, message: gossipsub::
     );
 }
 
+/// Builds the payload a node sends to say what it would like to be called.
+fn name_announcement(name: &str) -> String {
+    // Hand-built rather than via serde: it is one field, and the payload format
+    // is a string the frontend parses, not a type we share.
+    format!(
+        "{{\"type\":\"profile\",\"name\":{}}}",
+        serde_json::Value::String(name.to_string())
+    )
+}
+
+/// Reads a name out of an announcement, if that is what this payload is.
+///
+/// Returns None for anything else, including an announcement with an empty or
+/// unusable name, which is how a bad one is ignored rather than argued with.
+fn announced_name(message: &str) -> Option<String> {
+    let payload: serde_json::Value = serde_json::from_str(message).ok()?;
+
+    if payload.get("type")?.as_str()? != "profile" {
+        return None;
+    }
+
+    let name = trim_display_name(payload.get("name")?.as_str()?);
+
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Tells one peer what to call this node, if it has been given a name.
+fn announce_name_to(app: &AppHandle, swarm: &mut Swarm<AppBehaviour>, peer: PeerId) {
+    let name = match get_display_name(app.clone()) {
+        Ok(name) if !name.is_empty() => name,
+        Ok(_) => return,
+        Err(error) => {
+            // Expected while the database is locked, which is never, since the
+            // network only starts once it isn't.
+            eprintln!("could not read this node's name: {}", error);
+            return;
+        }
+    };
+
+    swarm
+        .behaviour_mut()
+        .chat
+        .send_request(&peer, ChatRequest(name_announcement(&name)));
+}
+
+/// Records what a peer would like to be called, and tells the frontend.
+fn record_peer_name(app: &AppHandle, peer_id: &str, name: String) {
+    let state = app.state::<NetworkState>();
+
+    match state.peer_names.lock() {
+        Ok(mut names) => {
+            // Nothing to report if they've said the same thing before.
+            if names.get(peer_id) == Some(&name) {
+                return;
+            }
+
+            names.insert(peer_id.to_string(), name.clone());
+        }
+        Err(error) => {
+            eprintln!("could not record the name of {}: {}", peer_id, error);
+            return;
+        }
+    }
+
+    emit_to_frontend(
+        app,
+        "peer-name",
+        PeerNamePayload {
+            peer_id: peer_id.to_string(),
+            name,
+        },
+    );
+}
+
 /// Handles one inbound chat message.
 ///
 /// Messages from peers that are not in our contacts are dropped without a
 /// reply, which keeps strangers on the local network from reaching the UI at
 /// all.
+///
+/// One exception: a node saying what it would like to be called is accepted from
+/// anyone, because the whole point is to be recognisable to someone who hasn't
+/// added you yet. It only ever puts a name beside a peer id in the discovered
+/// list, is capped in length, and never becomes a contact or a message on its
+/// own. Names are claims, not identities — the peer id remains what actually
+/// identifies a node, and it stays on screen next to the name.
 fn handle_chat_request(
     app: &AppHandle,
     swarm: &mut Swarm<AppBehaviour>,
@@ -1522,12 +1709,22 @@ fn handle_chat_request(
     response_channel: ResponseChannel<ChatResponse>,
 ) {
     let sender_id = sender.to_string();
+    let ChatRequest(message) = request;
+
+    if let Some(name) = announced_name(&message) {
+        record_peer_name(app, &sender_id, name);
+
+        let _ = swarm
+            .behaviour_mut()
+            .chat
+            .send_response(response_channel, ChatResponse());
+
+        return;
+    }
 
     if !is_contact(app, &sender_id) {
         return;
     }
-
-    let ChatRequest(message) = request;
 
     emit_to_frontend(
         app,
@@ -1608,6 +1805,10 @@ fn handle_swarm_event(
 
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             handle_peer_connected(app, peer_id);
+
+            // Both sides do this as they connect, so each learns what the other
+            // would like to be called without either having to ask.
+            announce_name_to(app, swarm, peer_id);
         }
 
         SwarmEvent::ConnectionClosed {
@@ -1703,6 +1904,21 @@ fn handle_network_command(
                 .behaviour_mut()
                 .groups
                 .unsubscribe(&group_topic(&group_id));
+        }
+
+        NetworkCommand::AnnounceName { name } => {
+            let announcement = name_announcement(&name);
+
+            // Collected first: sending borrows the swarm, and the list of who
+            // to send to comes from the swarm as well.
+            let connected: Vec<PeerId> = swarm.connected_peers().copied().collect();
+
+            for peer in connected {
+                swarm
+                    .behaviour_mut()
+                    .chat
+                    .send_request(&peer, ChatRequest(announcement.clone()));
+            }
         }
 
         NetworkCommand::PublishToGroup {
@@ -1843,6 +2059,7 @@ fn main() {
 
             app_handle.manage(NetworkState {
                 active_peers: Mutex::new(HashSet::new()),
+                peer_names: Mutex::new(HashMap::new()),
                 network_tx: Mutex::new(network_tx),
                 command_rx: Mutex::new(Some(command_rx)),
             });
@@ -1883,6 +2100,9 @@ fn main() {
             // Identity
             get_node_id,
             get_identity,
+            get_display_name,
+            set_display_name,
+            get_peer_names,
             // Contacts
             save_contact,
             get_contacts,
@@ -2022,6 +2242,49 @@ mod tests {
         drop(conn);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A name survives the trip to another node and back.
+    #[test]
+    fn a_name_announcement_round_trips() {
+        assert_eq!(announced_name(&name_announcement("Ada")).as_deref(), Some("Ada"));
+    }
+
+    /// A name is data, not markup: quotes and braces in one must not be able to
+    /// change the shape of the payload carrying it.
+    #[test]
+    fn an_awkward_name_cannot_break_out_of_the_payload() {
+        let awkward = r#"a","type":"chat","text":"gotcha"#;
+
+        assert_eq!(
+            announced_name(&name_announcement(awkward)).as_deref(),
+            Some(awkward),
+            "the name should arrive exactly as it was sent"
+        );
+    }
+
+    /// Ordinary messages must not be mistaken for announcements, or they would
+    /// bypass the contact check.
+    #[test]
+    fn only_announcements_are_read_as_names() {
+        assert_eq!(announced_name(r#"{"type":"chat","id":"1","text":"hello"}"#), None);
+        assert_eq!(announced_name(r#"{"type":"read","messageIds":["1"]}"#), None);
+        assert_eq!(announced_name("not json at all"), None);
+    }
+
+    /// A stranger can put a name on our screen, so it has to be a short one.
+    #[test]
+    fn a_long_name_is_cut_down() {
+        let name = announced_name(&name_announcement(&"a".repeat(500)))
+            .expect("a long name should be accepted, just shortened");
+
+        assert_eq!(name.chars().count(), MAX_DISPLAY_NAME);
+    }
+
+    /// An empty name is not a name.
+    #[test]
+    fn a_blank_name_is_ignored() {
+        assert_eq!(announced_name(&name_announcement("   ")), None);
     }
 
     /// A file written by an older version is world-readable; loading it should
