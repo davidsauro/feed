@@ -22,6 +22,7 @@ use libp2p::request_response::cbor;
 use libp2p::request_response::Config as RequestResponseConfig;
 use libp2p::request_response::Event as RequestResponseEvent;
 use libp2p::request_response::Message as RequestResponseMessage;
+use libp2p::request_response::OutboundRequestId;
 use libp2p::request_response::ProtocolSupport;
 use libp2p::request_response::ResponseChannel;
 use libp2p::swarm::NetworkBehaviour;
@@ -31,7 +32,7 @@ use libp2p::{PeerId, StreamProtocol, Swarm, SwarmBuilder};
 use rusqlite::Connection;
 use rusqlite::Result as SqlResult;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
@@ -50,6 +51,13 @@ const DEFAULT_NODE_ID: &str = "1";
 
 /// Name that both sides of a connection must agree on before they can chat.
 const CHAT_PROTOCOL: &str = "/chat/1.0.0";
+
+/// How long to wait for the other node to accept a direct message.
+///
+/// This is how long a message sits at "sending" before it is reported as failed,
+/// so it is a number the user waits out. Matches the libp2p default; named here
+/// because it is now visible in the interface.
+const CHAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Prefix for the gossipsub topic a group's messages travel on.
 ///
@@ -185,9 +193,15 @@ struct GroupPayload {
 ///
 /// Everything here needs the swarm, which only the network task can touch.
 enum NetworkCommand {
+    /// Send a message to one peer.
+    ///
+    /// Reports back like `PublishToGroup` does, but not straight away: the
+    /// answer only exists once the other node has replied or the attempt has
+    /// failed, both of which arrive later as swarm events.
     SendMessage {
         peer_id: String,
         message: String,
+        result_tx: oneshot::Sender<Result<(), String>>,
     },
     /// Start receiving a group's messages. Gossipsub only delivers to
     /// subscribers, so this has to happen before anything arrives.
@@ -1194,9 +1208,14 @@ fn get_active_peers(state: State<'_, NetworkState>) -> Result<Vec<String>, Strin
     Ok(active_peers.iter().cloned().collect())
 }
 
-/// Hands a message to the background network task to send.
+/// Sends a message to one peer and waits to hear whether it arrived.
 ///
-/// This returns as soon as the command is queued, not when the message arrives.
+/// Returns once the other node has accepted the message, or with an error if it
+/// couldn't be reached, didn't answer within `CHAT_REQUEST_TIMEOUT`, or dropped
+/// it because we aren't one of their contacts. That wait is the point: the
+/// caller shows the message as delivered on success, and this used to return as
+/// soon as the request was queued, so every message was marked delivered whether
+/// or not anyone ever received it.
 #[tauri::command]
 async fn send_message(
     state: State<'_, NetworkState>,
@@ -1204,11 +1223,18 @@ async fn send_message(
     message: String,
 ) -> Result<(), String> {
     let network_tx = network_sender(&state)?;
+    let (result_tx, result_rx) = oneshot::channel();
 
-    let command = NetworkCommand::SendMessage { peer_id, message };
+    let command = NetworkCommand::SendMessage {
+        peer_id,
+        message,
+        result_tx,
+    };
     network_tx.send(command).await.map_err(|e| e.to_string())?;
 
-    Ok(())
+    result_rx
+        .await
+        .map_err(|_| "the network task stopped before it could answer".to_string())?
 }
 
 /// Takes a copy of the channel into the network task.
@@ -1295,7 +1321,7 @@ fn build_swarm(keypair: Keypair) -> Swarm<AppBehaviour> {
             StreamProtocol::new(CHAT_PROTOCOL),
             ProtocolSupport::Full,
         )],
-        RequestResponseConfig::default(),
+        RequestResponseConfig::default().with_request_timeout(CHAT_REQUEST_TIMEOUT),
     );
 
     SwarmBuilder::with_existing_identity(keypair)
@@ -1507,6 +1533,26 @@ fn handle_chat_request(
         .send_response(response_channel, ChatResponse());
 }
 
+/// Senders waiting to hear whether their message arrived, by request.
+///
+/// Lives inside the network task rather than in shared state: only the task
+/// knows about request ids, and every entry is removed by the event that
+/// resolves it.
+type PendingSends = HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>>;
+
+/// Answers whoever is waiting on a request, if anyone still is.
+///
+/// The receiver is gone if the window closed mid-send, which is not a problem.
+fn complete_send(
+    pending_sends: &mut PendingSends,
+    request_id: OutboundRequestId,
+    outcome: Result<(), String>,
+) {
+    if let Some(result_tx) = pending_sends.remove(&request_id) {
+        let _ = result_tx.send(outcome);
+    }
+}
+
 /// Routes one event out of the swarm to the code that cares about it.
 ///
 /// Events we don't act on (listening addresses, connections opening and
@@ -1514,6 +1560,7 @@ fn handle_chat_request(
 fn handle_swarm_event(
     app: &AppHandle,
     swarm: &mut Swarm<AppBehaviour>,
+    pending_sends: &mut PendingSends,
     event: SwarmEvent<AppBehaviourEvent>,
 ) {
     match event {
@@ -1572,15 +1619,27 @@ fn handle_swarm_event(
             peer,
             message,
             ..
-        })) => {
-            // We only ever act on requests. Responses are empty by design, and
-            // arriving at all is all they tell us.
-            if let RequestResponseMessage::Request {
+        })) => match message {
+            RequestResponseMessage::Request {
                 request, channel, ..
-            } = message
-            {
-                handle_chat_request(app, swarm, peer, request, channel);
+            } => handle_chat_request(app, swarm, peer, request, channel),
+
+            // The response is empty by design: that it arrived at all is the
+            // whole message, and it means the other node accepted ours.
+            RequestResponseMessage::Response { request_id, .. } => {
+                complete_send(pending_sends, request_id, Ok(()));
             }
+        },
+
+        SwarmEvent::Behaviour(AppBehaviourEvent::Chat(RequestResponseEvent::OutboundFailure {
+            request_id,
+            error,
+            ..
+        })) => {
+            // The peer is unreachable, or accepted nothing before the timeout —
+            // which is also what happens when they haven't added us as a
+            // contact, since they drop our message without replying.
+            complete_send(pending_sends, request_id, Err(error.to_string()));
         }
 
         _ => {}
@@ -1588,21 +1647,33 @@ fn handle_swarm_event(
 }
 
 /// Carries out one command the frontend queued up.
-fn handle_network_command(swarm: &mut Swarm<AppBehaviour>, command: NetworkCommand) {
+fn handle_network_command(
+    swarm: &mut Swarm<AppBehaviour>,
+    pending_sends: &mut PendingSends,
+    command: NetworkCommand,
+) {
     match command {
-        NetworkCommand::SendMessage { peer_id, message } => {
-            let peer_id = match peer_id.parse::<PeerId>() {
-                Ok(peer_id) => peer_id,
+        NetworkCommand::SendMessage {
+            peer_id,
+            message,
+            result_tx,
+        } => {
+            let parsed = match peer_id.parse::<PeerId>() {
+                Ok(parsed) => parsed,
                 Err(error) => {
-                    eprintln!("cannot send to '{}': {}", peer_id, error);
+                    let _ = result_tx.send(Err(format!("'{}' is not a peer id: {}", peer_id, error)));
                     return;
                 }
             };
 
-            swarm
+            // Sending only starts the attempt. Whoever is waiting is answered
+            // when the response or the failure comes back as an event.
+            let request_id = swarm
                 .behaviour_mut()
                 .chat
-                .send_request(&peer_id, ChatRequest(message));
+                .send_request(&parsed, ChatRequest(message));
+
+            pending_sends.insert(request_id, result_tx);
         }
 
         NetworkCommand::SubscribeToGroup { group_id } => {
@@ -1661,14 +1732,18 @@ async fn run_network(
     // unreadable until the user has entered their passphrase, which is long
     // after this task starts. Commands sent before this loop begins wait in the
     // channel, so nothing is missed.
+    // Callers waiting on a direct message they've sent. Only this task touches
+    // it, so it needs no lock.
+    let mut pending_sends: PendingSends = HashMap::new();
+
     loop {
         tokio::select! {
             swarm_event = swarm.select_next_some() => {
-                handle_swarm_event(&app, &mut swarm, swarm_event);
+                handle_swarm_event(&app, &mut swarm, &mut pending_sends, swarm_event);
             }
 
             Some(command) = command_rx.recv() => {
-                handle_network_command(&mut swarm, command);
+                handle_network_command(&mut swarm, &mut pending_sends, command);
             }
         }
     }

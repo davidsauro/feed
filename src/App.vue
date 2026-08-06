@@ -294,17 +294,27 @@ async function createGroup(name: string, memberPeerIds: string[]) {
     members,
   });
 
-  const uninvited: string[] = [];
-  for (const peerId of memberPeerIds) {
-    try {
-      await invoke("send_message", { peerId, message: invite });
-    } catch (error) {
-      console.error(`Could not invite ${peerId}`, error);
-      uninvited.push(peerId);
-    }
-  }
-
+  // Open the group straight away. Each invite now waits to hear whether it
+  // actually arrived, and an unreachable member takes the full timeout to give
+  // up, so waiting for all of them before showing the group would leave the user
+  // staring at nothing.
   selection.value = { kind: "group", id };
+
+  // Sent together rather than one after another, so one unreachable member
+  // doesn't delay the invitations to everyone after them.
+  const results = await Promise.all(
+    memberPeerIds.map(async (peerId) => {
+      try {
+        await invoke("send_message", { peerId, message: invite });
+        return null;
+      } catch (error) {
+        console.error(`Could not invite ${peerId}`, error);
+        return peerId;
+      }
+    }),
+  );
+
+  const uninvited = results.filter((peerId): peerId is string => peerId !== null);
 
   if (uninvited.length > 0) {
     // Not fatal: they'll be added by the member list on the next message they
