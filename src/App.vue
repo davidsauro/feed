@@ -611,7 +611,7 @@ async function sendGroupMessage(text: string) {
   } catch (error) {
     setMessageStatus(key, id, "failed");
     invoke("update_message_status", { id, status: "failed" }).catch(() => {});
-    notify(`Could not send to ${group.name}: ${error}`);
+    notify(`Not sent to ${group.name} — ${error}. Click the message to try again.`);
   }
 }
 
@@ -802,7 +802,56 @@ async function sendMessage(text: string) {
   } catch (error) {
     setMessageStatus(key, id, "failed");
     invoke("update_message_status", { id, status: "failed" }).catch(() => {});
-    notify(`Could not send to ${contact.nickname}: ${error}`);
+    notify(`Not sent to ${contact.nickname} — ${error}. Click the message to try again.`);
+  }
+}
+
+/**
+ * Sends a message that previously failed, keeping its identity and its place.
+ *
+ * The id is reused so the recipient recognises a repeat and stores it once, and
+ * the original send time is kept so the message doesn't jump to the end of the
+ * conversation on every attempt.
+ */
+async function retryMessage(id: string) {
+  const conversation = selection.value;
+  if (!conversation) {
+    return;
+  }
+
+  const key = conversationKey(conversation.kind, conversation.id);
+  const message = messages.value[key]?.find((candidate) => candidate.id === id);
+
+  if (!message || message.status !== "failed") {
+    return;
+  }
+
+  setMessageStatus(key, id, "sending");
+  invoke("update_message_status", { id, status: "sending" }).catch(() => {});
+
+  const body = { id, text: message.text, sentAt: message.sent_at };
+
+  try {
+    if (conversation.kind === "contact") {
+      await invoke("send_direct", {
+        peerId: conversation.id,
+        message: JSON.stringify({ type: "chat", ...body }),
+      });
+    } else {
+      await invoke("send_group_message", {
+        groupId: conversation.id,
+        message: JSON.stringify({ type: "group-chat", ...body }),
+      });
+
+      // A group message is as delivered as it will ever be once it is carried;
+      // there is no single recipient to acknowledge it.
+      setMessageStatus(key, id, "delivered");
+      await invoke("update_message_status", { id, status: "delivered" });
+    }
+  } catch (error) {
+    setMessageStatus(key, id, "failed");
+    invoke("update_message_status", { id, status: "failed" }).catch(() => {});
+    notify(`Still could not send: ${error}`);
   }
 }
 
@@ -861,14 +910,15 @@ async function receiveChatMessage(sender: string, id: string, text: string, sent
     sentAt,
   });
 
+  // Acknowledged whether or not it was new. A repeat usually means the sender is
+  // retrying because our first acknowledgement went missing, and staying silent
+  // would leave them believing a message they successfully sent had failed.
+  sendAck(sender, id);
+
   if (!stored) {
     console.warn(`Ignored a message from ${sender} reusing the id ${id}`);
     return;
   }
-
-  // Told before anything else, so their clock turns into a tick even if we
-  // never open the conversation.
-  sendAck(sender, id);
 
   const key = conversationKey("contact", sender);
   insertMessage(key, { id, sender, text, status: "delivered", sent_at: sentAt });
@@ -1423,6 +1473,7 @@ function parsePayload(
         :messages="currentMessages"
         :my-peer-id="myPeerId"
         @send="sendMessage"
+        @retry="retryMessage"
       />
 
       <ChatPane
@@ -1436,6 +1487,7 @@ function parsePayload(
         :sender-labels="groupSenderLabels"
         :can-add-members="true"
         @send="sendGroupMessage"
+        @retry="retryMessage"
         @add-members="addingMembers = true"
       />
 

@@ -18,6 +18,11 @@ defineProps<{
   senderLabel?: string;
 }>();
 
+const emit = defineEmits<{
+  /** Asked for by clicking a message that didn't go out. */
+  retry: [];
+}>();
+
 const STATUS_LABELS: Record<ChatMessage["status"], string> = {
   sending: "Sending",
   delivered: "Delivered",
@@ -33,15 +38,15 @@ const STATUS_LABELS: Record<ChatMessage["status"], string> = {
       <span class="text">{{ message.text }}</span>
     </span>
 
-    <span
-      v-if="outgoing"
-      class="status"
-      :class="{ read: message.status === 'read', failed: message.status === 'failed' }"
-      :title="STATUS_LABELS[message.status]"
+    <!-- A message that didn't go out is the one status worth acting on, so it
+         becomes a button rather than an icon. Nothing retries on its own. -->
+    <button
+      v-if="outgoing && message.status === 'failed'"
+      class="retry"
+      title="Not sent. Click to try again."
+      @click="emit('retry')"
     >
-      <!-- Exclamation: it never went out. -->
       <svg
-        v-if="message.status === 'failed'"
         viewBox="0 0 24 24"
         width="13"
         height="13"
@@ -54,10 +59,19 @@ const STATUS_LABELS: Record<ChatMessage["status"], string> = {
         <line x1="12" y1="7" x2="12" y2="13" />
         <line x1="12" y1="17" x2="12.01" y2="17" />
       </svg>
+      Retry
+    </button>
+
+    <span
+      v-else-if="outgoing"
+      class="status"
+      :class="{ read: message.status === 'read' }"
+      :title="STATUS_LABELS[message.status]"
+    >
 
       <!-- Clock: queued or in flight. -->
       <svg
-        v-else-if="message.status === 'sending'"
+        v-if="message.status === 'sending'"
         viewBox="0 0 24 24"
         width="12"
         height="12"
@@ -155,9 +169,24 @@ const STATUS_LABELS: Record<ChatMessage["status"], string> = {
   opacity: 1;
 }
 
-/* A failed send has to be visible against the outgoing bubble's fill, which is
-   already the accent color, so it gets full opacity rather than a red hue. */
-.status.failed {
-  opacity: 1;
+/* The retry affordance sits on the outgoing bubble, which is already filled with
+   the accent color, so it reads by full opacity and an underline rather than by
+   turning red — red on blue would be close to unreadable. */
+.retry {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  align-self: flex-end;
+  padding: 0 0 2px;
+  color: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.retry:hover {
+  opacity: 0.8;
 }
 </style>

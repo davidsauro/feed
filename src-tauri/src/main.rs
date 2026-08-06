@@ -2189,7 +2189,7 @@ fn handle_network_command(
                 .groups
                 .publish(group_topic(&group_id), sealed)
                 .map(|_message_id| ())
-                .map_err(|error| error.to_string());
+                .map_err(describe_publish_failure);
 
             // The caller is gone if the window closed mid-send; nothing to do.
             let _ = result_tx.send(result);
@@ -2225,7 +2225,30 @@ fn publish_direct(
         .groups
         .publish(direct_topic(keypair, &peer)?, sealed)
         .map(|_message_id| ())
-        .map_err(|error| error.to_string())
+        .map_err(describe_publish_failure)
+}
+
+/// Turns a publishing failure into something worth showing a person.
+///
+/// The common one is that nobody is listening on the conversation, which
+/// gossipsub calls `NoPeersSubscribedToTopic`. That means one of two things —
+/// they're offline, or they haven't added us — and since we can't tell which,
+/// the wording covers both rather than guessing.
+fn describe_publish_failure(error: gossipsub::PublishError) -> String {
+    match error {
+        gossipsub::PublishError::NoPeersSubscribedToTopic => {
+            "nobody is listening for this conversation — they may be offline, or may not have \
+             added you as a contact"
+                .to_string()
+        }
+        gossipsub::PublishError::MessageTooLarge => {
+            "the message is too large to send".to_string()
+        }
+        gossipsub::PublishError::AllQueuesFull(_) => {
+            "the connection is too busy to take this right now".to_string()
+        }
+        other => other.to_string(),
+    }
 }
 
 /// Encrypts a message for everyone else in a group.

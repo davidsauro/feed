@@ -39,6 +39,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   send: [text: string];
   addMembers: [];
+  /** A message that didn't go out should be tried again. */
+  retry: [id: string];
 }>();
 
 const draft = ref("");
@@ -117,6 +119,7 @@ watch(
         :message="message"
         :outgoing="message.sender === myPeerId"
         :sender-label="senderLabels?.[message.sender]"
+        @retry="emit('retry', message.id)"
       />
     </div>
 
