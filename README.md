@@ -292,18 +292,29 @@ by another server then dropping it achieves nothing.
 
 # Development Setup
 
-Optimized for development on Windows 11 using WSL2 (Ubuntu 24.04).
+Developed on Windows 11 with WSL2 (Ubuntu 24.04) and on macOS. The same script
+handles both.
 
 ### 1. Environment Preparation
 
-A setup script installs the Linux C-dependencies for Tauri's webview, NVM,
-Node.js LTS, and the Rust toolchain:
+`setup.sh` detects the operating system and installs what that system needs,
+then installs NVM, Node.js LTS and the Rust toolchain the same way on either:
 
 ```bash
 chmod +x setup.sh
 ./setup.sh
 source ~/.bashrc
 ```
+
+On Linux that means the webview and its build dependencies. On macOS it means
+the Xcode Command Line Tools, which bring the compiler and everything else the
+build needs. The webview on macOS is part of the system, so there is nothing to
+install for it. If the Command Line Tools are missing, the script starts Apple's
+installer and asks you to run it again once that finishes.
+
+Windows is not covered by the script. The app builds there with the MSVC
+toolchain and WebView2, but note that the bundled SQLCipher compiles OpenSSL from
+source, which on Windows additionally wants Perl and NASM on the path.
 
 ### 2. Install Project Dependencies
 
@@ -368,6 +379,33 @@ does carry traffic between two nodes that know nothing about each other:
 cargo run -p feed-server --example probe -- <server address> /direct/1.0.0/test
 cargo run -p feed-server --example probe -- <server address> /direct/1.0.0/test "hello"
 ```
+
+## Building for other platforms
+
+The long term aim is binaries for Windows, Linux, macOS, Android and iOS. Some
+honest notes on what that involves, because it is less about this code than
+about how Tauri works.
+
+**There is no cross-compiling.** A Tauri app is built on the system it targets.
+Windows needs a Windows machine for WebView2 and MSVC, macOS needs a Mac for the
+SDK, and Linux needs Linux. The normal answer is a CI matrix with one runner per
+platform rather than one machine producing everything.
+
+**Mobile needs a library target that this repository no longer has.** Tauri
+builds mobile apps by linking the Rust side in as a library with a
+`mobile_entry_point`, which means `src-tauri` needs a `[lib]` target and its
+setup living in a `run()` function that both the desktop binary and the mobile
+shell can call. That scaffolding came with the Tauri template and was removed
+during cleanup, since it was dead code holding a second unused `Builder`.
+Restoring it is mechanical, moving the contents of `main()` into a library
+function, and worth doing when mobile actually starts rather than before.
+
+**Mobile has a harder problem than packaging.** iOS restricts multicast, so mDNS
+discovery needs an entitlement that Apple grants by request, and both platforms
+suspend background apps aggressively. A node that is asleep is a node that is
+offline, and a peer to peer app whose peers are usually suspended is a different
+design problem from the desktop one. Relay servers and store and forward matter
+much more on mobile than they do on a laptop.
 
 ---
 
