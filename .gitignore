@@ -24,6 +24,12 @@ dist-ssr
 *.sw?
 # Rust / Cargo
 /target/
+
+# A running server's state. identity.bin is a private key — anyone holding it
+# can impersonate that server — and the config may list who is allowed to use it.
+crates/server/data/
+**/identity.bin
+feed-server.toml
 **/*.rs.bk
 
 # Environment Variables

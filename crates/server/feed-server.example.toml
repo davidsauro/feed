@@ -1,0 +1,51 @@
+# Example configuration. Every setting here is optional: a server started with
+# no configuration file at all listens on port 4001 and carries traffic for
+# anyone. Copy this to feed-server.toml and change what you care about.
+
+# Addresses to listen on. The port is part of the address every client is
+# configured with, so changing it later means updating every client.
+listen_on = ["/ip4/0.0.0.0/tcp/4001"]
+
+# Where this server's identity is kept. Clients address a server by its public
+# key as well as its hostname, so losing this file makes every existing client
+# configuration wrong. In a container, put it on a mounted volume.
+identity_file = "identity.bin"
+
+# Who may connect, by peer id. Leave empty — the default — and anyone may.
+#
+# An open server is useful and easy to run, but it is also bandwidth anyone who
+# finds it can spend. The limits below are what stand between an open server and
+# whoever wants to take advantage of it.
+allowed_peers = [
+    # "12D3KooWCfRCgiQUEL6MkbU8rBNGySLjJCi3iYSKRpAc2w7u8TPW",
+]
+
+# Other servers to connect to. People using those servers and people using this
+# one can then reach each other.
+#
+# Each address must end with /p2p/<peer id>: that is what proves the machine
+# answering is the server you meant, and not whatever else has the hostname
+# today. Siblings are added to the allowlist automatically, so closing a server
+# doesn't accidentally cut it off from the others.
+siblings = [
+    # "/dns4/relay2.example.com/tcp/4001/p2p/12D3KooW...",
+]
+
+[limits]
+# Conversations one client may ask this server to carry, and how many it will
+# carry in total.
+#
+# Connection limits do not cover this: a single connection can ask for any
+# number of conversations, and each one costs memory here.
+max_topics_per_peer = 64
+max_topics_total = 4096
+
+# Connections. Two per peer allows a new one to be established before an old one
+# has finished closing. The pending limits matter most on an open server, since
+# handshakes that never complete are the cheapest thing to flood it with.
+max_connections_per_peer = 2
+max_pending_incoming = 64
+max_pending_outgoing = 16
+max_connections_incoming = 512
+max_connections_outgoing = 32
+max_connections_total = 550

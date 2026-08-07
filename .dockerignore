@@ -1,0 +1,32 @@
+# The server image needs the Rust workspace and nothing else. Everything here is
+# either enormous, rebuilt inside the image anyway, or belongs to the desktop
+# app rather than the server.
+
+target/
+node_modules/
+dist/
+.git/
+
+# The desktop app's frontend.
+src/
+public/
+index.html
+package.json
+package-lock.json
+tsconfig*.json
+vite.config.ts
+
+# The desktop app's non-manifest files. Its Cargo.toml is needed for the
+# workspace to resolve; the rest of it is not.
+src-tauri/src/
+src-tauri/icons/
+src-tauri/gen/
+src-tauri/capabilities/
+src-tauri/build.rs
+src-tauri/tauri.conf.json
+
+# Local server state, which must never be baked into an image: the identity file
+# is a private key.
+crates/server/data/
+**/identity.bin
+**/feed-server.toml

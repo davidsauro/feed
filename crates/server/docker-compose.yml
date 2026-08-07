@@ -1,0 +1,43 @@
+# Run from this directory:
+#
+#     mkdir -p data
+#     docker compose up -d
+#
+# If your account is not uid 1000, tell the build who you are, or the container
+# will not be able to write into ./data:
+#
+#     UID=$(id -u) GID=$(id -g) docker compose up -d --build
+
+services:
+  feed-server:
+    build:
+      # The workspace root, because the server is one crate within it.
+      context: ../..
+      dockerfile: crates/server/Dockerfile
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    image: feed-server
+    container_name: feed-server
+    restart: unless-stopped
+
+    ports:
+      # Must be reachable from the internet for this server to be useful, which
+      # usually means a firewall rule, and a forwarded port if it sits behind a
+      # router. Change the left-hand number to publish on a different port; the
+      # right-hand one is inside the container and is what the config listens on.
+      - "4001:4001"
+
+    volumes:
+      # Everything the server keeps: its identity, and the configuration if you
+      # supply one. A bind mount rather than a named volume on purpose — the
+      # identity is the one thing here worth backing up, and this way saving it
+      # is copying a file rather than an excursion into Docker's storage.
+      - ./data:/data
+
+    # The server binds a high port as an unprivileged user and writes one small
+    # file. It needs no privileges beyond that.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

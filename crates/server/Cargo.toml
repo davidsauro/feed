@@ -9,3 +9,5 @@ feed-protocol.workspace = true
 libp2p.workspace = true
 tokio.workspace = true
 futures.workspace = true
+serde.workspace = true
+toml = "0.9"
