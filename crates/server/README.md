@@ -30,8 +30,8 @@ docker logs -f feed-server
 Images are published for `linux/amd64` and `linux/arm64`, so the cheap virtual
 machines a small relay tends to live on are covered either way.
 
-Tags: `latest` follows the main branch, `0.1.0` and `0.1` follow releases, and
-`sha-<commit>` pins an exact build.
+Tags: `0.1.0` and `0.1` follow releases, `latest` is whatever was published most
+recently, and `sha-<commit>` pins an exact build.
 
 ### From a clone
 

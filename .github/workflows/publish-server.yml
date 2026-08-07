@@ -13,18 +13,19 @@
 
 name: Publish server image
 
+# Deliberately not on every push to main. Building and publishing both
+# architectures takes several minutes, and while the first release is still being
+# worked towards, most commits are not something anyone should be pulling.
+#
+# So it runs when asked — Actions → Publish server image → Run workflow — and
+# automatically for a version tag, which is the point at which an image is worth
+# publishing without being asked:
+#
+#     git tag v0.1.0 && git push origin v0.1.0
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
-    # Only what the image is built from. A change to the app or the README
-    # doesn't need a new server image.
-    paths:
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/publish-server.yml"
   workflow_dispatch:
+  push:
+    tags: ["v*"]
 
 jobs:
   test:
@@ -105,10 +106,13 @@ jobs:
         with:
           images: ${{ steps.registries.outputs.images }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=short
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            # Both cases move `latest`: a release, and a deliberate run from
+            # main. Without the tag half, publishing v0.1.0 would leave `latest`
+            # pointing at whatever came before it.
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/v') }}
           labels: |
             org.opencontainers.image.title=feed-server
             org.opencontainers.image.description=Relay for a peer-to-peer chat network, which carries traffic it cannot read
