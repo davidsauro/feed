@@ -43,8 +43,8 @@ docker compose logs -f
 ```
 
 The container runs as an unprivileged user, uid 1000 by default, because that is
-the first account created on most Linux hosts — so a directory you made yourself
-is one it can already write to. If your account is not 1000, say so once:
+the first account created on most Linux hosts. A directory you made yourself is
+therefore one it can already write to. If your account is not 1000, say so once:
 
 ```bash
 UID=$(id -u) GID=$(id -g) docker compose up -d --build
@@ -91,9 +91,10 @@ the listener can only have gone through the server.
 Optional. With no configuration file the server listens on port 4001 and carries
 traffic for anyone, which is a useful thing to run as it stands.
 
-To change that, copy `feed-server.example.toml` to `data/feed-server.toml` — it
-documents every setting — and restart. A file that exists but cannot be parsed
-stops the server rather than being guessed at, including for an unknown key.
+To change that, copy `feed-server.example.toml` to `data/feed-server.toml` and
+restart. That file documents every setting. A configuration that exists but
+cannot be parsed stops the server rather than being guessed at, including when
+the problem is nothing more than an unknown key.
 
 ## What it stores, and how to back it up
 
@@ -127,12 +128,13 @@ hostname plus the identity, and both still lead to the same place.
 
 > **Never run two servers with the same identity at once.** Two nodes claiming
 > one peer id will fight over connections and confuse every peer that reaches
-> either of them. Stop the old one before starting the new one — a migration,
-> not a handover.
+> either of them. Stop the old one before starting the new one. It is a
+> migration, not a handover.
 
 > **Treat `identity.bin` as the private key it is.** Anyone who copies it can be
-> this server: accept your users' connections and see everything it can see. It
-> is written with owner-only permissions; a backup deserves the same care.
+> this server, accepting your users' connections and seeing everything it can
+> see. It is written with owner-only permissions, and a backup deserves the same
+> care.
 
 ## What an operator can and cannot see
 
@@ -140,9 +142,9 @@ Cannot see: what anyone says, who is in a group, what a group is called, or the
 names of the people using it. All of that is sealed or never sent.
 
 Can see: which clients are connected, and which of them are interested in the
-same conversations — a conversation is an opaque string, but two clients
+same conversations. A conversation is an opaque string, but two clients
 interested in the same one are two clients with something to say to each other.
-Also message sizes and timing.
+Message sizes and timing are visible too.
 
 That is inherent to routing anything at all, and worth being straight about with
 the people whose traffic you carry. It is also the argument for running one of
