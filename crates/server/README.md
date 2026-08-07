@@ -14,6 +14,27 @@ or which conversation a topic belongs to.
 
 ## Running it
 
+You do not need this repository. A published image is enough:
+
+```bash
+mkdir -p data
+docker run -d --name feed-server \
+  -p 4001:4001 \
+  -v "$PWD/data:/data" \
+  --restart unless-stopped \
+  ghcr.io/davidsauro/feed-server:latest
+
+docker logs -f feed-server
+```
+
+Images are published for `linux/amd64` and `linux/arm64`, so the cheap virtual
+machines a small relay tends to live on are covered either way.
+
+Tags: `latest` follows the main branch, `0.1.0` and `0.1` follow releases, and
+`sha-<commit>` pins an exact build.
+
+### From a clone
+
 ```bash
 cd crates/server
 mkdir -p data

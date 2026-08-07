@@ -36,6 +36,20 @@ use libp2p::{allow_block_list, connection_limits, gossipsub, noise, tcp, yamux, 
 use crate::config::Config;
 use crate::mirror::{Caps, Decision, Mirror};
 
+const USAGE: &str = "\
+feed-server — carries traffic between nodes that cannot reach each other
+
+    feed-server [config file]
+
+With no argument it looks for feed-server.toml in the working directory, and
+runs with defaults if there isn't one: listening on port 4001 and carrying
+traffic for anyone.
+
+Everything it keeps — its identity, and the configuration if you supply one —
+lives in the working directory, which is /data in the container image.
+
+Full documentation: https://github.com/davidsauro/feed";
+
 /// Everything this server does on the network.
 #[derive(NetworkBehaviour)]
 struct ServerBehaviour {
@@ -59,8 +73,14 @@ struct ServerBehaviour {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let path = env::args()
-        .nth(1)
+    let argument = env::args().nth(1);
+
+    if matches!(argument.as_deref(), Some("--help" | "-h" | "help")) {
+        println!("{}", USAGE);
+        return Ok(());
+    }
+
+    let path = argument
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH));
 

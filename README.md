@@ -343,7 +343,17 @@ APP_PORT=1422 NODE_ID=3 npm run tauri dev -- --port 1422
 
 The sidebar footer shows which instance a window belongs to.
 
-## Running a Server Locally
+## Running a Server
+
+Nobody needs this repository to run one:
+
+```bash
+mkdir -p data
+docker run -d --name feed-server -p 4001:4001 -v "$PWD/data:/data" \
+  --restart unless-stopped ghcr.io/davidsauro/feed-server:latest
+```
+
+From a clone, with compose:
 
 ```bash
 cd crates/server

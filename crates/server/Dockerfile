@@ -5,9 +5,42 @@
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
-FROM rust:1-slim-bookworm AS builder
+#
+# Pinned to the machine doing the building rather than the machine being built
+# for, so that building an arm64 image on an amd64 host compiles natively and
+# cross-links, instead of running the entire Rust toolchain under emulation.
+# That is the difference between a couple of minutes and most of an hour.
+#
+# Cross-compiling needs a linker for the target and the target's C library
+# headers — not everything here is Rust all the way down, since some
+# cryptography dependencies build a little C.
+FROM --platform=$BUILDPLATFORM rust:1-slim-bookworm AS builder
+
+# Supplied by the builder. TARGETARCH is the architecture being built for.
+ARG TARGETARCH
 
 WORKDIR /build
+
+# Docker and Rust have different names for the same architectures.
+RUN case "$TARGETARCH" in \
+        amd64) echo x86_64-unknown-linux-gnu > /target ;; \
+        arm64) echo aarch64-unknown-linux-gnu > /target ;; \
+        *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && rustup target add "$(cat /target)"
+
+# A cross-linker and the target's headers, needed only when the target differs
+# from the host. libc6-dev-arm64-cross is not optional: without it the C parts of
+# the cryptography crates fail to compile against headers that aren't there.
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
 
 # Only what the server needs. The desktop app is a member of the same workspace,
 # so its manifest has to be here for the workspace to resolve — but its source
@@ -21,7 +54,8 @@ COPY src-tauri/Cargo.toml ./src-tauri/Cargo.toml
 # manifest needs something to point at. This stub is never built.
 RUN mkdir -p src-tauri/src && echo 'fn main() {}' > src-tauri/src/main.rs
 
-RUN cargo build --release -p feed-server
+RUN cargo build --release --target "$(cat /target)" -p feed-server \
+    && cp "target/$(cat /target)/release/feed-server" /feed-server
 
 # ---------------------------------------------------------------------------
 # Run
@@ -48,7 +82,7 @@ RUN groupadd --gid $GID feed \
     && mkdir /data \
     && chown $UID:$GID /data
 
-COPY --from=builder /build/target/release/feed-server /usr/local/bin/feed-server
+COPY --from=builder /feed-server /usr/local/bin/feed-server
 
 USER feed
 
