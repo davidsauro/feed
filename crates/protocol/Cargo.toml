@@ -1,0 +1,8 @@
+[package]
+name = "feed-protocol"
+description = "The parts of the network both the app and the server must agree on"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libp2p.workspace = true

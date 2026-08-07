@@ -23,7 +23,7 @@ dist-ssr
 *.sln
 *.sw?
 # Rust / Cargo
-src-tauri/target/
+/target/
 **/*.rs.bk
 
 # Environment Variables

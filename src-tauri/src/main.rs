@@ -16,6 +16,7 @@
 
 mod group_crypto;
 
+use feed_protocol::{DIRECT_TOPIC_PREFIX, GROUP_TOPIC_PREFIX};
 use futures::stream::StreamExt;
 use libp2p::gossipsub;
 use libp2p::identity::Keypair;
@@ -24,7 +25,6 @@ use libp2p::request_response::cbor;
 use libp2p::request_response::Config as RequestResponseConfig;
 use libp2p::request_response::Event as RequestResponseEvent;
 use libp2p::request_response::Message as RequestResponseMessage;
-use libp2p::request_response::OutboundRequestId;
 use libp2p::request_response::ProtocolSupport;
 use libp2p::request_response::ResponseChannel;
 use libp2p::swarm::NetworkBehaviour;
@@ -51,29 +51,18 @@ use tokio::sync::{mpsc, oneshot};
 /// don't share an identity file or a database.
 const DEFAULT_NODE_ID: &str = "1";
 
-/// Name that both sides of a connection must agree on before they can chat.
-const CHAT_PROTOCOL: &str = "/chat/1.0.0";
-
-/// How long to wait for the other node to accept a direct message.
+/// Name of the protocol nodes use to tell each other what to call them.
 ///
-/// This is how long a message sits at "sending" before it is reported as failed,
-/// so it is a number the user waits out. Matches the libp2p default; named here
-/// because it is now visible in the interface.
-const CHAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Reads oddly because it once carried chat, which now goes over gossipsub. The
+/// name on the wire is left alone: changing it would stop older nodes and newer
+/// ones recognising each other's names, which is a poor trade for tidiness.
+const NAME_PROTOCOL: &str = "/chat/1.0.0";
 
-/// Prefix for the gossipsub topic a group's messages travel on.
-///
-/// The topic is this prefix plus the group's id, so knowing the id is what lets
-/// a node join the conversation.
-const GROUP_TOPIC_PREFIX: &str = "/group/1.0.0/";
+/// How long to wait for an announcement to be acknowledged before giving up on
+/// it. Nothing depends on the answer; this only stops a stalled exchange from
+/// being held open indefinitely.
+const NAME_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Prefix for the gossipsub topic a one-to-one conversation travels on. What
-/// follows it is derived from the secret the two peers share.
-const DIRECT_TOPIC_PREFIX: &str = "/direct/1.0.0/";
-
-/// How often gossipsub maintains its mesh. The default is one second, which is
-/// more upkeep than a handful of nodes on a LAN needs.
-const GOSSIPSUB_HEARTBEAT: Duration = Duration::from_secs(10);
 
 /// Listen on every network interface, and let the OS pick the port.
 const LISTEN_ADDRESS: &str = "/ip4/0.0.0.0/tcp/0";
@@ -102,11 +91,6 @@ const MDNS_QUERY_INTERVAL: Duration = Duration::from_secs(10);
 /// do with whether we're shown as online. See the note on presence above
 /// `handle_peer_connected`.
 const MDNS_RECORD_TTL: Duration = Duration::from_secs(6 * 60);
-
-/// How often gossipsub retries connecting to peers it has been told about,
-/// measured in heartbeats. Three heartbeats is 30 seconds, so a peer we failed
-/// to reach — or lost a connection to — is picked up again promptly.
-const GOSSIPSUB_EXPLICIT_PEER_TICKS: u64 = 3;
 
 /// How often each connection is pinged, and how long a ping may go unanswered.
 ///
@@ -211,16 +195,6 @@ struct GroupPayload {
 ///
 /// Everything here needs the swarm, which only the network task can touch.
 enum NetworkCommand {
-    /// Send a message to one peer.
-    ///
-    /// Reports back like `PublishToGroup` does, but not straight away: the
-    /// answer only exists once the other node has replied or the attempt has
-    /// failed, both of which arrive later as swarm events.
-    SendMessage {
-        peer_id: String,
-        message: String,
-        result_tx: oneshot::Sender<Result<(), String>>,
-    },
     /// Start receiving a group's messages. Gossipsub only delivers to
     /// subscribers, so this has to happen before anything arrives.
     SubscribeToGroup {
@@ -292,14 +266,13 @@ struct NetworkState {
     command_rx: Mutex<Option<mpsc::Receiver<NetworkCommand>>>,
 }
 
-/// The bytes we send when we send a chat message.
+/// A node telling another what it would like to be called.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ChatRequest(String);
+struct NameRequest(String);
 
-/// The reply to a `ChatRequest`. Empty on purpose: receiving a reply at all is
-/// the only information we need, which is that the other node accepted it.
+/// The reply, empty on purpose: arriving at all is the only information in it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ChatResponse();
+struct NameAck();
 
 /// Everything this node does on the network.
 ///
@@ -309,8 +282,13 @@ struct ChatResponse();
 struct AppBehaviour {
     /// Finds other nodes on the same local network.
     mdns: mdns::tokio::Behaviour,
-    /// Sends and receives direct chat messages, and group invites.
-    chat: cbor::Behaviour<ChatRequest, ChatResponse>,
+    /// Carries nothing but nodes telling each other what to call them.
+    ///
+    /// Everything people say to each other goes over `groups` below, whether it
+    /// is meant for a group or one person. This is a separate protocol because
+    /// an announcement has to reach somebody who has not added us, and so cannot
+    /// travel on a conversation that only contacts subscribe to.
+    names: cbor::Behaviour<NameRequest, NameAck>,
     /// Carries group messages, one topic per group.
     ///
     /// Unlike `chat`, this reaches members we have no direct connection to:
@@ -1378,35 +1356,6 @@ fn get_active_peers(state: State<'_, NetworkState>) -> Result<Vec<String>, Strin
     Ok(active_peers.iter().cloned().collect())
 }
 
-/// Sends a message to one peer and waits to hear whether it arrived.
-///
-/// Returns once the other node has accepted the message, or with an error if it
-/// couldn't be reached, didn't answer within `CHAT_REQUEST_TIMEOUT`, or dropped
-/// it because we aren't one of their contacts. That wait is the point: the
-/// caller shows the message as delivered on success, and this used to return as
-/// soon as the request was queued, so every message was marked delivered whether
-/// or not anyone ever received it.
-#[tauri::command]
-async fn send_message(
-    state: State<'_, NetworkState>,
-    peer_id: String,
-    message: String,
-) -> Result<(), String> {
-    let network_tx = network_sender(&state)?;
-    let (result_tx, result_rx) = oneshot::channel();
-
-    let command = NetworkCommand::SendMessage {
-        peer_id,
-        message,
-        result_tx,
-    };
-    network_tx.send(command).await.map_err(|e| e.to_string())?;
-
-    result_rx
-        .await
-        .map_err(|_| "the network task stopped before it could answer".to_string())?
-}
-
 /// Takes a copy of the channel into the network task.
 ///
 /// Kept separate so the lock is released before any await: holding a
@@ -1563,12 +1512,12 @@ async fn send_group_message(
 /// Panics on failure, because a node that can't set up its network stack has
 /// nothing useful to do.
 fn build_swarm(keypair: Keypair) -> Swarm<AppBehaviour> {
-    let chat = cbor::Behaviour::<ChatRequest, ChatResponse>::new(
+    let names = cbor::Behaviour::<NameRequest, NameAck>::new(
         [(
-            StreamProtocol::new(CHAT_PROTOCOL),
+            StreamProtocol::new(NAME_PROTOCOL),
             ProtocolSupport::Full,
         )],
-        RequestResponseConfig::default().with_request_timeout(CHAT_REQUEST_TIMEOUT),
+        RequestResponseConfig::default().with_request_timeout(NAME_REQUEST_TIMEOUT),
     );
 
     SwarmBuilder::with_existing_identity(keypair)
@@ -1589,15 +1538,10 @@ fn build_swarm(keypair: Keypair) -> Swarm<AppBehaviour> {
             let mdns = mdns::tokio::Behaviour::new(mdns_config, key.public().to_peer_id())
                 .expect("failed to start mDNS discovery");
 
-            let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(GOSSIPSUB_HEARTBEAT)
-                // Refuse messages that aren't signed, so the sender on an
-                // inbound group message is the peer who actually wrote it and
-                // not whoever passed it along.
-                .validation_mode(gossipsub::ValidationMode::Strict)
-                .check_explicit_peers_ticks(GOSSIPSUB_EXPLICIT_PEER_TICKS)
-                .build()
-                .expect("invalid gossipsub configuration");
+            // Shared with the server rather than written out twice. Two nodes
+            // that disagree about this don't fail to start, they fail to talk.
+            let gossipsub_config = feed_protocol::gossipsub_config()
+                .expect("the shared gossipsub configuration is not valid");
 
             let groups = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
@@ -1613,7 +1557,7 @@ fn build_swarm(keypair: Keypair) -> Swarm<AppBehaviour> {
 
             AppBehaviour {
                 mdns,
-                chat,
+                names,
                 groups,
                 ping,
             }
@@ -1875,8 +1819,8 @@ fn announce_name_to(app: &AppHandle, swarm: &mut Swarm<AppBehaviour>, peer: Peer
 
     swarm
         .behaviour_mut()
-        .chat
-        .send_request(&peer, ChatRequest(name_announcement(&name)));
+        .names
+        .send_request(&peer, NameRequest(name_announcement(&name)));
 }
 
 /// Records what a peer would like to be called, and tells the frontend.
@@ -1908,78 +1852,37 @@ fn record_peer_name(app: &AppHandle, peer_id: &str, name: String) {
     );
 }
 
-/// Handles one inbound chat message.
+/// Handles one inbound announcement.
 ///
-/// Messages from peers that are not in our contacts are dropped without a
-/// reply, which keeps strangers on the local network from reaching the UI at
-/// all.
+/// Accepted from anyone, contact or not, because the whole point is to be
+/// recognisable to somebody who hasn't added you yet. It only ever puts a name
+/// beside a peer id already on screen, is capped in length, and never becomes a
+/// contact or a message on its own. Names are claims, not identities — the peer
+/// id remains what actually identifies a node, and stays on screen next to it.
 ///
-/// One exception: a node saying what it would like to be called is accepted from
-/// anyone, because the whole point is to be recognisable to someone who hasn't
-/// added you yet. It only ever puts a name beside a peer id in the discovered
-/// list, is capped in length, and never becomes a contact or a message on its
-/// own. Names are claims, not identities — the peer id remains what actually
-/// identifies a node, and it stays on screen next to the name.
-fn handle_chat_request(
+/// Anything else arriving here is ignored. Conversations moved to gossipsub, so
+/// nothing this version sends takes this path.
+fn handle_name_announcement(
     app: &AppHandle,
     swarm: &mut Swarm<AppBehaviour>,
     sender: PeerId,
-    request: ChatRequest,
-    response_channel: ResponseChannel<ChatResponse>,
+    request: NameRequest,
+    response_channel: ResponseChannel<NameAck>,
 ) {
-    let sender_id = sender.to_string();
-    let ChatRequest(message) = request;
+    let NameRequest(message) = request;
 
-    if let Some(name) = announced_name(&message) {
-        record_peer_name(app, &sender_id, name);
-
-        let _ = swarm
-            .behaviour_mut()
-            .chat
-            .send_response(response_channel, ChatResponse());
-
+    let Some(name) = announced_name(&message) else {
         return;
-    }
+    };
 
-    if !is_contact(app, &sender_id) {
-        return;
-    }
+    record_peer_name(app, &sender.to_string(), name);
 
-    emit_to_frontend(
-        app,
-        "chat-received",
-        ChatPayload {
-            sender: sender_id,
-            message,
-        },
-    );
-
-    // The reply is the sender's confirmation that we accepted the message. It
-    // fails only if they disconnected while we were working, so ignore it.
+    // The reply only confirms arrival. It fails if they disconnected while we
+    // were working, which is nothing to act on.
     let _ = swarm
         .behaviour_mut()
-        .chat
-        .send_response(response_channel, ChatResponse());
-}
-
-/// Senders waiting to hear whether their message arrived, by request.
-///
-/// Lives inside the network task rather than in shared state: only the task
-/// knows about request ids, and every entry is removed by the event that
-/// resolves it.
-type PendingSends = HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>>;
-
-/// Answers whoever is waiting on a request, if anyone still is.
-///
-/// The receiver is gone if the window closed mid-send, which is not a problem.
-fn complete_send(
-    pending_sends: &mut PendingSends,
-    request_id: OutboundRequestId,
-    outcome: Result<(), String>,
-) {
-    if let Some(result_tx) = pending_sends.remove(&request_id) {
-        let _ = result_tx.send(outcome);
-    }
+        .names
+        .send_response(response_channel, NameAck());
 }
 
 /// Routes one event out of the swarm to the code that cares about it.
@@ -1990,7 +1893,6 @@ fn handle_swarm_event(
     app: &AppHandle,
     swarm: &mut Swarm<AppBehaviour>,
     keypair: &Keypair,
-    pending_sends: &mut PendingSends,
     event: SwarmEvent<AppBehaviourEvent>,
 ) {
     match event {
@@ -2049,32 +1951,20 @@ fn handle_swarm_event(
             handle_gossipsub_message(app, keypair, message);
         }
 
-        SwarmEvent::Behaviour(AppBehaviourEvent::Chat(RequestResponseEvent::Message {
+        SwarmEvent::Behaviour(AppBehaviourEvent::Names(RequestResponseEvent::Message {
             peer,
             message,
             ..
         })) => match message {
             RequestResponseMessage::Request {
                 request, channel, ..
-            } => handle_chat_request(app, swarm, peer, request, channel),
+            } => handle_name_announcement(app, swarm, peer, request, channel),
 
-            // The response is empty by design: that it arrived at all is the
-            // whole message, and it means the other node accepted ours.
-            RequestResponseMessage::Response { request_id, .. } => {
-                complete_send(pending_sends, request_id, Ok(()));
-            }
+            // Nothing waits on these. The reply to a name announcement carries
+            // no information beyond having arrived, and nobody is listening for
+            // it.
+            RequestResponseMessage::Response { .. } => {}
         },
-
-        SwarmEvent::Behaviour(AppBehaviourEvent::Chat(RequestResponseEvent::OutboundFailure {
-            request_id,
-            error,
-            ..
-        })) => {
-            // The peer is unreachable, or accepted nothing before the timeout —
-            // which is also what happens when they haven't added us as a
-            // contact, since they drop our message without replying.
-            complete_send(pending_sends, request_id, Err(error.to_string()));
-        }
 
         _ => {}
     }
@@ -2085,33 +1975,9 @@ fn handle_network_command(
     app: &AppHandle,
     swarm: &mut Swarm<AppBehaviour>,
     keypair: &Keypair,
-    pending_sends: &mut PendingSends,
     command: NetworkCommand,
 ) {
     match command {
-        NetworkCommand::SendMessage {
-            peer_id,
-            message,
-            result_tx,
-        } => {
-            let parsed = match peer_id.parse::<PeerId>() {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    let _ = result_tx.send(Err(format!("'{}' is not a peer id: {}", peer_id, error)));
-                    return;
-                }
-            };
-
-            // Sending only starts the attempt. Whoever is waiting is answered
-            // when the response or the failure comes back as an event.
-            let request_id = swarm
-                .behaviour_mut()
-                .chat
-                .send_request(&parsed, ChatRequest(message));
-
-            pending_sends.insert(request_id, result_tx);
-        }
-
         NetworkCommand::SubscribeToGroup { group_id } => {
             if let Err(error) = swarm.behaviour_mut().groups.subscribe(&group_topic(&group_id)) {
                 eprintln!("could not subscribe to group '{}': {}", group_id, error);
@@ -2164,8 +2030,8 @@ fn handle_network_command(
             for peer in connected {
                 swarm
                     .behaviour_mut()
-                    .chat
-                    .send_request(&peer, ChatRequest(announcement.clone()));
+                    .names
+                    .send_request(&peer, NameRequest(announcement.clone()));
             }
         }
 
@@ -2316,30 +2182,14 @@ async fn run_network(
     // after this task starts. Commands sent before this loop begins wait in the
     // channel, so nothing is missed.
 
-    // Callers waiting on a direct message they've sent. Only this task touches
-    // it, so it needs no lock.
-    let mut pending_sends: PendingSends = HashMap::new();
-
     loop {
         tokio::select! {
             swarm_event = swarm.select_next_some() => {
-                handle_swarm_event(
-                    &app,
-                    &mut swarm,
-                    &keypair_for_crypto,
-                    &mut pending_sends,
-                    swarm_event,
-                );
+                handle_swarm_event(&app, &mut swarm, &keypair_for_crypto, swarm_event);
             }
 
             Some(command) = command_rx.recv() => {
-                handle_network_command(
-                    &app,
-                    &mut swarm,
-                    &keypair_for_crypto,
-                    &mut pending_sends,
-                    command,
-                );
+                handle_network_command(&app, &mut swarm, &keypair_for_crypto, command);
             }
         }
     }
@@ -2428,7 +2278,6 @@ fn main() {
             send_direct,
             fail_stale_sends,
             get_active_peers,
-            send_message,
             subscribe_group,
             unsubscribe_group,
             send_group_message,
