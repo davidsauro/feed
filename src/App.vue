@@ -788,6 +788,14 @@ async function openFile(file: FileTransfer) {
   }
 }
 
+/**
+ * Shows a file in whatever the system uses to browse files.
+ *
+ * On Linux this goes through the desktop portal, which is not running under
+ * WSL2 and fails with a D-Bus error about a service nobody provides. Opening
+ * the containing folder is the next best thing, and if that also fails the path
+ * itself is at least worth showing, since it can be pasted somewhere useful.
+ */
 async function revealFile(file: FileTransfer) {
   if (!file.path) {
     return;
@@ -795,8 +803,18 @@ async function revealFile(file: FileTransfer) {
 
   try {
     await revealItemInDir(file.path);
+    return;
   } catch (error) {
-    notify(`Could not show ${file.name}: ${error}`);
+    console.error("Could not reveal the file", error);
+  }
+
+  const folder = file.path.slice(0, Math.max(0, file.path.lastIndexOf("/")));
+
+  try {
+    await openPath(folder);
+  } catch (error) {
+    console.error("Could not open the folder either", error);
+    notify(`${file.name} is at ${file.path}`, "info");
   }
 }
 

@@ -117,29 +117,59 @@ where
 ///
 /// Runs in its own task, so a large file does not hold up anything else.
 pub async fn serve(app: AppHandle, peer: PeerId, mut stream: Stream) {
-    if let Err(error) = serve_inner(&app, peer, &mut stream).await {
-        eprintln!("could not send a file to {}: {}", peer, error);
+    // Read first, so that whatever happens next can be recorded against the
+    // transfer it happened to.
+    let request = match read_request(&mut stream).await {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!("could not read a file request from {}: {}", peer, error);
+            let _ = stream.close().await;
+            return;
+        }
+    };
 
-        // Best effort. The other side may already be gone, which is how most of
-        // these end.
-        let _ = write_frame(
-            &mut stream,
-            &serde_json::to_vec(&PullResponse {
-                ok: false,
-                error: Some(error),
-            })
-            .unwrap_or_default(),
-        )
-        .await;
+    let id = request.transfer_id.clone();
+    let _ = crate::set_file_status(&app, &id, "transferring", None);
+    let _ = app.emit("file-changed", &id);
+
+    match serve_inner(&app, peer, &mut stream, request).await {
+        Ok(()) => {
+            let _ = crate::set_file_status(&app, &id, "complete", None);
+        }
+        Err(error) => {
+            eprintln!("could not send a file to {}: {}", peer, error);
+
+            // Best effort. The other side may already be gone, which is how most
+            // of these end.
+            let _ = write_frame(
+                &mut stream,
+                &serde_json::to_vec(&PullResponse {
+                    ok: false,
+                    error: Some(error.clone()),
+                })
+                .unwrap_or_default(),
+            )
+            .await;
+
+            let _ = crate::set_file_status(&app, &id, "failed", Some(&error));
+        }
     }
 
+    let _ = app.emit("file-changed", &id);
     let _ = stream.close().await;
 }
 
-async fn serve_inner(app: &AppHandle, peer: PeerId, stream: &mut Stream) -> Result<(), String> {
-    let request: PullRequest = serde_json::from_slice(&read_frame(stream, MAX_REQUEST_SIZE).await?)
-        .map_err(|e| format!("could not read the request: {}", e))?;
+async fn read_request(stream: &mut Stream) -> Result<PullRequest, String> {
+    serde_json::from_slice(&read_frame(stream, MAX_REQUEST_SIZE).await?)
+        .map_err(|e| format!("could not read the request: {}", e))
+}
 
+async fn serve_inner(
+    app: &AppHandle,
+    peer: PeerId,
+    stream: &mut Stream,
+    request: PullRequest,
+) -> Result<(), String> {
     let transfer = crate::find_outgoing_file(app, &request.transfer_id, &peer.to_string())?
         .ok_or_else(|| "no such transfer".to_string())?;
 
@@ -173,6 +203,7 @@ async fn serve_inner(app: &AppHandle, peer: PeerId, stream: &mut Stream) -> Resu
     .await?;
 
     let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut sent = request.from_chunk * CHUNK_SIZE as u64;
 
     for index in request.from_chunk..chunks {
         let filled = read_up_to(&mut file, &mut buffer).await?;
@@ -180,6 +211,20 @@ async fn serve_inner(app: &AppHandle, peer: PeerId, stream: &mut Stream) -> Resu
 
         let sealed = file_crypto::seal_chunk(&key, index, is_last, &buffer[..filled])?;
         write_frame(stream, &sealed).await?;
+
+        // The sender gets a progress bar for the same reason the receiver does.
+        // Watching a file leave is most of knowing that it worked.
+        sent += filled as u64;
+        crate::set_file_progress(app, &request.transfer_id, sent)?;
+
+        let _ = app.emit(
+            "file-progress",
+            Progress {
+                transfer_id: request.transfer_id.clone(),
+                transferred: sent,
+                size: transfer.size,
+            },
+        );
     }
 
     Ok(())

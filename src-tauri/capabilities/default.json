@@ -8,7 +8,21 @@
   "permissions": [
     "core:default",
     "dialog:allow-open",
-    "opener:allow-open-path",
-    "opener:allow-reveal-item-in-dir"
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [
+        {
+          "path": "$APPLOCALDATA/files/**"
+        }
+      ]
+    },
+    {
+      "identifier": "opener:allow-reveal-item-in-dir",
+      "allow": [
+        {
+          "path": "$APPLOCALDATA/files/**"
+        }
+      ]
+    }
   ]
 }
