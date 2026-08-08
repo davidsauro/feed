@@ -59,3 +59,37 @@ export function shortPeerId(peerId: string): string {
 
   return `${peerId.slice(0, 8)}…${peerId.slice(-6)}`;
 }
+
+/**
+ * One file, in one direction, between us and one other person.
+ *
+ * Mirrors the `FileTransfer` struct in Rust. `transferred` is what a progress
+ * bar reads, and what lets a broken transfer pick up where it stopped.
+ */
+export interface FileTransfer {
+  id: string;
+  peer_id: string;
+  direction: "outgoing" | "incoming";
+  name: string;
+  size: number;
+  hash: string;
+  key: string;
+  path: string | null;
+  status: "offered" | "pending" | "transferring" | "complete" | "failed";
+  transferred: number;
+  error: string | null;
+  sent_at: number;
+}
+
+/** Bytes as something a person reads. */
+export function describeSize(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(0)} KB`;
+  }
+
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}

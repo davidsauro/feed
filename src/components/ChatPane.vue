@@ -9,9 +9,10 @@
  * Sending is reported upward. All this component owns is the draft text and
  * keeping the history scrolled to the newest message.
  */
-import { nextTick, ref, watch } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
+import FileBubble from "./FileBubble.vue";
 import MessageBubble from "./MessageBubble.vue";
-import type { ChatMessage } from "../types";
+import type { ChatMessage, FileTransfer } from "../types";
 
 const props = defineProps<{
   /** Contact nickname, or group name. */
@@ -19,6 +20,8 @@ const props = defineProps<{
   /** Shortened peer ID, or the member count. */
   subtitle: string;
   messages: ChatMessage[];
+  /** Files sent or received in this conversation. */
+  files: FileTransfer[];
   /** Our own peer ID, used to tell our messages from theirs. */
   myPeerId: string;
   /**
@@ -41,7 +44,37 @@ const emit = defineEmits<{
   addMembers: [];
   /** A message that didn't go out should be tried again. */
   retry: [id: string];
+  attach: [];
+  openFile: [file: FileTransfer];
+  revealFile: [file: FileTransfer];
 }>();
+
+/**
+ * Messages and files in one list, in the order they were sent.
+ *
+ * Sending somebody a file is a thing you said to them, so it belongs in the
+ * conversation rather than only in a separate list. Merging here rather than
+ * storing a file as a message too keeps one record of a transfer rather than two
+ * that could disagree.
+ */
+const timeline = computed(() => {
+  const entries = [
+    ...props.messages.map((message) => ({
+      key: `m:${message.id}`,
+      sentAt: message.sent_at,
+      message,
+      file: null as FileTransfer | null,
+    })),
+    ...props.files.map((file) => ({
+      key: `f:${file.id}`,
+      sentAt: file.sent_at,
+      message: null as ChatMessage | null,
+      file,
+    })),
+  ];
+
+  return entries.sort((a, b) => a.sentAt - b.sentAt);
+});
 
 const draft = ref("");
 const history = ref<HTMLElement | null>(null);
@@ -61,7 +94,7 @@ function send() {
  * conversation changes, which is what makes the newest message the one you see.
  */
 watch(
-  () => [props.title, props.messages.length],
+  () => [props.title, props.messages.length, props.files.length],
   async () => {
     await nextTick();
     if (history.value) {
@@ -109,21 +142,44 @@ watch(
     </header>
 
     <div ref="history" class="history">
-      <p v-if="messages.length === 0" class="empty">
+      <p v-if="timeline.length === 0" class="empty">
         No messages yet. Say hello.
       </p>
 
-      <MessageBubble
-        v-for="message in messages"
-        :key="message.id"
-        :message="message"
-        :outgoing="message.sender === myPeerId"
-        :sender-label="senderLabels?.[message.sender]"
-        @retry="emit('retry', message.id)"
-      />
+      <template v-for="entry in timeline" :key="entry.key">
+        <MessageBubble
+          v-if="entry.message"
+          :message="entry.message"
+          :outgoing="entry.message.sender === myPeerId"
+          :sender-label="senderLabels?.[entry.message.sender]"
+          @retry="emit('retry', entry.message!.id)"
+        />
+
+        <FileBubble
+          v-else-if="entry.file"
+          :file="entry.file"
+          :outgoing="entry.file.direction === 'outgoing'"
+          @open="emit('openFile', $event)"
+          @reveal="emit('revealFile', $event)"
+        />
+      </template>
     </div>
 
     <footer class="composer">
+      <button class="attach" title="Send files" @click="emit('attach')">
+        <svg
+          viewBox="0 0 24 24"
+          width="17"
+          height="17"
+          stroke="currentColor"
+          stroke-width="2"
+          fill="none"
+          stroke-linecap="round"
+        >
+          <path d="M21.4 11.05 12.25 20.2a6 6 0 0 1-8.49-8.49l9.2-9.19a4 4 0 0 1 5.65 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+        </svg>
+      </button>
+
       <input
         v-model="draft"
         type="text"
@@ -258,6 +314,22 @@ watch(
   padding: 12px 16px;
   border-top: 1px solid var(--border);
   background-color: var(--bg);
+}
+
+.attach {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  color: var(--text-faint);
+}
+
+.attach:hover {
+  background-color: var(--bg-hover);
+  color: var(--text);
 }
 
 .composer input {

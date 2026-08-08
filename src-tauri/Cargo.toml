@@ -35,4 +35,7 @@ base64 = "0.22.1"
 # is set, so existing data keeps working. OpenSSL is vendored to avoid adding a
 # system dependency, at the cost of a longer first build.
 rusqlite = { version = "0.40.1", features = ["bundled-sqlcipher-vendored-openssl"] }
+libp2p-stream = "0.4.0-alpha"
+tauri-plugin-dialog = "2.7.2"
+tauri-plugin-opener = "2.5.4"
 

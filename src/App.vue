@@ -14,6 +14,8 @@
 import { computed, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open as pickFiles } from "@tauri-apps/plugin-dialog";
+import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 
 import AddMembersDialog from "./components/AddMembersDialog.vue";
 import ChatPane from "./components/ChatPane.vue";
@@ -25,7 +27,7 @@ import NewGroupDialog from "./components/NewGroupDialog.vue";
 import PeerList from "./components/PeerList.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import UnlockScreen from "./components/UnlockScreen.vue";
-import type { ChatMessage, Contact, Group, MessageStatus } from "./types";
+import type { ChatMessage, Contact, FileTransfer, Group, MessageStatus } from "./types";
 import { shortPeerId } from "./types";
 
 /** Which kind of thing a conversation is with. */
@@ -59,6 +61,14 @@ const groups = ref<Group[]>([]);
  * as the id rather than relying on peer IDs and group IDs never colliding.
  */
 const messages = ref<Record<string, ChatMessage[]>>({});
+
+/**
+ * Every file this node has sent or received.
+ *
+ * Kept whole rather than per conversation, because the Files view wants all of
+ * them and a conversation only wants a slice, which is cheap to take.
+ */
+const files = ref<FileTransfer[]>([]);
 const unread = ref<Record<string, boolean>>({});
 
 /** The open conversation, or null for the empty state. */
@@ -200,6 +210,15 @@ const currentMessages = computed(() => {
   }
 
   return messages.value[conversationKey(selection.value.kind, selection.value.id)] ?? [];
+});
+
+/** The files belonging to whichever conversation is open. */
+const currentFiles = computed(() => {
+  if (selection.value?.kind !== "contact") {
+    return [];
+  }
+
+  return files.value.filter((file) => file.peer_id === selection.value?.id);
 });
 
 const selectedIsOnline = computed(
@@ -650,6 +669,134 @@ async function receiveGroupMessage(
 
   if (selection.value?.kind !== "group" || selection.value.id !== groupId) {
     unread.value[key] = true;
+  }
+}
+
+// --- Files ----------------------------------------------------------------
+
+async function loadFiles() {
+  try {
+    files.value = await invoke<FileTransfer[]>("get_files");
+  } catch (error) {
+    console.error("Could not load files", error);
+  }
+}
+
+/** Replaces one file in the list, or adds it if it is new. */
+function rememberFile(file: FileTransfer) {
+  const at = files.value.findIndex((existing) => existing.id === file.id);
+
+  if (at === -1) {
+    files.value.push(file);
+  } else {
+    files.value[at] = file;
+  }
+}
+
+/**
+ * Picks files and sends them to whoever is open.
+ *
+ * One offer per file rather than one for the batch, so that a file that fails
+ * takes only itself down.
+ */
+async function attachFiles() {
+  const contact = selectedContact.value;
+  if (!contact) {
+    return;
+  }
+
+  const chosen = await pickFiles({ multiple: true, title: `Send to ${contact.nickname}` });
+  if (!chosen) {
+    return;
+  }
+
+  const paths = Array.isArray(chosen) ? chosen : [chosen];
+
+  for (const path of paths) {
+    await sendOneFile(contact, path);
+  }
+}
+
+async function sendOneFile(contact: Contact, path: string) {
+  const sentAt = Date.now();
+
+  try {
+    // Reads the file, hashes it, and records the offer. Nothing leaves this
+    // machine until the recipient asks for it.
+    const file = await invoke<FileTransfer>("send_file", {
+      peerId: contact.peer_id,
+      path,
+      sentAt,
+    });
+
+    rememberFile(file);
+
+    await invoke("send_direct", {
+      peerId: contact.peer_id,
+      message: JSON.stringify({
+        type: "file-offer",
+        id: file.id,
+        name: file.name,
+        size: file.size,
+        hash: file.hash,
+        key: file.key,
+        sentAt,
+      }),
+    });
+  } catch (error) {
+    notify(`Could not send that file: ${error}`);
+  }
+}
+
+/** Handles a file somebody has offered us, and starts fetching it. */
+async function receiveOffer(
+  sender: string,
+  offer: { id: string; name: string; size: number; hash: string; key: string },
+  sentAt: number,
+) {
+  const contact = savedContacts.value.find((saved) => saved.peer_id === sender);
+
+  try {
+    const file = await invoke<FileTransfer>("receive_file", {
+      offer: {
+        peerId: sender,
+        nickname: contact?.nickname ?? "",
+        id: offer.id,
+        name: offer.name,
+        size: offer.size,
+        hash: offer.hash,
+        key: offer.key,
+        sentAt,
+      },
+    });
+
+    rememberFile(file);
+  } catch (error) {
+    notify(`Could not accept ${offer.name}: ${error}`);
+  }
+}
+
+async function openFile(file: FileTransfer) {
+  if (!file.path) {
+    return;
+  }
+
+  try {
+    await openPath(file.path);
+  } catch (error) {
+    notify(`Could not open ${file.name}: ${error}`);
+  }
+}
+
+async function revealFile(file: FileTransfer) {
+  if (!file.path) {
+    return;
+  }
+
+  try {
+    await revealItemInDir(file.path);
+  } catch (error) {
+    notify(`Could not show ${file.name}: ${error}`);
   }
 }
 
@@ -1252,6 +1399,7 @@ async function startSession() {
   await loadNames();
   await loadContacts();
   await subscribeToContacts();
+  await loadFiles();
   await loadGroups();
   await subscribeToSavedGroups();
 
@@ -1261,6 +1409,23 @@ async function startSession() {
 
   await listen<string>("peer-lost", (event) => {
     activePeers.value.delete(event.payload);
+  });
+
+  // Progress arrives per chunk, so this updates one number rather than
+  // reloading everything.
+  await listen<{ transfer_id: string; transferred: number }>("file-progress", (event) => {
+    const file = files.value.find((candidate) => candidate.id === event.payload.transfer_id);
+
+    if (file) {
+      file.transferred = event.payload.transferred;
+      file.status = "transferring";
+    }
+  });
+
+  // A transfer finishing or failing changes more than a number, so the record is
+  // read back rather than guessed at.
+  await listen<string>("file-changed", async () => {
+    await loadFiles();
   });
 
   await listen<{ peer_id: string; name: string }>("peer-name", (event) => {
@@ -1299,6 +1464,25 @@ async function startSession() {
       Array.isArray(data.members)
     ) {
       await receiveInvite(sender, data.groupId, data.groupName, data.members);
+    } else if (
+      data.type === "file-offer" &&
+      data.id &&
+      data.name &&
+      typeof data.size === "number" &&
+      data.hash &&
+      data.key
+    ) {
+      await receiveOffer(
+        sender,
+        {
+          id: data.id,
+          name: data.name,
+          size: data.size,
+          hash: data.hash,
+          key: data.key,
+        },
+        claimedSentAt(data.sentAt),
+      );
     } else if (data.type === "group-leave" && data.groupId) {
       await receiveDeparture(sender, data.groupId);
     }
@@ -1386,6 +1570,10 @@ function parsePayload(
   text?: string;
   messageIds?: string[];
   sentAt?: number;
+  name?: string;
+  size?: number;
+  hash?: string;
+  key?: string;
   groupId?: string;
   groupName?: string;
   members?: string[];
@@ -1471,9 +1659,13 @@ function parsePayload(
         :subtitle="shortPeerId(selectedContact.peer_id)"
         :online="selectedIsOnline"
         :messages="currentMessages"
+        :files="currentFiles"
         :my-peer-id="myPeerId"
         @send="sendMessage"
         @retry="retryMessage"
+        @attach="attachFiles"
+        @open-file="openFile"
+        @reveal-file="revealFile"
       />
 
       <ChatPane
@@ -1483,6 +1675,7 @@ function parsePayload(
         :subtitle="`${selectedGroup.members.length} members`"
         :online="null"
         :messages="currentMessages"
+        :files="[]"
         :my-peer-id="myPeerId"
         :sender-labels="groupSenderLabels"
         :can-add-members="true"

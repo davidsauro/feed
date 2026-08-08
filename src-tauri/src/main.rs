@@ -14,6 +14,8 @@
 //! frontend sends work to the network task through an mpsc channel, and the
 //! network task sends news back to the frontend as Tauri events.
 
+mod file_crypto;
+mod file_transfer;
 mod group_crypto;
 
 use feed_protocol::{DIRECT_TOPIC_PREFIX, GROUP_TOPIC_PREFIX};
@@ -236,6 +238,14 @@ enum NetworkCommand {
     },
 }
 
+/// Lets a command open a stream to a peer without going through the network
+/// task.
+///
+/// Cloning this is how a transfer gets its own stream. The library uses one
+/// stream at a time per control to provide backpressure, so a transfer takes a
+/// clone rather than sharing.
+pub struct FileControl(pub libp2p_stream::Control);
+
 /// The passphrase for the encrypted database, held only in memory.
 ///
 /// `None` means either that encryption is off, or that it is on and the database
@@ -294,6 +304,13 @@ struct AppBehaviour {
     /// Unlike `chat`, this reaches members we have no direct connection to:
     /// peers in the middle relay what they receive.
     groups: gossipsub::Behaviour,
+    /// Carries files, on their own streams.
+    ///
+    /// Separate from everything else so that a large file cannot delay a
+    /// message, and so a transfer gets flow control from the stream rather than
+    /// having to invent it.
+    files: libp2p_stream::Behaviour,
+
     /// Checks that the peer on the other end of each connection is still there.
     ///
     /// Only needed for nodes that disappear without closing their sockets; one
@@ -521,6 +538,24 @@ fn create_tables(conn: &Connection) -> SqlResult<()> {
     )?;
 
     conn.execute(
+        "CREATE TABLE IF NOT EXISTS files (
+            id          TEXT PRIMARY KEY,
+            peer_id     TEXT NOT NULL,
+            direction   TEXT NOT NULL,
+            name        TEXT NOT NULL,
+            size        INTEGER NOT NULL,
+            hash        TEXT NOT NULL,
+            key         TEXT NOT NULL,
+            path        TEXT,
+            status      TEXT NOT NULL,
+            transferred INTEGER NOT NULL DEFAULT 0,
+            error       TEXT,
+            sent_at     INTEGER NOT NULL
+        )",
+        (),
+    )?;
+
+    conn.execute(
         "CREATE TABLE IF NOT EXISTS settings (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -601,6 +636,323 @@ fn is_contact(app: &AppHandle, peer_id: &str) -> bool {
     let count: i64 = statement.query_row([peer_id], |row| row.get(0)).unwrap_or(0);
 
     count > 0
+}
+
+// ---------------------------------------------------------------------------
+// Files
+// ---------------------------------------------------------------------------
+
+/// One file, in one direction, between us and one other person.
+///
+/// The same row serves both sides. For a file we are sending, `path` is where it
+/// lives on this machine and `key` is what we sealed it with. For one we are
+/// receiving, `path` is where it is being written and `key` is what came in the
+/// offer. `transferred` is what makes resuming possible.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct FileTransfer {
+    pub id: String,
+    pub peer_id: String,
+    pub direction: String,
+    pub name: String,
+    pub size: u64,
+    pub hash: String,
+    pub key: String,
+    pub path: Option<String>,
+    pub status: String,
+    pub transferred: u64,
+    pub error: Option<String>,
+    pub sent_at: i64,
+}
+
+const FILE_COLUMNS: &str =
+    "id, peer_id, direction, name, size, hash, key, path, status, transferred, error, sent_at";
+
+fn read_file_row(row: &rusqlite::Row) -> SqlResult<FileTransfer> {
+    Ok(FileTransfer {
+        id: row.get(0)?,
+        peer_id: row.get(1)?,
+        direction: row.get(2)?,
+        name: row.get(3)?,
+        size: row.get::<_, i64>(4)?.max(0) as u64,
+        hash: row.get(5)?,
+        key: row.get(6)?,
+        path: row.get(7)?,
+        status: row.get(8)?,
+        transferred: row.get::<_, i64>(9)?.max(0) as u64,
+        error: row.get(10)?,
+        sent_at: row.get(11)?,
+    })
+}
+
+/// Where received files are kept, one folder per person they came from.
+fn files_dir(app: &AppHandle) -> std::path::PathBuf {
+    app_data_dir(app).join("files")
+}
+
+/// Finds a transfer we offered, checking it was offered to the peer asking.
+///
+/// Ids are random and travel only inside sealed messages, so guessing one is not
+/// realistic. Checking anyway costs a comparison and means one leaked id cannot
+/// be used by anybody else.
+pub fn find_outgoing_file(
+    app: &AppHandle,
+    id: &str,
+    peer_id: &str,
+) -> Result<Option<FileTransfer>, String> {
+    let conn = get_db_connection(app).map_err(|e| e.to_string())?;
+
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT {} FROM files WHERE id = ?1 AND peer_id = ?2 AND direction = 'outgoing'",
+            FILE_COLUMNS
+        ))
+        .map_err(|e| e.to_string())?;
+
+    let mut rows = statement
+        .query_map((id, peer_id), read_file_row)
+        .map_err(|e| e.to_string())?;
+
+    rows.next().transpose().map_err(|e| e.to_string())
+}
+
+pub fn find_incoming_file(app: &AppHandle, id: &str) -> Result<Option<FileTransfer>, String> {
+    let conn = get_db_connection(app).map_err(|e| e.to_string())?;
+
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT {} FROM files WHERE id = ?1 AND direction = 'incoming'",
+            FILE_COLUMNS
+        ))
+        .map_err(|e| e.to_string())?;
+
+    let mut rows = statement
+        .query_map([id], read_file_row)
+        .map_err(|e| e.to_string())?;
+
+    rows.next().transpose().map_err(|e| e.to_string())
+}
+
+pub fn set_file_status(
+    app: &AppHandle,
+    id: &str,
+    status: &str,
+    error: Option<&str>,
+) -> Result<(), String> {
+    let conn = get_db_connection(app).map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "UPDATE files SET status = ?1, error = ?2 WHERE id = ?3",
+        (status, error, id),
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+pub fn set_file_progress(app: &AppHandle, id: &str, transferred: u64) -> Result<(), String> {
+    let conn = get_db_connection(app).map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "UPDATE files SET transferred = ?1 WHERE id = ?2",
+        (transferred as i64, id),
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Everything this node has sent or received, newest first.
+#[tauri::command]
+fn get_files(app: AppHandle) -> Result<Vec<FileTransfer>, String> {
+    let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
+
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT {} FROM files ORDER BY sent_at DESC",
+            FILE_COLUMNS
+        ))
+        .map_err(|e| e.to_string())?;
+
+    let rows = statement
+        .query_map([], read_file_row)
+        .map_err(|e| e.to_string())?;
+
+    let mut files = Vec::new();
+    for row in rows {
+        files.push(row.map_err(|e| e.to_string())?);
+    }
+
+    Ok(files)
+}
+
+/// Prepares a file to be sent, and returns what the offer message needs.
+///
+/// Nothing is sent from here. The caller puts these details in an offer, which
+/// travels as an ordinary sealed message, and the recipient then asks for the
+/// bytes.
+#[tauri::command]
+async fn send_file(
+    app: AppHandle,
+    peer_id: String,
+    path: String,
+    sent_at: i64,
+) -> Result<FileTransfer, String> {
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| format!("could not read {}: {}", path, e))?;
+
+    if !metadata.is_file() {
+        return Err(format!("{} is not a file", path));
+    }
+
+    let size = metadata.len();
+    if size > file_crypto::MAX_FILE_SIZE {
+        return Err(format!(
+            "that file is {:.1}MB and the limit is {}MB",
+            size as f64 / (1024.0 * 1024.0),
+            file_crypto::MAX_FILE_SIZE / (1024 * 1024)
+        ));
+    }
+
+    let name = std::path::Path::new(&path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+
+    let hash = file_transfer::hash_file(&path).await?;
+    let key = file_crypto::FileKey::generate();
+
+    let transfer = FileTransfer {
+        id: random_id(),
+        peer_id,
+        direction: "outgoing".to_string(),
+        name,
+        size,
+        hash,
+        key: file_transfer::encode_key(&key),
+        path: Some(path),
+        status: "offered".to_string(),
+        transferred: 0,
+        error: None,
+        sent_at,
+    };
+
+    insert_file(&app, &transfer)?;
+
+    Ok(transfer)
+}
+
+/// A file somebody has offered us, as it arrives from the interface.
+///
+/// Gathered into one type rather than passed as eight arguments, which is both
+/// easier to read and harder to fill in wrongly.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncomingOffer {
+    pub peer_id: String,
+    /// What we call them, which is what their folder is named after.
+    pub nickname: String,
+    pub id: String,
+    pub name: String,
+    pub size: u64,
+    pub hash: String,
+    pub key: String,
+    pub sent_at: i64,
+}
+
+/// Records a file we have been offered and starts fetching it.
+///
+/// There is no prompt. Both people have added each other, which is where that
+/// decision was made.
+#[tauri::command]
+async fn receive_file(
+    app: AppHandle,
+    state: State<'_, FileControl>,
+    offer: IncomingOffer,
+) -> Result<FileTransfer, String> {
+    let IncomingOffer {
+        peer_id,
+        nickname,
+        id,
+        name,
+        size,
+        hash,
+        key,
+        sent_at,
+    } = offer;
+
+    if size > file_crypto::MAX_FILE_SIZE {
+        return Err(format!("{} is larger than this node will accept", name));
+    }
+
+    let peer = parse_peer(&peer_id)?;
+
+    // The sender chose this name, so it is cleaned before it touches a path.
+    let folder = files_dir(&app).join(file_transfer::folder_for(&nickname, &peer_id));
+    tokio::fs::create_dir_all(&folder)
+        .await
+        .map_err(|e| format!("could not make a folder for their files: {}", e))?;
+
+    let destination = file_transfer::available_path(&folder, &file_transfer::safe_file_name(&name));
+
+    let transfer = FileTransfer {
+        id: id.clone(),
+        peer_id,
+        direction: "incoming".to_string(),
+        name,
+        size,
+        hash,
+        key,
+        path: Some(destination.to_string_lossy().to_string()),
+        status: "pending".to_string(),
+        transferred: 0,
+        error: None,
+        sent_at,
+    };
+
+    insert_file(&app, &transfer)?;
+
+    // Its own task, so a large file does not hold up anything else.
+    let control = state.0.clone();
+    tauri::async_runtime::spawn(file_transfer::fetch(app.clone(), control, peer, id));
+
+    Ok(transfer)
+}
+
+fn insert_file(app: &AppHandle, transfer: &FileTransfer) -> Result<(), String> {
+    let conn = get_db_connection(app).map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO files (id, peer_id, direction, name, size, hash, key, path, status, transferred, error, sent_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        (
+            &transfer.id,
+            &transfer.peer_id,
+            &transfer.direction,
+            &transfer.name,
+            transfer.size as i64,
+            &transfer.hash,
+            &transfer.key,
+            &transfer.path,
+            &transfer.status,
+            transfer.transferred as i64,
+            &transfer.error,
+            transfer.sent_at,
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// A random identifier, for naming a transfer.
+fn random_id() -> String {
+    use chacha20poly1305::aead::rand_core::RngCore;
+
+    let mut bytes = [0u8; 16];
+    chacha20poly1305::aead::OsRng.fill_bytes(&mut bytes);
+
+    bytes.iter().map(|byte| format!("{:02x}", byte)).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1338,8 +1690,13 @@ fn start_network(app: AppHandle, state: State<'_, NetworkState>) -> Result<(), S
     };
 
     let keypair = get_or_create_keypair(&app_data_dir(&app), &current_node_id())?;
+    let swarm = build_swarm(keypair.clone());
 
-    tauri::async_runtime::spawn(run_network(app, keypair, command_rx));
+    // Taken before the network task starts, so a command cannot arrive and find
+    // there is no way to open a stream yet.
+    app.manage(FileControl(swarm.behaviour().files.new_control()));
+
+    tauri::async_runtime::spawn(run_network(app, keypair, swarm, command_rx));
 
     Ok(())
 }
@@ -1557,6 +1914,7 @@ fn build_swarm(keypair: Keypair) -> Swarm<AppBehaviour> {
 
             AppBehaviour {
                 mdns,
+                files: libp2p_stream::Behaviour::new(),
                 names,
                 groups,
                 ping,
@@ -2160,13 +2518,30 @@ fn seal_for_group(
 async fn run_network(
     app: AppHandle,
     keypair: Keypair,
+    mut swarm: Swarm<AppBehaviour>,
     mut command_rx: mpsc::Receiver<NetworkCommand>,
 ) {
-    // Kept for sealing and opening group messages. The swarm takes ownership of
-    // the original for its own signing and handshakes.
-    let keypair_for_crypto = keypair.clone();
+    // Kept for sealing and opening group messages.
+    let keypair_for_crypto = keypair;
 
-    let mut swarm = build_swarm(keypair);
+    // Inbound file transfers, each handled on its own task so that one large
+    // file neither blocks another nor holds up the network loop.
+    match swarm.behaviour().files.new_control().accept(file_transfer::FILE_PROTOCOL) {
+        Ok(mut incoming) => {
+            let app_for_files = app.clone();
+
+            tauri::async_runtime::spawn(async move {
+                while let Some((peer, stream)) = incoming.next().await {
+                    tauri::async_runtime::spawn(file_transfer::serve(
+                        app_for_files.clone(),
+                        peer,
+                        stream,
+                    ));
+                }
+            });
+        }
+        Err(error) => eprintln!("could not listen for incoming files: {}", error),
+    }
 
     let listen_address = LISTEN_ADDRESS
         .parse()
@@ -2201,6 +2576,10 @@ async fn run_network(
 
 fn main() {
     tauri::Builder::default()
+        // The picker for choosing files to send, and opening or revealing one
+        // that has arrived.
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let app_handle = app.handle().clone();
 
@@ -2264,6 +2643,10 @@ fn main() {
             update_message_status,
             get_chat_history,
             count_chat_messages,
+            // Files
+            send_file,
+            receive_file,
+            get_files,
             // Groups
             save_group,
             get_groups,

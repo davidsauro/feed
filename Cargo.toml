@@ -41,7 +41,9 @@ libp2p = { version = "0.56.0", features = [
     "tokio",
     "yamux",
 ] }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync"] }
+# "fs" and "io-util" are for file transfer, which reads and writes files
+# without blocking the runtime.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util"] }
 futures = "0.3.33"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
