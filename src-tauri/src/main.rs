@@ -1679,7 +1679,7 @@ fn get_group_history(app: AppHandle, group_id: String) -> Result<Vec<ChatMessage
 /// Safe to call more than once: the receiving half of the command channel can
 /// only be taken once, and later calls do nothing.
 #[tauri::command]
-fn start_network(app: AppHandle, state: State<'_, NetworkState>) -> Result<(), String> {
+async fn start_network(app: AppHandle, state: State<'_, NetworkState>) -> Result<(), String> {
     let command_rx = {
         let mut guard = state.command_rx.lock().map_err(|e| e.to_string())?;
         guard.take()
@@ -1695,6 +1695,13 @@ fn start_network(app: AppHandle, state: State<'_, NetworkState>) -> Result<(), S
     // Taken before the network task starts, so a command cannot arrive and find
     // there is no way to open a stream yet.
     app.manage(FileControl(swarm.behaviour().files.new_control()));
+
+    // This command is async for a reason that is easy to undo by accident.
+    // Building the swarm sets up mDNS, which watches network interfaces through
+    // netlink and needs a Tokio reactor to do it. A synchronous command runs on
+    // the main thread, where there is no reactor and the whole process aborts on
+    // a panic that cannot unwind. Async commands run on the async runtime, which
+    // has one.
 
     tauri::async_runtime::spawn(run_network(app, keypair, swarm, command_rx));
 
@@ -2823,6 +2830,23 @@ mod tests {
     #[test]
     fn a_blank_name_is_ignored() {
         assert_eq!(announced_name(&name_announcement("   ")), None);
+    }
+
+    /// Building the swarm sets up mDNS, which watches network interfaces through
+    /// netlink and needs a Tokio reactor. Doing it anywhere without one aborts
+    /// the process rather than returning an error, so this at least pins that it
+    /// works where it is supposed to.
+    ///
+    /// It does not catch the mistake that caused that abort, which was calling it
+    /// from a synchronous Tauri command. Nothing here can see how a command is
+    /// declared.
+    #[tokio::test]
+    async fn the_swarm_builds_inside_the_runtime() {
+        let swarm = build_swarm(Keypair::generate_ed25519());
+
+        assert!(swarm.behaviour().files.new_control().accept(
+            file_transfer::FILE_PROTOCOL
+        ).is_ok());
     }
 
     /// A file written by an older version is world-readable; loading it should
