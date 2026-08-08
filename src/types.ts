@@ -46,6 +46,80 @@ export interface ChatMessage {
 }
 
 /**
+ * A relay server this node connects to. Mirrors the `Server` struct in Rust.
+ *
+ * Servers exist so two people who are not on the same network can still reach
+ * each other. Whether one is reachable is not stored here: a server is an
+ * ordinary peer once connected, so it shows up in the same presence set as
+ * everybody else.
+ */
+export interface Server {
+  /** Full multiaddress, including the `/p2p/<peer id>` that names it. */
+  address: string;
+  peer_id: string;
+}
+
+/**
+ * The readable part of a server address, without the peer id.
+ *
+ * The identity matters and is worth keeping, but it is 52 characters of noise in
+ * a list where what you want to recognise is the host.
+ */
+export function describeServer(server: Server): string {
+  const at = server.address.indexOf("/p2p/");
+
+  return at === -1 ? server.address : server.address.slice(0, at);
+}
+
+/**
+ * What is currently known about one server. Mirrors `ServerStatus` in Rust.
+ *
+ * Every field is an observation rather than a promise. A server reachable a
+ * moment ago may not be now, which is why there is a button to go and look.
+ */
+export interface ServerStatus {
+  address: string;
+  peer_id: string;
+  connected: boolean;
+  /**
+   * Last measured round trip, in milliseconds.
+   *
+   * From the ping running anyway rather than a request made on demand, so it can
+   * be up to one ping interval old. Null against a server that does not answer
+   * pings at all, which older builds of the server do not.
+   */
+  round_trip_ms: number | null;
+  /** When the current connection was established, or null if there isn't one. */
+  connected_at: number | null;
+  /** Why the last attempt to reach it failed. */
+  last_error: string | null;
+}
+
+/**
+ * A rough elapsed time, for saying how long a connection has been up.
+ *
+ * Deliberately coarse. Nobody reading this needs seconds of precision on a
+ * connection that has been up for two hours.
+ */
+export function describeDuration(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+
+  const minutes = Math.round(seconds / 60);
+
+  if (minutes < 60) {
+    return `${minutes}m`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+
+  return `${hours}h ${minutes % 60}m`;
+}
+
+/**
  * Shortens a peer ID for display.
  *
  * Peer IDs are 52 characters, which is far too wide for a sidebar row. The head

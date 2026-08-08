@@ -28,10 +28,11 @@ use std::error::Error;
 use std::path::PathBuf;
 
 use futures::stream::StreamExt;
-use libp2p::multiaddr::Protocol;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{allow_block_list, connection_limits, gossipsub, noise, tcp, yamux, Multiaddr, PeerId};
+use libp2p::{
+    allow_block_list, connection_limits, gossipsub, noise, ping, tcp, yamux, Multiaddr, PeerId,
+};
 
 use crate::config::Config;
 use crate::mirror::{Caps, Decision, Mirror};
@@ -69,6 +70,17 @@ struct ServerBehaviour {
     /// The one protocol that matters here: it carries every message this server
     /// passes along, for the conversations it has been asked to carry.
     gossipsub: gossipsub::Behaviour,
+
+    /// Answers pings.
+    ///
+    /// Nothing here needs it. It is for the other end: a client measures the
+    /// round trip to its servers this way, and without it a client has no way to
+    /// tell a working server from one that is merely still accepting a socket.
+    ///
+    /// It also keeps this server from looking dead. A node that does not speak
+    /// ping at all reports back as unsupported, which is easy for a client to
+    /// mistake for a peer that has stopped answering.
+    ping: ping::Behaviour,
 }
 
 #[tokio::main]
@@ -136,6 +148,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 limits: connection_limits::Behaviour::new(limits),
                 allowed,
                 gossipsub,
+                ping: ping::Behaviour::default(),
             }
         })?
         .build();
@@ -247,34 +260,15 @@ fn stop_carrying(swarm: &mut libp2p::Swarm<ServerBehaviour>, topic: &gossipsub::
 
 /// Reads the sibling addresses, each of which must name the server it points at.
 ///
-/// An address without a peer id is rejected rather than dialled: connecting to
-/// whatever answers at a hostname is exactly what including the identity is
-/// meant to prevent.
+/// The rule for what a server address looks like is shared with the app, so that
+/// an address an operator can configure here is one a person can configure
+/// there, and neither end can quietly start accepting something the other will
+/// not.
 fn parse_siblings(addresses: &[String]) -> Result<Vec<(PeerId, Multiaddr)>, String> {
-    let mut siblings = Vec::new();
-
-    for address in addresses {
-        let parsed: Multiaddr = address
-            .parse()
-            .map_err(|error| format!("{} is not an address: {}", address, error))?;
-
-        let peer = parsed
-            .iter()
-            .find_map(|part| match part {
-                Protocol::P2p(peer) => Some(peer),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                format!(
-                    "{} does not say which server it is; it needs a /p2p/<peer id> on the end",
-                    address
-                )
-            })?;
-
-        siblings.push((peer, parsed));
-    }
-
-    Ok(siblings)
+    addresses
+        .iter()
+        .map(|address| feed_protocol::parse_server_address(address))
+        .collect()
 }
 
 /// Builds the allowlist, or leaves it switched off for an open server.

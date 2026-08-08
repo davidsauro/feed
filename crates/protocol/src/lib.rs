@@ -14,7 +14,8 @@
 
 use std::time::Duration;
 
-use libp2p::gossipsub;
+use libp2p::multiaddr::Protocol;
+use libp2p::{gossipsub, Multiaddr, PeerId};
 
 /// Prefix for the topic a group's messages travel on.
 ///
@@ -64,9 +65,79 @@ pub fn gossipsub_config() -> Result<gossipsub::Config, &'static str> {
         .map_err(|_| "the shared gossipsub configuration is not valid")
 }
 
+/// Reads an address that names a server, checking that it says which one.
+///
+/// Used by the app for the servers a person configures, and by the server for
+/// its siblings, so that both ends hold the same idea of what a server address
+/// is and neither can drift into accepting something the other rejects.
+///
+/// The `/p2p/<peer id>` part is required rather than optional. Without it, we
+/// would be connecting to whatever happens to answer at a hostname, which is the
+/// whole thing including the identity is meant to prevent. With it, the
+/// handshake fails unless the far end holds the matching private key, so a
+/// hijacked DNS record or a machine at a recycled IP address cannot pass itself
+/// off as the server people meant.
+pub fn parse_server_address(address: &str) -> Result<(PeerId, Multiaddr), String> {
+    let parsed: Multiaddr = address
+        .trim()
+        .parse()
+        .map_err(|error| format!("{} is not an address: {}", address, error))?;
+
+    let peer = parsed
+        .iter()
+        .find_map(|part| match part {
+            Protocol::P2p(peer) => Some(peer),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            format!(
+                "{} does not say which server it is; it needs a /p2p/<peer id> on the end",
+                address
+            )
+        })?;
+
+    Ok((peer, parsed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A whole address, of the shape a server prints when it starts.
+    const SERVER: &str =
+        "/ip4/203.0.113.7/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN";
+
+    #[test]
+    fn reads_an_address_that_names_its_server() {
+        let (peer, address) = parse_server_address(SERVER).expect("should be a valid address");
+
+        assert_eq!(
+            peer.to_string(),
+            "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+        );
+        assert_eq!(address.to_string(), SERVER);
+    }
+
+    /// Surrounding space is what happens when somebody pastes an address.
+    #[test]
+    fn ignores_space_around_a_pasted_address() {
+        assert!(parse_server_address(&format!("  {}\n", SERVER)).is_ok());
+    }
+
+    /// Dialling this would mean trusting whatever answers at that address.
+    #[test]
+    fn refuses_an_address_that_does_not_say_who_it_reaches() {
+        let error = parse_server_address("/ip4/203.0.113.7/tcp/4001")
+            .expect_err("an address without a peer id should be refused");
+
+        assert!(error.contains("/p2p/"), "the error should say what is missing");
+    }
+
+    #[test]
+    fn refuses_something_that_is_not_an_address() {
+        assert!(parse_server_address("example.com:4001").is_err());
+        assert!(parse_server_address("").is_err());
+    }
 
     #[test]
     fn recognises_the_topics_this_application_uses() {

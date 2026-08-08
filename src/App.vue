@@ -35,6 +35,8 @@ import type {
   Group,
   MessageStatus,
   PickedFile,
+  Server,
+  ServerStatus,
 } from "./types";
 import { canSend, shortPeerId } from "./types";
 
@@ -90,6 +92,28 @@ const selection = ref<{ kind: ConversationKind; id: string } | null>(null);
  * that is plainly what selecting one means.
  */
 const view = ref<"chats" | "files">("chats");
+
+/**
+ * The relay servers this node uses to reach people off the local network.
+ *
+ * Whether each is reachable is not held here. A server is an ordinary peer once
+ * connected, so `activePeers` already answers that.
+ */
+const servers = ref<Server[]>([]);
+
+/**
+ * Measurements for each server: round trip, how long it has been up, and why the
+ * last attempt failed.
+ *
+ * Whether a server is reachable is *not* read from here. That comes from
+ * `activePeers`, which the same connection events drive and which updates the
+ * moment anything changes. This holds only what a live set cannot: numbers and
+ * reasons. Keeping the two apart is what stops a dot and a label disagreeing.
+ */
+const serverStatus = ref<ServerStatus[]>([]);
+
+/** Set while a manual test is running, which takes a few seconds by design. */
+const testingServers = ref(false);
 
 /**
  * Files picked but not yet sent, keyed by who they are going to.
@@ -235,8 +259,17 @@ const selectedGroup = computed<Group | null>(() => {
 /** Discovered peers we haven't saved as contacts yet. */
 const unregisteredPeers = computed(() =>
   Array.from(activePeers.value).filter(
-    (peer) => !savedContacts.value.some((contact) => contact.peer_id === peer),
+    (peer) =>
+      !savedContacts.value.some((contact) => contact.peer_id === peer) &&
+      // A server is a peer, but not somebody you would chat with. Offering to
+      // add one as a contact would be offering something that cannot work.
+      !servers.value.some((server) => server.peer_id === peer),
   ),
+);
+
+/** How many configured servers are reachable right now. */
+const connectedServers = computed(
+  () => servers.value.filter((server) => activePeers.value.has(server.peer_id)).length,
 );
 
 const currentMessages = computed(() => {
@@ -1617,6 +1650,7 @@ async function startSession() {
   await loadNames();
   await loadContacts();
   await subscribeToContacts();
+  await connectToServers();
   await loadFiles();
   await loadGroups();
   await subscribeToSavedGroups();
@@ -1732,13 +1766,88 @@ async function startSession() {
   );
 }
 
+// --- Servers --------------------------------------------------------------
+
 /**
- * Subscribes to the groups we're already in.
+ * Loads the configured servers and starts connecting to them.
  *
- * The backend can't do this at startup any more: with encryption on, the
- * database is unreadable until the passphrase arrives, which is long after the
- * network task begins.
+ * Same timing as subscriptions and for the same reason: on an encrypted node the
+ * database cannot be read until the passphrase has been entered, which is long
+ * after the network task starts. Connecting is not waited on. A server that is
+ * down is retried by the backend on a timer, so nothing here should block
+ * startup on one being reachable.
  */
+async function connectToServers() {
+  try {
+    servers.value = await invoke<Server[]>("connect_to_saved_servers");
+  } catch (error) {
+    console.error("Could not connect to the saved servers", error);
+  }
+}
+
+/**
+ * Saves a server and starts connecting to it.
+ *
+ * The address is checked by the backend before it is stored, so a typo comes
+ * back here as a message rather than becoming a connection that silently never
+ * succeeds.
+ */
+async function addServer(address: string) {
+  try {
+    const server = await invoke<Server>("add_server", { address });
+
+    // Adding one already in the list should not list it twice.
+    if (!servers.value.some((existing) => existing.address === server.address)) {
+      servers.value.push(server);
+    }
+  } catch (error) {
+    notify(`Could not add that server: ${error}`);
+  }
+}
+
+async function removeServer(address: string) {
+  try {
+    await invoke("remove_server", { address });
+    servers.value = servers.value.filter((server) => server.address !== address);
+    serverStatus.value = serverStatus.value.filter((status) => status.address !== address);
+  } catch (error) {
+    notify(`Could not remove that server: ${error}`);
+  }
+}
+
+/** Reads the current measurements without disturbing anything. */
+async function loadServerStatus() {
+  try {
+    serverStatus.value = await invoke<ServerStatus[]>("get_server_status");
+  } catch (error) {
+    console.error("Could not read the server status", error);
+  }
+}
+
+/**
+ * Checks every server and reports what came back.
+ *
+ * This dials the ones that are not connected rather than only reporting what is
+ * already known, which is what makes it a test rather than a readout. It takes a
+ * few seconds on purpose: a dial is not instant, and answering sooner would only
+ * describe the state we started in.
+ */
+async function testServers() {
+  if (testingServers.value) {
+    return;
+  }
+
+  testingServers.value = true;
+
+  try {
+    serverStatus.value = await invoke<ServerStatus[]>("test_servers");
+  } catch (error) {
+    notify(`Could not test the servers: ${error}`);
+  } finally {
+    testingServers.value = false;
+  }
+}
+
 /**
  * Starts listening to each contact's conversation.
  *
@@ -1756,6 +1865,13 @@ async function subscribeToContacts() {
   }
 }
 
+/**
+ * Subscribes to the groups we're already in.
+ *
+ * The backend can't do this at startup: with encryption on, the database is
+ * unreadable until the passphrase arrives, which is long after the network task
+ * begins.
+ */
 async function subscribeToSavedGroups() {
   for (const group of groups.value) {
     try {
@@ -1878,6 +1994,24 @@ function parsePayload(
           Node {{ nodeInstance }}
         </span>
 
+        <!-- Only once a server is configured. On a local network there is
+             nothing here to report, and an indicator saying so would just be
+             something else to read. -->
+        <button
+          v-if="servers.length"
+          class="server-badge"
+          :class="{ connected: connectedServers > 0 }"
+          :title="
+            connectedServers > 0
+              ? `Connected to ${connectedServers} of ${servers.length} servers`
+              : 'Not connected to any server'
+          "
+          @click="settingsOpen = true"
+        >
+          <span class="dot" />
+          {{ connectedServers }}/{{ servers.length }}
+        </button>
+
         <button class="settings-button" title="Settings" @click="settingsOpen = true">
           <svg
             viewBox="0 0 24 24"
@@ -1968,9 +2102,17 @@ function parsePayload(
       v-if="settingsOpen"
       :encryption-enabled="encryption.enabled"
       :display-name="myDisplayName"
+      :servers="servers"
+      :server-status="serverStatus"
+      :online-peers="activePeers"
+      :testing-servers="testingServers"
       @enable="enableEncryption"
       @disable="disableEncryption"
       @rename="changeDisplayName"
+      @add-server="addServer"
+      @remove-server="removeServer"
+      @test-servers="testServers"
+      @refresh-servers="loadServerStatus"
       @close="settingsOpen = false"
     />
 
@@ -2108,6 +2250,34 @@ function parsePayload(
   width: 6px;
   height: 6px;
   border-radius: 50%;
+  background-color: var(--online);
+}
+
+/* How many configured servers are actually reachable. Grey until at least one
+   is, since "configured" and "working" are different things and only the
+   second one means you can reach anybody off this network. */
+.server-badge {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 8px;
+  flex: none;
+  padding: 2px 7px;
+  border-radius: var(--radius-pill);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.server-badge:hover {
+  background-color: var(--bg-hover);
+}
+
+.server-badge .dot {
+  background-color: var(--offline);
+}
+
+.server-badge.connected .dot {
   background-color: var(--online);
 }
 

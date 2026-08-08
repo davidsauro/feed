@@ -29,10 +29,11 @@ use libp2p::request_response::Event as RequestResponseEvent;
 use libp2p::request_response::Message as RequestResponseMessage;
 use libp2p::request_response::ProtocolSupport;
 use libp2p::request_response::ResponseChannel;
+use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{mdns, noise, tcp, yamux};
-use libp2p::{PeerId, StreamProtocol, Swarm, SwarmBuilder};
+use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder};
 use rusqlite::Connection;
 use rusqlite::Result as SqlResult;
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,15 @@ const NAME_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Listen on every network interface, and let the OS pick the port.
 const LISTEN_ADDRESS: &str = "/ip4/0.0.0.0/tcp/0";
+
+/// How often a configured server we are not connected to is dialled again.
+///
+/// We do this ourselves rather than leaning on gossipsub's explicit peer retry,
+/// which dials by peer id alone and relies on some other behaviour knowing an
+/// address for that peer. On the local network mDNS supplies those addresses. A
+/// server is not on the local network and nothing else knows where it is, so the
+/// address has to come from us, on every attempt.
+const SERVER_REDIAL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How many outbound commands the frontend can queue up before `send_message`
 /// starts waiting for the network task to catch up.
@@ -115,6 +125,22 @@ fn current_node_id() -> String {
 // ---------------------------------------------------------------------------
 // Types shared with the frontend
 // ---------------------------------------------------------------------------
+
+/// A relay server this node connects to. Rows in the `servers` table.
+///
+/// Servers exist so two people who are not on the same network can still reach
+/// each other. A server carries traffic without being able to read it, so adding
+/// one is a decision about reachability rather than about trust in what it can
+/// see. What it can do is stop carrying, which is why more than one may be
+/// configured.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Server {
+    /// The full multiaddress, including the `/p2p/<peer id>` that names it.
+    address: String,
+    /// Pulled out of the address so the frontend can match connection events
+    /// against it without parsing multiaddresses itself.
+    peer_id: String,
+}
 
 /// A peer the user has given a name to. Rows in the `contacts` table.
 #[derive(Serialize, Deserialize)]
@@ -227,6 +253,18 @@ enum NetworkCommand {
         message: String,
         result_tx: oneshot::Sender<Result<(), String>>,
     },
+    /// Start connecting to a relay server, and keep trying.
+    ConnectToServer {
+        peer_id: PeerId,
+        address: Multiaddr,
+    },
+    /// Stop connecting to one, on removing it.
+    DisconnectFromServer {
+        peer_id: PeerId,
+    },
+    /// Dial every configured server that is not connected, now rather than at
+    /// the next scheduled attempt. Sent when somebody presses the test button.
+    TestServers,
     /// Publish to a group.
     ///
     /// Unlike a direct message this reports back, because gossipsub refuses to
@@ -274,6 +312,37 @@ struct NetworkState {
     /// doesn't start until the app is unlocked. Taking it is what starts the
     /// task, and it can only be taken once, so there is no way to start twice.
     command_rx: Mutex<Option<mpsc::Receiver<NetworkCommand>>>,
+    /// What we know about each configured server, keyed by its peer id.
+    ///
+    /// Kept here rather than in the network task because a Tauri command has to
+    /// be able to read it. The network task is the only writer.
+    server_health: Mutex<HashMap<String, ServerHealth>>,
+}
+
+/// What is known about one server right now.
+///
+/// Every field is an observation rather than a promise. A server that was
+/// reachable a moment ago may not be now, which is exactly why there is a button
+/// to go and look again.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ServerHealth {
+    /// Whether a connection to it exists at this moment.
+    connected: bool,
+    /// Last measured round trip, in milliseconds.
+    ///
+    /// Comes from the periodic ping rather than from a request made on demand,
+    /// so it is up to one ping interval old. A new connection produces one
+    /// immediately, which is what makes a freshly tested server report a time
+    /// straight away.
+    round_trip_ms: Option<u64>,
+    /// When the current connection was established, in milliseconds since the
+    /// epoch. Cleared when it closes.
+    connected_at: Option<i64>,
+    /// Why the last attempt to reach it failed.
+    ///
+    /// Kept after a later success would clear `connected`, because the reason a
+    /// server is unreachable is the most useful thing on the screen when one is.
+    last_error: Option<String>,
 }
 
 /// A node telling another what it would like to be called.
@@ -557,6 +626,15 @@ fn create_tables(conn: &Connection) -> SqlResult<()> {
     )?;
 
     conn.execute(
+        "CREATE TABLE IF NOT EXISTS servers (
+            address  TEXT PRIMARY KEY,
+            peer_id  TEXT NOT NULL,
+            added_at INTEGER NOT NULL
+        )",
+        (),
+    )?;
+
+    conn.execute(
         "CREATE TABLE IF NOT EXISTS settings (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -658,6 +736,77 @@ fn is_contact(app: &AppHandle, peer_id: &str) -> bool {
     let count: i64 = statement.query_row([peer_id], |row| row.get(0)).unwrap_or(0);
 
     count > 0
+}
+
+/// One server and everything currently known about it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ServerStatus {
+    address: String,
+    peer_id: String,
+    #[serde(flatten)]
+    health: ServerHealth,
+}
+
+/// How long a manual test waits before reporting what it found.
+///
+/// Long enough for a dial to a server across the internet to either complete or
+/// fail, and for the first ping on a new connection to come back. Short enough
+/// that somebody who pressed a button is not left wondering.
+const SERVER_TEST_WAIT: Duration = Duration::from_secs(6);
+
+/// Checks every configured server and reports what came back.
+///
+/// Dials the ones that are not connected rather than only reporting what is
+/// already known, which is the difference between a test and a status readout.
+/// A server that is already connected is not disturbed: its round trip comes
+/// from the ping that is running anyway.
+#[tauri::command]
+async fn test_servers(
+    app: AppHandle,
+    state: State<'_, NetworkState>,
+) -> Result<Vec<ServerStatus>, String> {
+    let servers = get_servers(app.clone())?;
+
+    {
+        let network_tx = network_sender(&state)?;
+        network_tx
+            .send(NetworkCommand::TestServers)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Waiting is the honest way to do this. A dial is not instant, and reporting
+    // before the answers are in would report the state we started from.
+    tokio::time::sleep(SERVER_TEST_WAIT).await;
+
+    read_server_status(&app, servers)
+}
+
+/// The current status of every configured server, without testing anything.
+#[tauri::command]
+fn get_server_status(app: AppHandle) -> Result<Vec<ServerStatus>, String> {
+    let servers = get_servers(app.clone())?;
+
+    read_server_status(&app, servers)
+}
+
+/// Joins the saved servers with what the network task has observed about them.
+fn read_server_status(app: &AppHandle, servers: Vec<Server>) -> Result<Vec<ServerStatus>, String> {
+    let state = app.state::<NetworkState>();
+
+    let health = state
+        .server_health
+        .lock()
+        .map_err(|e| format!("could not read server health: {}", e))?;
+
+    Ok(servers
+        .into_iter()
+        .map(|server| ServerStatus {
+            health: health.get(&server.peer_id).cloned().unwrap_or_default(),
+            address: server.address,
+            peer_id: server.peer_id,
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -789,6 +938,204 @@ pub fn set_file_progress(app: &AppHandle, id: &str, transferred: u64) -> Result<
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Servers
+// ---------------------------------------------------------------------------
+
+/// The current time in milliseconds since the epoch.
+///
+/// Rust's clock rather than the frontend's, unlike message timestamps: these
+/// values never leave the machine, so there is nothing for a remote clock to be
+/// authoritative about.
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// The relay servers this node is configured to use, oldest first.
+///
+/// Whether any of them is reachable is not answered here. A server is an
+/// ordinary peer once connected, so the frontend already learns that from the
+/// same presence events every other peer produces.
+#[tauri::command]
+fn get_servers(app: AppHandle) -> Result<Vec<Server>, String> {
+    let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
+
+    let mut statement = conn
+        .prepare("SELECT address, peer_id FROM servers ORDER BY added_at ASC")
+        .map_err(|e| e.to_string())?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok(Server {
+                address: row.get(0)?,
+                peer_id: row.get(1)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut servers = Vec::new();
+    for row in rows {
+        servers.push(row.map_err(|e| e.to_string())?);
+    }
+
+    Ok(servers)
+}
+
+/// Saves a server and starts connecting to it.
+///
+/// The address is checked before it is stored, so a typo is refused at the point
+/// somebody pastes it rather than becoming a connection that quietly never
+/// succeeds.
+#[tauri::command]
+async fn add_server(
+    app: AppHandle,
+    state: State<'_, NetworkState>,
+    address: String,
+) -> Result<Server, String> {
+    let (peer_id, parsed) = feed_protocol::parse_server_address(&address)?;
+
+    // Connecting to ourselves is not useful, and the confusion it would cause is
+    // worth a couple of lines to prevent.
+    if peer_id.to_string() == get_identity(app.clone())? {
+        return Err("that address is this node".to_string());
+    }
+
+    let server = Server {
+        address: parsed.to_string(),
+        peer_id: peer_id.to_string(),
+    };
+
+    {
+        let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT OR REPLACE INTO servers (address, peer_id, added_at) VALUES (?1, ?2, ?3)",
+            (&server.address, &server.peer_id, now_millis()),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    connect_to_server(&state, peer_id, parsed).await?;
+
+    Ok(server)
+}
+
+/// Forgets a server and drops the connection to it.
+#[tauri::command]
+async fn remove_server(
+    app: AppHandle,
+    state: State<'_, NetworkState>,
+    address: String,
+) -> Result<(), String> {
+    let (peer_id, _) = feed_protocol::parse_server_address(&address)?;
+
+    {
+        let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM servers WHERE address = ?1", (&address,))
+            .map_err(|e| e.to_string())?;
+    }
+
+    let network_tx = network_sender(&state)?;
+    network_tx
+        .send(NetworkCommand::DisconnectFromServer { peer_id })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Dials the servers already saved.
+///
+/// Called by the frontend once the database is readable, which on an encrypted
+/// node is only after the passphrase has been entered. That is why this is not
+/// done when the network starts.
+#[tauri::command]
+async fn connect_to_saved_servers(
+    app: AppHandle,
+    state: State<'_, NetworkState>,
+) -> Result<Vec<Server>, String> {
+    let servers = get_servers(app)?;
+
+    for server in &servers {
+        match feed_protocol::parse_server_address(&server.address) {
+            Ok((peer_id, parsed)) => connect_to_server(&state, peer_id, parsed).await?,
+            // A stored address that no longer parses should not stop the others
+            // from being dialled.
+            Err(error) => eprintln!("skipping a saved server: {}", error),
+        }
+    }
+
+    Ok(servers)
+}
+
+/// Updates what we know about one server.
+///
+/// A no-op for any peer that is not a configured server, so the callers can hand
+/// it every peer event without first working out which ones matter.
+fn record_server_health(
+    app: &AppHandle,
+    peer_id: &PeerId,
+    update: impl FnOnce(&mut ServerHealth),
+) {
+    let state = app.state::<NetworkState>();
+    let peer_id = peer_id.to_string();
+
+    match state.server_health.lock() {
+        Ok(mut health) => {
+            // Only servers are tracked. An entry exists from the moment one is
+            // configured, so an unknown peer here is somebody else entirely.
+            if let Some(entry) = health.get_mut(&peer_id) {
+                update(entry);
+            }
+        }
+        Err(error) => eprintln!("could not record server health: {}", error),
+    };
+}
+
+/// Starts tracking a server, so events about it are recorded from now on.
+fn begin_tracking_server(app: &AppHandle, peer_id: &PeerId) {
+    let state = app.state::<NetworkState>();
+
+    match state.server_health.lock() {
+        Ok(mut health) => {
+            health.entry(peer_id.to_string()).or_default();
+        }
+        Err(error) => eprintln!("could not track a server: {}", error),
+    };
+}
+
+/// Stops tracking one, on removing it.
+fn stop_tracking_server(app: &AppHandle, peer_id: &PeerId) {
+    let state = app.state::<NetworkState>();
+
+    match state.server_health.lock() {
+        Ok(mut health) => {
+            health.remove(&peer_id.to_string());
+        }
+        Err(error) => eprintln!("could not stop tracking a server: {}", error),
+    };
+}
+
+/// Asks the network task to start connecting to one server.
+async fn connect_to_server(
+    state: &State<'_, NetworkState>,
+    peer_id: PeerId,
+    address: Multiaddr,
+) -> Result<(), String> {
+    let network_tx = network_sender(state)?;
+
+    network_tx
+        .send(NetworkCommand::ConnectToServer { peer_id, address })
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Files
+// ---------------------------------------------------------------------------
 
 /// Everything this node has sent or received, newest first.
 #[tauri::command]
@@ -2047,6 +2394,41 @@ fn emit_to_frontend<P: Serialize + Clone>(app: &AppHandle, event: &str, payload:
     }
 }
 
+/// Dials one server at the address we hold for it.
+///
+/// The address is passed on every attempt rather than registered once, because
+/// nothing in this swarm remembers addresses for peers that mDNS did not find.
+/// Dialling by peer id alone would fail with no address to try.
+fn dial_server(swarm: &mut Swarm<AppBehaviour>, peer_id: PeerId, address: &Multiaddr) {
+    let options = DialOpts::peer_id(peer_id)
+        .addresses(vec![address.clone()])
+        .build();
+
+    if let Err(error) = swarm.dial(options) {
+        // Being already connected or already dialling both land here, and
+        // neither is a problem: they are the outcome this was trying to reach.
+        eprintln!("not dialling {}: {}", address, error);
+    }
+}
+
+/// Dials every configured server we are not already connected to.
+///
+/// Runs on a timer because a server that was down when the app started, or that
+/// restarts later, has to be picked up again without the user doing anything.
+/// Dialling one we are already connected to is refused harmlessly, but checking
+/// first keeps the log quiet.
+fn redial_missing_servers(swarm: &mut Swarm<AppBehaviour>, servers: &HashMap<PeerId, Multiaddr>) {
+    let missing: Vec<(PeerId, Multiaddr)> = servers
+        .iter()
+        .filter(|(peer_id, _)| !swarm.is_connected(peer_id))
+        .map(|(peer_id, address)| (*peer_id, address.clone()))
+        .collect();
+
+    for (peer_id, address) in missing {
+        dial_server(swarm, peer_id, &address);
+    }
+}
+
 /// Connects to peers mDNS has found.
 ///
 /// Handing them to gossipsub does two jobs: it builds the mesh that group
@@ -2361,6 +2743,7 @@ fn handle_swarm_event(
     app: &AppHandle,
     swarm: &mut Swarm<AppBehaviour>,
     keypair: &Keypair,
+    servers: &HashMap<PeerId, Multiaddr>,
     event: SwarmEvent<AppBehaviourEvent>,
 ) {
     match event {
@@ -2379,12 +2762,50 @@ fn handle_swarm_event(
 
         SwarmEvent::Behaviour(AppBehaviourEvent::Ping(ping::Event {
             peer,
+            result: Ok(round_trip),
+            ..
+        })) => {
+            record_server_health(app, &peer, |health| {
+                health.round_trip_ms = Some(round_trip.as_millis() as u64);
+            });
+        }
+
+        SwarmEvent::Behaviour(AppBehaviourEvent::Ping(ping::Event {
+            peer,
+            result: Err(ping::Failure::Unsupported),
+            ..
+        })) => {
+            record_server_health(app, &peer, |health| {
+                // Connected, but there is no round trip to report and there
+                // never will be from this peer. Clearing it beats leaving a
+                // stale number on the screen.
+                //
+                // Deliberately not recorded as an error. `last_error` is shown
+                // as the reason a server is unreachable, and this one is
+                // reachable. Putting it there would mean that if the server
+                // later went down, the screen would explain its absence with
+                // something that had nothing to do with it.
+                health.round_trip_ms = None;
+            });
+
+            // Says the peer does not speak the ping protocol, which is a fact
+            // about what it implements rather than about whether it is alive.
+            // Closing on this would be badly wrong: a relay server runs
+            // gossipsub and nothing else, so every server connection would be
+            // dropped seconds after it was made and redialled forever.
+            eprintln!("{} does not answer pings; leaving the connection alone", peer);
+        }
+
+        SwarmEvent::Behaviour(AppBehaviourEvent::Ping(ping::Event {
+            peer,
             connection,
             result: Err(failure),
         })) => {
-            // libp2p leaves the policy to us: a failed ping is reported, not
-            // acted on. Closing the connection is what turns it into a presence
-            // change, since that path already tells the frontend.
+            // A timeout or a transport error, both of which do say something
+            // about liveness. libp2p leaves the policy to us: a failed ping is
+            // reported, not acted on. Closing the connection is what turns it
+            // into a presence change, since that path already tells the
+            // frontend.
             //
             // Safe to be decisive about. If the peer is in fact alive, gossipsub
             // retries it within 30 seconds and it comes straight back.
@@ -2395,9 +2816,21 @@ fn handle_swarm_event(
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             handle_peer_connected(app, peer_id);
 
-            // Both sides do this as they connect, so each learns what the other
-            // would like to be called without either having to ask.
-            announce_name_to(app, swarm, peer_id);
+            record_server_health(app, &peer_id, |health| {
+                health.connected = true;
+                health.connected_at = Some(now_millis());
+                health.last_error = None;
+            });
+
+            // Servers are told nothing about us beyond what they must carry.
+            // A server does not speak the name protocol anyway, so announcing
+            // would only produce a failed negotiation, but the reason to skip it
+            // is that our name is none of a relay's business.
+            if !servers.contains_key(&peer_id) {
+                // Both sides do this as they connect, so each learns what the
+                // other would like to be called without either having to ask.
+                announce_name_to(app, swarm, peer_id);
+            }
         }
 
         SwarmEvent::ConnectionClosed {
@@ -2409,7 +2842,29 @@ fn handle_swarm_event(
             // the last one closes.
             if num_established == 0 {
                 handle_peer_disconnected(app, peer_id);
+
+                record_server_health(app, &peer_id, |health| {
+                    health.connected = false;
+                    health.connected_at = None;
+                    // The round trip is left alone on purpose. It is the last
+                    // measurement taken, not a claim about right now, and
+                    // throwing it away would lose the only evidence of how the
+                    // server behaved while it was up.
+                });
             }
+        }
+
+        SwarmEvent::OutgoingConnectionError {
+            peer_id: Some(peer_id),
+            error,
+            ..
+        } => {
+            // Why a server could not be reached is the most useful thing there
+            // is to show when one cannot. Peers that are not servers are ignored
+            // by the recorder.
+            record_server_health(app, &peer_id, |health| {
+                health.last_error = Some(error.to_string());
+            });
         }
 
         SwarmEvent::Behaviour(AppBehaviourEvent::Groups(gossipsub::Event::Message {
@@ -2443,9 +2898,37 @@ fn handle_network_command(
     app: &AppHandle,
     swarm: &mut Swarm<AppBehaviour>,
     keypair: &Keypair,
+    servers: &mut HashMap<PeerId, Multiaddr>,
     command: NetworkCommand,
 ) {
     match command {
+        NetworkCommand::TestServers => {
+            redial_missing_servers(swarm, servers);
+        }
+
+        NetworkCommand::ConnectToServer { peer_id, address } => {
+            servers.insert(peer_id, address);
+            begin_tracking_server(app, &peer_id);
+            dial_server(swarm, peer_id, &servers[&peer_id]);
+
+            // What makes the server useful. Gossipsub sends an explicit peer the
+            // full list of what we are subscribed to, and forwards our messages
+            // to it directly rather than only through the mesh, which is how a
+            // server comes to carry our conversations without being told about
+            // them in so many words.
+            swarm.behaviour_mut().groups.add_explicit_peer(&peer_id);
+        }
+
+        NetworkCommand::DisconnectFromServer { peer_id } => {
+            servers.remove(&peer_id);
+            stop_tracking_server(app, &peer_id);
+            swarm.behaviour_mut().groups.remove_explicit_peer(&peer_id);
+
+            // An error here means we were not connected, which is the state we
+            // were after.
+            let _ = swarm.disconnect_peer_id(peer_id);
+        }
+
         NetworkCommand::SubscribeToGroup { group_id } => {
             if let Err(error) = swarm.behaviour_mut().groups.subscribe(&group_topic(&group_id)) {
                 eprintln!("could not subscribe to group '{}': {}", group_id, error);
@@ -2667,14 +3150,33 @@ async fn run_network(
     // after this task starts. Commands sent before this loop begins wait in the
     // channel, so nothing is missed.
 
+    // Where the configured servers live for as long as the network is running.
+    // Held here rather than in Tauri state because only this task dials, and a
+    // value one task owns cannot be read at the wrong moment by another.
+    let mut servers: HashMap<PeerId, Multiaddr> = HashMap::new();
+
+    let mut redial = tokio::time::interval(SERVER_REDIAL_INTERVAL);
+
+    // The first tick of a Tokio interval fires immediately. Nothing is
+    // configured yet at this point, so it does nothing, which is fine.
     loop {
         tokio::select! {
             swarm_event = swarm.select_next_some() => {
-                handle_swarm_event(&app, &mut swarm, &keypair_for_crypto, swarm_event);
+                handle_swarm_event(&app, &mut swarm, &keypair_for_crypto, &servers, swarm_event);
             }
 
             Some(command) = command_rx.recv() => {
-                handle_network_command(&app, &mut swarm, &keypair_for_crypto, command);
+                handle_network_command(
+                    &app,
+                    &mut swarm,
+                    &keypair_for_crypto,
+                    &mut servers,
+                    command,
+                );
+            }
+
+            _ = redial.tick() => {
+                redial_missing_servers(&mut swarm, &servers);
             }
         }
     }
@@ -2703,6 +3205,7 @@ fn main() {
                 peer_names: Mutex::new(HashMap::new()),
                 network_tx: Mutex::new(network_tx),
                 command_rx: Mutex::new(Some(command_rx)),
+                server_health: Mutex::new(HashMap::new()),
             });
 
             // Managed before anything can reach the database, since opening one
@@ -2756,6 +3259,14 @@ fn main() {
             // Files
             send_file,
             receive_file,
+            // Servers
+            get_servers,
+            add_server,
+            remove_server,
+            connect_to_saved_servers,
+            test_servers,
+            get_server_status,
+            // Files
             get_files,
             mark_files_seen,
             inspect_files,

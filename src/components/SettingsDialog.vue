@@ -9,19 +9,97 @@
  */
 import { nextTick, onMounted, onUnmounted, ref } from "vue";
 import ThemeToggle from "./ThemeToggle.vue";
+import type { Server, ServerStatus } from "../types";
+import { describeDuration, describeServer } from "../types";
 
 const props = defineProps<{
   encryptionEnabled: boolean;
   /** The name this node asks others to call it. */
   displayName: string;
+  /** Relay servers this node is configured to use. */
+  servers: Server[];
+  /**
+   * Measurements for each server: round trip, uptime, and the last failure.
+   *
+   * Deliberately not the source of whether a server is up. That comes from
+   * `onlinePeers`, which is live. If this held it too, a stale reading and a live
+   * dot could contradict each other on the same row.
+   */
+  serverStatus: ServerStatus[];
+  /**
+   * Peers reachable right now. A server is an ordinary peer once connected, so
+   * this is what says whether each one is actually working.
+   */
+  onlinePeers: Set<string>;
+  testingServers: boolean;
 }>();
 
 const emit = defineEmits<{
   enable: [passphrase: string];
   disable: [];
   rename: [name: string];
+  addServer: [address: string];
+  removeServer: [address: string];
+  testServers: [];
+  refreshServers: [];
   close: [];
 }>();
+
+/**
+ * Ticks so an uptime that is on screen keeps counting.
+ *
+ * Only runs while this dialog is open, which is the only time anything reads it.
+ */
+const now = ref(Date.now());
+let clock: ReturnType<typeof setInterval> | null = null;
+
+const isOnline = (server: Server) => props.onlinePeers.has(server.peer_id);
+
+const statusOf = (server: Server) =>
+  props.serverStatus.find((status) => status.address === server.address) ?? null;
+
+/**
+ * The measurements line for one server.
+ *
+ * Reads as one short phrase rather than a row of labelled fields, because there
+ * are only ever two or three numbers and a sentence is easier to take in.
+ */
+function describeMetrics(server: Server): string {
+  const status = statusOf(server);
+
+  if (!isOnline(server)) {
+    return status?.last_error ?? "not connected";
+  }
+
+  const parts = [];
+
+  if (status?.round_trip_ms !== null && status?.round_trip_ms !== undefined) {
+    parts.push(`${status.round_trip_ms} ms`);
+  }
+
+  if (status?.connected_at) {
+    parts.push(`up ${describeDuration(now.value - status.connected_at)}`);
+  }
+
+  // A server that is connected but has told us nothing else yet.
+  return parts.length > 0 ? parts.join(" · ") : "connected";
+}
+
+const serverDraft = ref("");
+
+function addServer() {
+  const address = serverDraft.value.trim();
+  if (!address) {
+    return;
+  }
+
+  emit("addServer", address);
+
+  // Cleared straight away rather than on success, because the field coming back
+  // empty is what says the address was taken. A rejected one is reported
+  // separately.
+  serverDraft.value = "";
+}
 
 /** Longest name the backend will advertise; kept in step with MAX_DISPLAY_NAME. */
 const NAME_LIMIT = 32;
@@ -91,8 +169,25 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 
-onMounted(() => window.addEventListener("keydown", onKeydown));
-onUnmounted(() => window.removeEventListener("keydown", onKeydown));
+onMounted(() => {
+  window.addEventListener("keydown", onKeydown);
+
+  // What is on screen should be current when it appears, not whatever was last
+  // measured minutes ago.
+  emit("refreshServers");
+
+  clock = setInterval(() => {
+    now.value = Date.now();
+  }, 1000);
+});
+
+onUnmounted(() => {
+  window.removeEventListener("keydown", onKeydown);
+
+  if (clock) {
+    clearInterval(clock);
+  }
+});
 </script>
 
 <template>
@@ -139,6 +234,88 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
             </div>
             <ThemeToggle />
           </div>
+        </section>
+
+        <section class="section">
+          <h3 class="section-title">Servers</h3>
+
+          <p class="hint section-hint">
+            A server relays messages between people who are not on the same
+            network. It carries traffic without being able to read it, so adding
+            one is a decision about reach rather than about trust. On a local
+            network you do not need one at all.
+          </p>
+
+          <ul v-if="servers.length" class="servers">
+            <li
+              v-for="server in servers"
+              :key="server.address"
+              class="server"
+              :class="{ offline: !isOnline(server) }"
+            >
+              <span class="server-dot" :class="{ online: isOnline(server) }" />
+
+              <span class="server-text">
+                <span class="server-line">
+                  <span class="server-host">{{ describeServer(server) }}</span>
+                  <span class="server-state">
+                    {{ isOnline(server) ? "Online" : "Offline" }}
+                  </span>
+                </span>
+
+                <!-- Round trip, uptime, or why it could not be reached. -->
+                <span class="server-metrics">{{ describeMetrics(server) }}</span>
+
+                <!-- Which server this is, kept visible: it is what stops
+                     something else answering at that address from passing
+                     itself off as this one. -->
+                <code class="server-id">{{ server.peer_id }}</code>
+              </span>
+
+              <button
+                class="server-remove"
+                title="Remove this server"
+                @click="emit('removeServer', server.address)"
+              >
+                ✕
+              </button>
+            </li>
+          </ul>
+
+          <div v-if="servers.length" class="server-actions">
+            <button
+              class="secondary"
+              :disabled="testingServers"
+              @click="emit('testServers')"
+            >
+              {{ testingServers ? "Testing…" : "Test connections" }}
+            </button>
+
+            <span class="hint test-hint">
+              Dials anything not connected and reports what came back. Takes a
+              few seconds.
+            </span>
+          </div>
+
+          <div class="add-server">
+            <input
+              v-model="serverDraft"
+              class="server-input"
+              type="text"
+              placeholder="/ip4/203.0.113.7/tcp/4001/p2p/12D3KooW…"
+              spellcheck="false"
+              @keyup.enter="addServer"
+            />
+            <button class="primary" :disabled="!serverDraft.trim()" @click="addServer">
+              Add
+            </button>
+          </div>
+
+          <p class="hint">
+            The address a server prints when it starts, including the
+            <code>/p2p/</code> part. Without that this node would connect to
+            whatever answers at that address rather than to the server you meant.
+          </p>
         </section>
 
         <section class="section">
@@ -492,5 +669,143 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
   height: 7px;
   border-radius: 50%;
   background-color: var(--online);
+}
+
+/* Servers ---------------------------------------------------------------- */
+
+.section-hint {
+  margin: 0 0 10px;
+}
+
+.servers {
+  margin: 0 0 10px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  list-style: none;
+  overflow: hidden;
+}
+
+.server {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 11px;
+}
+
+.server + .server {
+  border-top: 1px solid var(--border);
+}
+
+/* Whether this server is actually reachable, which is the one thing a list of
+   configured servers cannot tell you on its own. */
+.server-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background-color: var(--offline);
+}
+
+.server-dot.online {
+  background-color: var(--online);
+}
+
+.server-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;
+}
+
+.server-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.server-host {
+  overflow: hidden;
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Said in words as well as by the dot. A colour alone is not something
+   everybody can read. */
+.server-state {
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--online);
+}
+
+.server.offline .server-state {
+  color: var(--text-faint);
+}
+
+.server-metrics {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* The reason a server could not be reached, which is the useful thing on the
+   screen when one cannot. */
+.server.offline .server-metrics {
+  color: var(--danger);
+}
+
+.server-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.test-hint {
+  flex: 1;
+  min-width: 0;
+}
+
+.server-id {
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.server-remove {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.server-remove:hover {
+  background-color: var(--bg-hover);
+  color: var(--danger);
+}
+
+.add-server {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.server-input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
 }
 </style>
