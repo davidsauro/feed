@@ -11,7 +11,7 @@
  * being written to, so two nodes that could never reach each other directly can
  * still talk as long as both can reach something in the middle.
  */
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as pickFiles } from "@tauri-apps/plugin-dialog";
@@ -21,14 +21,22 @@ import AddMembersDialog from "./components/AddMembersDialog.vue";
 import ChatPane from "./components/ChatPane.vue";
 import ConfirmDialog from "./components/ConfirmDialog.vue";
 import ContactList from "./components/ContactList.vue";
+import FilesView from "./components/FilesView.vue";
 import GroupList from "./components/GroupList.vue";
 import IdentityBar from "./components/IdentityBar.vue";
 import NewGroupDialog from "./components/NewGroupDialog.vue";
 import PeerList from "./components/PeerList.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import UnlockScreen from "./components/UnlockScreen.vue";
-import type { ChatMessage, Contact, FileTransfer, Group, MessageStatus } from "./types";
-import { shortPeerId } from "./types";
+import type {
+  ChatMessage,
+  Contact,
+  FileTransfer,
+  Group,
+  MessageStatus,
+  PickedFile,
+} from "./types";
+import { canSend, shortPeerId } from "./types";
 
 /** Which kind of thing a conversation is with. */
 type ConversationKind = "contact" | "group";
@@ -73,6 +81,33 @@ const unread = ref<Record<string, boolean>>({});
 
 /** The open conversation, or null for the empty state. */
 const selection = ref<{ kind: ConversationKind; id: string } | null>(null);
+
+/**
+ * What the main pane is showing.
+ *
+ * The sidebar stays put either way, because picking who to send to is the same
+ * act as picking who to talk to. Opening a conversation returns to chats, since
+ * that is plainly what selecting one means.
+ */
+const view = ref<"chats" | "files">("chats");
+
+/**
+ * Files picked but not yet sent, keyed by who they are going to.
+ *
+ * Held here rather than in the Files view so a half assembled batch survives
+ * flipping back to a conversation and returning. Keyed by peer so batches for
+ * two different people can be assembled at once without either being lost.
+ */
+const staged = ref<Record<string, PickedFile[]>>({});
+
+/**
+ * Files that had not been looked at when the Files view was last opened.
+ *
+ * The database flag is cleared as soon as the view opens, which is right for the
+ * badge but would make the markers vanish while they are being read. This keeps
+ * them on screen for the visit that revealed them.
+ */
+const newlyArrived = ref<Set<string>>(new Set());
 
 /** A short-lived message shown over the UI. Replaces blocking alert() dialogs. */
 const notice = ref<{ text: string; kind: "error" | "info" } | null>(null);
@@ -211,6 +246,31 @@ const currentMessages = computed(() => {
 
   return messages.value[conversationKey(selection.value.kind, selection.value.id)] ?? [];
 });
+
+/** How many transfers are moving right now, in either direction. */
+const activeTransfers = computed(
+  () =>
+    files.value.filter(
+      (file) => file.status === "transferring" || file.status === "pending",
+    ).length,
+);
+
+/**
+ * Files that turned up since the Files view was last looked at.
+ *
+ * A transfer still in flight is not counted, because it has not arrived yet. It
+ * raises this once it settles. One that failed does count, since a file that
+ * did not make it is worth being told about rather than being swallowed.
+ */
+const unseenFiles = computed(
+  () =>
+    files.value.filter(
+      (file) =>
+        file.direction === "incoming" &&
+        !file.seen &&
+        (file.status === "complete" || file.status === "failed"),
+    ).length,
+);
 
 /** The files belonging to whichever conversation is open. */
 const currentFiles = computed(() => {
@@ -700,22 +760,159 @@ function rememberFile(file: FileTransfer) {
  * takes only itself down.
  */
 async function attachFiles() {
-  const contact = selectedContact.value;
+  if (selectedContact.value) {
+    await attachFilesTo(selectedContact.value.peer_id);
+  }
+}
+
+/**
+ * Picks files and sends them to one contact straight away.
+ *
+ * This is the conversation's behaviour, where attaching something is part of
+ * saying it and waiting to press Send again would be odd. The Files view stages
+ * instead, since that is a place for assembling a batch.
+ */
+async function attachFilesTo(peerId: string) {
+  const contact = savedContacts.value.find((candidate) => candidate.peer_id === peerId);
   if (!contact) {
     return;
   }
 
-  const chosen = await pickFiles({ multiple: true, title: `Send to ${contact.nickname}` });
-  if (!chosen) {
-    return;
-  }
-
-  const paths = Array.isArray(chosen) ? chosen : [chosen];
+  const paths = await pickPaths(`Send to ${contact.nickname}`);
 
   for (const path of paths) {
     await sendOneFile(contact, path);
   }
 }
+
+/** Opens the picker and returns whatever was chosen, as a list. */
+async function pickPaths(title: string): Promise<string[]> {
+  const chosen = await pickFiles({ multiple: true, title });
+
+  if (!chosen) {
+    return [];
+  }
+
+  return Array.isArray(chosen) ? chosen : [chosen];
+}
+
+/**
+ * Picks files and puts them in a contact's tray without sending anything.
+ *
+ * Sizes are read here rather than at send time so the tray can say up front that
+ * something is too large, instead of accepting it and failing later.
+ */
+async function stageFilesFor(peerId: string) {
+  const contact = savedContacts.value.find((candidate) => candidate.peer_id === peerId);
+  if (!contact) {
+    return;
+  }
+
+  const paths = await pickPaths(`Add files for ${contact.nickname}`);
+  if (paths.length === 0) {
+    return;
+  }
+
+  let picked: PickedFile[];
+  try {
+    picked = await invoke<PickedFile[]>("inspect_files", { paths });
+  } catch (error) {
+    notify(`Could not read those files: ${error}`);
+    return;
+  }
+
+  const tray = staged.value[peerId] ?? [];
+
+  // Picking the same file twice should not queue it twice.
+  const fresh = picked.filter(
+    (file) => !tray.some((existing) => existing.path === file.path),
+  );
+
+  staged.value = { ...staged.value, [peerId]: [...tray, ...fresh] };
+}
+
+/** Sends everything in a contact's tray, then empties it. */
+async function sendStaged(peerId: string) {
+  const contact = savedContacts.value.find((candidate) => candidate.peer_id === peerId);
+  const tray = staged.value[peerId];
+
+  if (!contact || !tray) {
+    return;
+  }
+
+  // Emptied first so a second press cannot send the same batch twice while the
+  // first one is still going out.
+  clearStaged(peerId);
+
+  for (const file of tray.filter(canSend)) {
+    await sendOneFile(contact, file.path);
+  }
+}
+
+/** Drops one file from a tray before it is sent. */
+function unstage(peerId: string, path: string) {
+  const tray = staged.value[peerId];
+  if (!tray) {
+    return;
+  }
+
+  const left = tray.filter((file) => file.path !== path);
+
+  if (left.length === 0) {
+    clearStaged(peerId);
+  } else {
+    staged.value = { ...staged.value, [peerId]: left };
+  }
+}
+
+function clearStaged(peerId: string) {
+  const rest = { ...staged.value };
+  delete rest[peerId];
+  staged.value = rest;
+}
+
+/**
+ * Notes what had not been looked at, then clears the flag.
+ *
+ * Called on opening the Files view and again whenever something arrives while it
+ * is open, so the badge never counts things sitting in plain sight. The ids are
+ * kept so the markers stay readable for this visit.
+ */
+async function markFilesSeen() {
+  const arrived = files.value.filter(
+    (file) =>
+      file.direction === "incoming" &&
+      !file.seen &&
+      (file.status === "complete" || file.status === "failed"),
+  );
+
+  if (arrived.length === 0) {
+    return;
+  }
+
+  for (const file of arrived) {
+    newlyArrived.value.add(file.id);
+    file.seen = true;
+  }
+
+  try {
+    await invoke("mark_files_seen");
+  } catch (error) {
+    console.error("Could not mark files as seen", error);
+  }
+}
+
+/**
+ * Leaving the Files view forgets the markers, so the next visit only highlights
+ * what is new to that visit rather than accumulating for the session.
+ */
+watch(view, async (now) => {
+  if (now === "files") {
+    await markFilesSeen();
+  } else {
+    newlyArrived.value = new Set();
+  }
+});
 
 async function sendOneFile(contact: Contact, path: string) {
   const sentAt = Date.now();
@@ -839,6 +1036,9 @@ async function sendReadReceipt(peerId: string, messageIds: string[]) {
 /**
  * Opens a direct conversation: loads its history, clears the unread dot, and
  * tells the other side we've read what they sent.
+ *
+ * Deliberately leaves the chats/files choice alone. Picking a contact while
+ * looking at files means "this one", not "take me somewhere else".
  */
 async function selectContact(contact: Contact) {
   selection.value = { kind: "contact", id: contact.peer_id };
@@ -1444,6 +1644,11 @@ async function startSession() {
   // read back rather than guessed at.
   await listen<string>("file-changed", async () => {
     await loadFiles();
+
+    // Something that lands while this view is open has been seen by definition.
+    if (view.value === "files") {
+      await markFilesSeen();
+    }
   });
 
   await listen<{ peer_id: string; name: string }>("peer-name", (event) => {
@@ -1622,6 +1827,28 @@ function parsePayload(
     <aside class="sidebar">
       <IdentityBar :peer-id="myPeerId" :name="myDisplayName" />
 
+      <nav class="views">
+        <button
+          class="view"
+          :class="{ active: view === 'chats' }"
+          @click="view = 'chats'"
+        >
+          Chats
+        </button>
+        <button
+          class="view"
+          :class="{ active: view === 'files' }"
+          @click="view = 'files'"
+        >
+          Files
+          <!-- Two different things, and what arrived is the one worth
+               interrupting for. A running total of every file ever would sit
+               there saying nothing, so neither badge is that. -->
+          <span v-if="unseenFiles > 0" class="badge arrived">{{ unseenFiles }}</span>
+          <span v-else-if="activeTransfers > 0" class="badge">{{ activeTransfers }}</span>
+        </button>
+      </nav>
+
       <ContactList
         class="fill"
         :contacts="savedContacts"
@@ -1670,8 +1897,23 @@ function parsePayload(
     </aside>
 
     <main class="content">
+      <FilesView
+        v-if="view === 'files'"
+        :files="files"
+        :contacts="savedContacts"
+        :staged="staged"
+        :selected-peer-id="selectedContact?.peer_id ?? null"
+        :newly-arrived="newlyArrived"
+        @add="stageFilesFor"
+        @send="sendStaged"
+        @unstage="unstage"
+        @clear="clearStaged"
+        @open="openFile"
+        @reveal="revealFile"
+      />
+
       <ChatPane
-        v-if="selectedContact"
+        v-else-if="selectedContact"
         :key="`contact:${selectedContact.peer_id}`"
         :title="selectedContact.nickname"
         :subtitle="shortPeerId(selectedContact.peer_id)"
@@ -1717,7 +1959,7 @@ function parsePayload(
         <p class="placeholder-title">No conversation open</p>
         <p class="placeholder-hint">
           Pick a contact or a group, or add a discovered peer to start talking to
-          them.
+          them. Files you have sent and received are under Files.
         </p>
       </div>
     </main>
@@ -1803,6 +2045,53 @@ function parsePayload(
   flex: none;
   padding: 7px 10px 7px 14px;
   border-top: 1px solid var(--border);
+}
+
+.views {
+  display: flex;
+  gap: 4px;
+  flex: none;
+  padding: 8px 8px 0;
+}
+
+.view {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex: 1;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.view:hover {
+  background-color: var(--bg-hover);
+  color: var(--text);
+}
+
+.view.active {
+  background-color: var(--bg-active);
+  color: var(--accent);
+}
+
+/* Transfers in flight: worth showing, not worth a colour that demands
+   attention, since it clears itself. */
+.badge {
+  padding: 0 5px;
+  border-radius: var(--radius-pill);
+  background-color: var(--border-strong);
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+/* Files that arrived while you were elsewhere. Nothing else tells you. */
+.badge.arrived {
+  background-color: var(--accent);
+  color: var(--accent-contrast);
 }
 
 .node-badge {

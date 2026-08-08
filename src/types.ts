@@ -79,6 +79,47 @@ export interface FileTransfer {
   transferred: number;
   error: string | null;
   sent_at: number;
+  /**
+   * Whether this has been looked at since it arrived.
+   *
+   * Only meaningful on an incoming file. Nothing arrives with a prompt, so this
+   * is what lets the Files tab say something turned up while you were elsewhere.
+   */
+  seen: boolean;
+}
+
+/**
+ * A file that has been picked but not sent.
+ *
+ * Mirrors the `PickedFile` struct in Rust. Picking and sending are separate
+ * steps, so a batch can be assembled and looked over before any of it leaves.
+ */
+export interface PickedFile {
+  path: string;
+  name: string;
+  size: number;
+  /** Over the size ceiling, so it is refused here rather than at send time. */
+  too_large: boolean;
+  /** Could not be read at all. A folder lands here too. */
+  unreadable: boolean;
+}
+
+/** Whether a picked file can actually be sent. */
+export function canSend(file: PickedFile): boolean {
+  return !file.too_large && !file.unreadable;
+}
+
+/** Why a picked file is not going anywhere, or null when it is fine. */
+export function describeProblem(file: PickedFile): string | null {
+  if (file.unreadable) {
+    return "could not be read";
+  }
+
+  if (file.too_large) {
+    return "too large to send";
+  }
+
+  return null;
 }
 
 /** Bytes as something a person reads. */
@@ -92,4 +133,23 @@ export function describeSize(bytes: number): string {
   }
 
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * A timestamp as something worth reading in a list.
+ *
+ * Today shows only the time, because the date would be noise. Anything older
+ * carries its date, because "14:32" on its own is useless a week later.
+ */
+export function describeWhen(epochMs: number): string {
+  const when = new Date(epochMs);
+  const time = when.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+
+  if (new Date().toDateString() === when.toDateString()) {
+    return time;
+  }
+
+  const date = when.toLocaleDateString(undefined, { day: "numeric", month: "short" });
+
+  return `${date} ${time}`;
 }

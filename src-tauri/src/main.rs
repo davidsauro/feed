@@ -550,7 +550,8 @@ fn create_tables(conn: &Connection) -> SqlResult<()> {
             status      TEXT NOT NULL,
             transferred INTEGER NOT NULL DEFAULT 0,
             error       TEXT,
-            sent_at     INTEGER NOT NULL
+            sent_at     INTEGER NOT NULL,
+            seen        INTEGER NOT NULL DEFAULT 0
         )",
         (),
     )?;
@@ -575,28 +576,49 @@ fn create_tables(conn: &Connection) -> SqlResult<()> {
 /// Checked rather than attempted-and-ignored, because SQLite gives no way to say
 /// "add this column only if it's missing".
 fn add_missing_columns(conn: &Connection) -> SqlResult<()> {
-    let existing = {
-        let mut statement = conn.prepare("PRAGMA table_info(messages)")?;
+    add_column_if_missing(conn, "messages", "group_id", "TEXT")?;
+    add_column_if_missing(conn, "messages", "sent_at", "INTEGER")?;
+    // A database that predates this column has files in it that were received
+    // before anything tracked being looked at. Backfilling them as unseen would
+    // announce every file the user has ever received as new, so they start as
+    // seen and only genuinely new arrivals raise the badge.
+    if add_column_if_missing(conn, "files", "seen", "INTEGER NOT NULL DEFAULT 0")? {
+        conn.execute("UPDATE files SET seen = 1", ())?;
+    }
+
+    Ok(())
+}
+
+/// Adds one column to a table that predates it, reporting whether it did.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> SqlResult<bool> {
+    let present = {
+        let mut statement = conn.prepare(&format!("PRAGMA table_info({})", table))?;
 
         // Column 1 of table_info is the column name.
         let names = statement.query_map([], |row| row.get::<_, String>(1))?;
 
-        let mut existing = HashSet::new();
+        let mut present = HashSet::new();
         for name in names {
-            existing.insert(name?);
+            present.insert(name?);
         }
-        existing
+        present
     };
 
-    if !existing.contains("group_id") {
-        conn.execute("ALTER TABLE messages ADD COLUMN group_id TEXT", ())?;
+    if present.contains(column) {
+        return Ok(false);
     }
 
-    if !existing.contains("sent_at") {
-        conn.execute("ALTER TABLE messages ADD COLUMN sent_at INTEGER", ())?;
-    }
+    conn.execute(
+        &format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, declaration),
+        (),
+    )?;
 
-    Ok(())
+    Ok(true)
 }
 
 /// Orders a conversation by when each message was written rather than when it
@@ -662,10 +684,16 @@ pub struct FileTransfer {
     pub transferred: u64,
     pub error: Option<String>,
     pub sent_at: i64,
+    /// Whether this has been looked at since it arrived.
+    ///
+    /// Only meaningful for files coming in. Nothing arrives with a prompt, so
+    /// this is what lets the interface say that something turned up while you
+    /// were elsewhere.
+    pub seen: bool,
 }
 
 const FILE_COLUMNS: &str =
-    "id, peer_id, direction, name, size, hash, key, path, status, transferred, error, sent_at";
+    "id, peer_id, direction, name, size, hash, key, path, status, transferred, error, sent_at, seen";
 
 fn read_file_row(row: &rusqlite::Row) -> SqlResult<FileTransfer> {
     Ok(FileTransfer {
@@ -681,6 +709,7 @@ fn read_file_row(row: &rusqlite::Row) -> SqlResult<FileTransfer> {
         transferred: row.get::<_, i64>(9)?.max(0) as u64,
         error: row.get(10)?,
         sent_at: row.get(11)?,
+        seen: row.get::<_, i64>(12)? != 0,
     })
 }
 
@@ -785,6 +814,76 @@ fn get_files(app: AppHandle) -> Result<Vec<FileTransfer>, String> {
     Ok(files)
 }
 
+/// Marks everything that has finished arriving as looked at.
+///
+/// Called when the files view is opened. A transfer still in flight is left
+/// alone, so it raises the badge again once it settles rather than being
+/// counted as seen before it existed.
+#[tauri::command]
+fn mark_files_seen(app: AppHandle) -> Result<(), String> {
+    let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "UPDATE files SET seen = 1
+         WHERE direction = 'incoming' AND status IN ('complete', 'failed')",
+        (),
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// One file the user has picked but not yet sent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PickedFile {
+    path: String,
+    name: String,
+    size: u64,
+    /// Set when this is over the ceiling, so it can be refused before sending
+    /// rather than after.
+    too_large: bool,
+    /// Set when the path could not be read at all.
+    unreadable: bool,
+}
+
+/// Looks at files the user has picked, without sending anything.
+///
+/// This exists so the staging list can show real sizes and can grey out a file
+/// that would be refused. Reporting that at the point of picking is far kinder
+/// than accepting it and failing at send time.
+#[tauri::command]
+async fn inspect_files(paths: Vec<String>) -> Result<Vec<PickedFile>, String> {
+    let mut picked = Vec::new();
+
+    for path in paths {
+        let name = Path::new(&path)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+
+        match tokio::fs::metadata(&path).await {
+            Ok(metadata) if metadata.is_file() => picked.push(PickedFile {
+                path,
+                name,
+                size: metadata.len(),
+                too_large: metadata.len() > file_crypto::MAX_FILE_SIZE,
+                unreadable: false,
+            }),
+            // A directory lands here too. Neither can be sent, and from the
+            // list's point of view they fail the same way.
+            _ => picked.push(PickedFile {
+                path,
+                name,
+                size: 0,
+                too_large: false,
+                unreadable: true,
+            }),
+        }
+    }
+
+    Ok(picked)
+}
+
 /// Prepares a file to be sent, and returns what the offer message needs.
 ///
 /// Nothing is sent from here. The caller puts these details in an offer, which
@@ -835,6 +934,8 @@ async fn send_file(
         transferred: 0,
         error: None,
         sent_at,
+        // Ours already, so there is nothing to notice about it.
+        seen: true,
     };
 
     insert_file(&app, &transfer)?;
@@ -908,6 +1009,7 @@ async fn receive_file(
         transferred: 0,
         error: None,
         sent_at,
+        seen: false,
     };
 
     insert_file(&app, &transfer)?;
@@ -923,8 +1025,8 @@ fn insert_file(app: &AppHandle, transfer: &FileTransfer) -> Result<(), String> {
     let conn = get_db_connection(app).map_err(|e| e.to_string())?;
 
     conn.execute(
-        "INSERT OR IGNORE INTO files (id, peer_id, direction, name, size, hash, key, path, status, transferred, error, sent_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT OR IGNORE INTO files (id, peer_id, direction, name, size, hash, key, path, status, transferred, error, sent_at, seen)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         (
             &transfer.id,
             &transfer.peer_id,
@@ -938,6 +1040,7 @@ fn insert_file(app: &AppHandle, transfer: &FileTransfer) -> Result<(), String> {
             transfer.transferred as i64,
             &transfer.error,
             transfer.sent_at,
+            i64::from(transfer.seen),
         ),
     )
     .map_err(|e| e.to_string())?;
@@ -2654,6 +2757,8 @@ fn main() {
             send_file,
             receive_file,
             get_files,
+            mark_files_seen,
+            inspect_files,
             // Groups
             save_group,
             get_groups,
@@ -2694,6 +2799,78 @@ mod tests {
         fs::create_dir_all(&dir).expect("could not create the scratch directory");
 
         dir
+    }
+
+    /// A files table as it was before arrivals were tracked.
+    fn seed_files_without_seen(conn: &Connection) {
+        conn.execute(
+            "CREATE TABLE files (
+                id          TEXT PRIMARY KEY,
+                peer_id     TEXT NOT NULL,
+                direction   TEXT NOT NULL,
+                name        TEXT NOT NULL,
+                size        INTEGER NOT NULL,
+                hash        TEXT NOT NULL,
+                key         TEXT NOT NULL,
+                path        TEXT,
+                status      TEXT NOT NULL,
+                transferred INTEGER NOT NULL DEFAULT 0,
+                error       TEXT,
+                sent_at     INTEGER NOT NULL
+            )",
+            (),
+        )
+        .expect("could not create the old files table");
+
+        conn.execute(
+            "INSERT INTO files (id, peer_id, direction, name, size, hash, key, path, status, transferred, error, sent_at)
+             VALUES ('a', 'peer', 'incoming', 'old.txt', 10, 'h', 'k', '/tmp/old.txt', 'complete', 10, NULL, 1)",
+            (),
+        )
+        .expect("could not insert the old file");
+    }
+
+    /// Files received before this feature existed are not new arrivals.
+    ///
+    /// The column defaults to zero, so without the backfill an upgrade would
+    /// announce everything the user has ever received as having just turned up.
+    #[test]
+    fn migration_treats_existing_files_as_already_seen() {
+        let conn = Connection::open_in_memory().expect("could not open a database");
+        seed_files_without_seen(&conn);
+        conn.execute("CREATE TABLE messages (id TEXT PRIMARY KEY)", ())
+            .expect("could not create the messages table");
+
+        add_missing_columns(&conn).expect("could not migrate");
+
+        let seen: i64 = conn
+            .query_row("SELECT seen FROM files WHERE id = 'a'", [], |row| row.get(0))
+            .expect("could not read the migrated row");
+
+        assert_eq!(seen, 1);
+    }
+
+    /// Migrating twice must not undo what the second run has since recorded.
+    #[test]
+    fn migration_leaves_an_up_to_date_database_alone() {
+        let conn = Connection::open_in_memory().expect("could not open a database");
+        seed_files_without_seen(&conn);
+        conn.execute("CREATE TABLE messages (id TEXT PRIMARY KEY)", ())
+            .expect("could not create the messages table");
+
+        add_missing_columns(&conn).expect("could not migrate");
+
+        // Something arrives after the upgrade and has not been looked at.
+        conn.execute("UPDATE files SET seen = 0 WHERE id = 'a'", ())
+            .expect("could not mark the file unseen");
+
+        add_missing_columns(&conn).expect("could not migrate a second time");
+
+        let seen: i64 = conn
+            .query_row("SELECT seen FROM files WHERE id = 'a'", [], |row| row.get(0))
+            .expect("could not read the row");
+
+        assert_eq!(seen, 0, "a second migration should not clear what is unseen");
     }
 
     /// An ordinary unencrypted database with one contact in it.
