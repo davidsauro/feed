@@ -1873,6 +1873,16 @@ fn get_peer_names(state: State<'_, NetworkState>) -> Result<HashMap<String, Stri
 /// Adds a contact, or renames one we already have.
 #[tauri::command]
 fn save_contact(app: AppHandle, peer_id: String, nickname: String) -> Result<(), String> {
+    // Checked here because a peer id can now be typed in by hand rather than
+    // only clicked from a list of peers already found on the network. A wrong
+    // one would otherwise be saved happily and simply never reach anybody.
+    let peer_id = peer_id.trim().to_string();
+    parse_peer(&peer_id)?;
+
+    if peer_id == get_identity(app.clone())? {
+        return Err("that is this node's own address".to_string());
+    }
+
     let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
 
     conn.execute(

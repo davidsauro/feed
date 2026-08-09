@@ -1,9 +1,14 @@
 <script setup lang="ts">
 /**
- * Peers mDNS has found on the local network that aren't contacts yet.
+ * Finding people: peers mDNS has turned up, and a way to add somebody by hand.
  *
- * Each row keeps its own nickname draft, keyed by peer ID. A single shared input
- * would put whatever you typed into every row at once.
+ * Adding by hand exists because discovery only reaches the local network.
+ * Somebody on the other side of the internet, reachable through a relay server,
+ * never appears in this list and has to be added from their peer id, which they
+ * copy from the top of their own sidebar and send you however they like.
+ *
+ * Each discovered row keeps its own nickname draft, keyed by peer ID. A single
+ * shared input would put whatever you typed into every row at once.
  */
 import { ref } from "vue";
 import { shortPeerId } from "../types";
@@ -25,6 +30,28 @@ const emit = defineEmits<{
 }>();
 
 const expanded = ref(true);
+
+/** The add-by-id form, which stays out of the way until it is wanted. */
+const addingById = ref(false);
+const typedPeerId = ref("");
+const typedNickname = ref("");
+
+const canAddTyped = () =>
+  typedPeerId.value.trim().length > 0 && typedNickname.value.trim().length > 0;
+
+function addTyped() {
+  if (!canAddTyped()) {
+    return;
+  }
+
+  // Whether this is a real peer id is the backend's to say. Guessing at the
+  // format here would mean two places to keep in step.
+  emit("add", typedPeerId.value.trim(), typedNickname.value.trim());
+
+  typedPeerId.value = "";
+  typedNickname.value = "";
+  addingById.value = false;
+}
 
 /** Edits in progress. A peer with no entry hasn't been typed over yet. */
 const drafts = ref<Record<string, string>>({});
@@ -86,11 +113,109 @@ function add(peerId: string) {
           </div>
         </li>
       </ul>
+
+      <!-- The only way to reach somebody who is not on this network, since
+           discovery does not leave it. -->
+      <button v-if="!addingById" class="by-id-toggle" @click="addingById = true">
+        + Add someone by their ID
+      </button>
+
+      <div v-else class="by-id">
+        <input
+          v-model="typedPeerId"
+          class="id-input"
+          type="text"
+          placeholder="Their peer ID (12D3KooW…)"
+          spellcheck="false"
+          autofocus
+        />
+        <input
+          v-model="typedNickname"
+          type="text"
+          placeholder="What to call them"
+          @keyup.enter="addTyped"
+        />
+
+        <div class="by-id-actions">
+          <button class="cancel" @click="addingById = false">Cancel</button>
+          <button class="add-button" :disabled="!canAddTyped()" @click="addTyped">
+            Add
+          </button>
+        </div>
+
+        <p class="by-id-hint">
+          They send you the ID from the top of their own sidebar, where clicking
+          it copies it. They have to add you the same way before either of you
+          can send anything.
+        </p>
+      </div>
     </div>
   </section>
 </template>
 
 <style scoped>
+/* Add by ID ------------------------------------------------------------- */
+
+.by-id-toggle {
+  width: 100%;
+  margin-top: 6px;
+  padding: 7px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.by-id-toggle:hover {
+  background-color: var(--bg-hover);
+  color: var(--text);
+}
+
+.by-id {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+
+.by-id input {
+  width: 100%;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+.id-input {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.by-id-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.cancel {
+  padding: 5px 9px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.cancel:hover {
+  color: var(--text);
+}
+
+.by-id-hint {
+  margin: 2px 0 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-faint);
+}
+
 .discovered {
   display: flex;
   flex-direction: column;
