@@ -130,6 +130,13 @@ cargo run -p feed-server --example circuit_probe -- <server address> 25
 If the first passes and the second fails, `external_addresses` is wrong or
 missing. That is the failure that leaves chat working perfectly.
 
+There is a third, for the reservation a client needs before anyone can fetch a
+file from it:
+
+```bash
+cargo run -p feed-server --example reserve_probe -- <server address>
+```
+
 ## Closing it to a known group
 
 By default anyone who finds this server may use it. To restrict it, collect each

@@ -2704,9 +2704,16 @@ struct ServerLink {
 
 /// Asks a server to make this node reachable through it.
 ///
-/// Listening on `<server>/p2p-circuit` is how a reservation is requested. The
-/// swarm reuses the connection we already hold to that server, so this costs
-/// nothing beyond the request itself.
+/// Listening on `<server>/p2p-circuit` is how a reservation is requested.
+///
+/// **Only call this once the connection to that server is established.** The
+/// relay client looks for an existing connection to the relay, and asks for the
+/// reservation over it. Finding none, it dials the relay itself, and that dial
+/// is refused whenever one is already in flight, which is exactly the case if
+/// this is called alongside our own dial rather than after it. The reservation
+/// then dies with the refused dial, and the only sign of it is a listener
+/// closing. Conversations carry on working throughout, so the visible symptom is
+/// file transfers failing much later for a reason that looks unrelated.
 fn reserve_through(swarm: &mut Swarm<AppBehaviour>, address: &Multiaddr) -> Option<ListenerId> {
     let circuit = address.clone().with(Protocol::P2pCircuit);
 
@@ -3149,7 +3156,56 @@ fn handle_swarm_event(
 
         SwarmEvent::ExpiredListenAddr { address, .. } => {
             if is_relayed(&address) {
+                println!("no longer reachable through a relay at {}", address);
                 remember_relayed_address(app, &address, false);
+            }
+        }
+
+        SwarmEvent::ListenerClosed {
+            addresses, reason, ..
+        } => {
+            // This is how a refused reservation arrives, and until it was
+            // handled a server that would not make this node reachable said
+            // nothing at all. Conversations keep working eastward of the
+            // problem, so the only visible symptom was file transfers failing
+            // with something that looked unrelated.
+            // Reported whatever the reason, including success. A refused
+            // reservation closes its listener with `Ok(())` and no error
+            // anywhere, so reporting only failures would say nothing at all
+            // about the one case that matters.
+            let relayed = addresses.iter().any(is_relayed);
+
+            match (relayed, reason) {
+                (true, outcome) => eprintln!(
+                    "no longer reachable through a relay ({:?}), so files cannot be pulled from \
+                     this node: {:?}",
+                    addresses, outcome
+                ),
+                (false, Err(error)) => {
+                    eprintln!("a listener stopped: {}", error)
+                }
+                (false, Ok(())) => {}
+            }
+
+            for address in addresses {
+                if is_relayed(&address) {
+                    remember_relayed_address(app, &address, false);
+                }
+            }
+        }
+
+        SwarmEvent::ListenerError { error, .. } => {
+            eprintln!("a listener reported an error: {}", error);
+        }
+
+        SwarmEvent::Behaviour(AppBehaviourEvent::Relay(event)) => {
+            // Reservations are the whole of what makes this node reachable
+            // through a server, so both outcomes are worth saying out loud.
+            match event {
+                relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } => {
+                    println!("{} agreed to relay for this node", relay_peer_id);
+                }
+                other => println!("relay: {:?}", other),
             }
         }
 
@@ -3157,6 +3213,19 @@ fn handle_swarm_event(
             peer_id, endpoint, ..
         } => {
             links.resolve_dials(&peer_id, Ok(()));
+
+            // Now, and not before, this node can ask to be reachable through
+            // that server. Only once per server: reconnecting clears it below.
+            if let Some(link) = links.servers.get(&peer_id) {
+                if link.reservation.is_none() {
+                    let address = link.address.clone();
+                    let reservation = reserve_through(swarm, &address);
+
+                    if let Some(link) = links.servers.get_mut(&peer_id) {
+                        link.reservation = reservation;
+                    }
+                }
+            }
 
             if !is_relayed(endpoint.get_remote_address()) {
                 count_direct_connection(app, &peer_id, 1);
@@ -3189,6 +3258,16 @@ fn handle_swarm_event(
         } => {
             if !is_relayed(endpoint.get_remote_address()) {
                 count_direct_connection(app, &peer_id, -1);
+            }
+
+            // A reservation cannot outlive the connection it was made over, so
+            // forget it and let reconnecting ask again.
+            if num_established == 0 {
+                if let Some(link) = links.servers.get_mut(&peer_id) {
+                    if let Some(listener) = link.reservation.take() {
+                        swarm.remove_listener(listener);
+                    }
+                }
             }
 
             // Peers can hold more than one connection; they're only gone when
@@ -3300,12 +3379,15 @@ fn handle_network_command(
             begin_tracking_server(app, &peer_id);
             dial_server(swarm, peer_id, &address);
 
-            // Asked for straight away rather than after the connection is up.
-            // The swarm queues it behind the dial either way, and doing it here
-            // means one place decides what happens when a server is added.
-            let reservation = reserve_through(swarm, &address);
-
-            links.servers.insert(peer_id, ServerLink { address, reservation });
+            // The reservation is asked for once the connection is up, not here.
+            // See `reserve_through` for why asking now would silently fail.
+            links.servers.insert(
+                peer_id,
+                ServerLink {
+                    address,
+                    reservation: None,
+                },
+            );
 
             // What makes the server useful. Gossipsub sends an explicit peer the
             // full list of what we are subscribed to, and forwards our messages

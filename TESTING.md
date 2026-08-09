@@ -15,9 +15,15 @@ Throughout: **A** and **B** are the two machines, **S** is the server.
 | S is up | `docker logs feed-server` | `reachable at <your address>`, no `WARNING` |
 | S carries conversations | `probe` example, twice | The message arrives |
 | S relays connections | `circuit_probe` example | `OK: 25 MiB crossed the relay` |
+| A reservation survives the app's ordering | `reserve_probe` example | `RESERVED: …/p2p-circuit/…` |
 
 If `circuit_probe` fails where `probe` passed, stop. `external_addresses` is
 wrong, and nothing below will work.
+
+`reserve_probe` exists because the app dials a server first and asks to be
+reachable through it second, which the other probes do not. Run it with
+`during` instead of `after` to see the failure that ordering used to cause: a
+reservation that never happens, reported as a listener closing successfully.
 
 ## 1. Local network, no server involved
 
