@@ -33,6 +33,14 @@ services:
       # supply one. A bind mount rather than a named volume on purpose — the
       # identity is the one thing here worth backing up, and this way saving it
       # is copying a file rather than an excursion into Docker's storage.
+      #
+      # For file transfers, a configuration file here is not optional. The
+      # server listens on 0.0.0.0 inside the container, which tells it nothing
+      # about how anyone reaches it, so relaying needs to be told:
+      #
+      #     external_addresses = ["/dns4/relay.example.com/tcp/4001"]
+      #
+      # Without it, conversations work and file transfers do not.
       - ./data:/data
 
     # The server binds a high port as an unprivileged user and writes one small

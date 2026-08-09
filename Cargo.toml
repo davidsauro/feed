@@ -36,6 +36,7 @@ libp2p = { version = "0.56.0", features = [
     "mdns",
     "noise",
     "ping",
+    "relay",
     "request-response",
     "tcp",
     "tokio",

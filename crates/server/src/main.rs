@@ -26,12 +26,14 @@ mod mirror;
 use std::env;
 use std::error::Error;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use futures::stream::StreamExt;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{
-    allow_block_list, connection_limits, gossipsub, noise, ping, tcp, yamux, Multiaddr, PeerId,
+    allow_block_list, connection_limits, gossipsub, noise, ping, relay, tcp, yamux, Multiaddr,
+    PeerId,
 };
 
 use crate::config::Config;
@@ -70,6 +72,19 @@ struct ServerBehaviour {
     /// The one protocol that matters here: it carries every message this server
     /// passes along, for the conversations it has been asked to carry.
     gossipsub: gossipsub::Behaviour,
+
+    /// Carries connections between two people who cannot reach each other
+    /// directly, which is what makes file transfers work off the local network.
+    ///
+    /// Separate from gossipsub and doing a different job. Gossipsub forwards
+    /// small sealed messages for conversations clients asked for. This proxies a
+    /// byte stream between two peers, so that a transfer, which needs a real
+    /// connection rather than a topic, has one. This server can no more read
+    /// what crosses a circuit than it can read a message.
+    ///
+    /// Off entirely when an operator says so, in which case people on this
+    /// server can still talk and cannot send each other files.
+    relay: Toggle<relay::Behaviour>,
 
     /// Answers pings.
     ///
@@ -125,6 +140,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_max_established_outgoing(Some(config.limits.max_connections_outgoing))
         .with_max_established(Some(config.limits.max_connections_total));
 
+    let relay_behaviour = build_relay(&config, keypair.public().to_peer_id());
+
+    if config.relay.enabled {
+        println!(
+            "relaying connections: up to {} reservation(s), {} per circuit, {} minute(s) each",
+            config.relay.max_reservations,
+            describe_bytes(config.relay.max_circuit_bytes),
+            config.relay.max_circuit_duration_secs / 60,
+        );
+    } else {
+        println!("not relaying connections: file transfers will not work through this server");
+    }
+
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -148,6 +176,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 limits: connection_limits::Behaviour::new(limits),
                 allowed,
                 gossipsub,
+                relay: relay_behaviour,
                 ping: ping::Behaviour::default(),
             }
         })?
@@ -156,6 +185,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for address in &config.listen_on {
         swarm.listen_on(address.parse()?)?;
     }
+
+    announce_external_addresses(&mut swarm, &config)?;
 
     for (peer, address) in &siblings {
         // Registered as explicit peers as well as dialled, so a sibling that is
@@ -269,6 +300,96 @@ fn parse_siblings(addresses: &[String]) -> Result<Vec<(PeerId, Multiaddr)>, Stri
         .iter()
         .map(|address| feed_protocol::parse_server_address(address))
         .collect()
+}
+
+/// Tells the swarm how this server is reached from outside.
+///
+/// Only relaying needs this, and it needs it absolutely. A reservation reply has
+/// to carry the address other people will use to reach the reserving client
+/// through this server, and a server listening on `0.0.0.0` has no idea what
+/// that is. Without one, every reservation fails with `NoAddressesInReservation`
+/// and no file transfer through this server can work.
+///
+/// Configured addresses are used when given. Otherwise any listen address naming
+/// a real interface is used, which is right for a server bound straight to its
+/// public address and wrong for one behind a container or a NAT, hence the
+/// warning.
+fn announce_external_addresses(
+    swarm: &mut libp2p::Swarm<ServerBehaviour>,
+    config: &Config,
+) -> Result<(), Box<dyn Error>> {
+    let announced: Vec<Multiaddr> = if config.external_addresses.is_empty() {
+        config
+            .listen_on
+            .iter()
+            .filter_map(|address| address.parse::<Multiaddr>().ok())
+            .filter(|address| !is_unspecified(address))
+            .collect()
+    } else {
+        config
+            .external_addresses
+            .iter()
+            .map(|address| {
+                address
+                    .parse::<Multiaddr>()
+                    .map_err(|error| format!("{} is not an address: {}", address, error))
+            })
+            .collect::<Result<_, _>>()?
+    };
+
+    for address in &announced {
+        println!("reachable at {}", address);
+        swarm.add_external_address(address.clone());
+    }
+
+    if announced.is_empty() && config.relay.enabled {
+        println!(
+            "WARNING: no external address is known, so clients cannot reserve a slot here and \
+             file transfers through this server will fail. Set external_addresses in the \
+             configuration, for example [\"/dns4/relay.example.com/tcp/4001\"]."
+        );
+    }
+
+    Ok(())
+}
+
+/// Whether an address names "every interface" rather than a reachable one.
+fn is_unspecified(address: &Multiaddr) -> bool {
+    address.iter().any(|part| match part {
+        libp2p::multiaddr::Protocol::Ip4(ip) => ip.is_unspecified(),
+        libp2p::multiaddr::Protocol::Ip6(ip) => ip.is_unspecified(),
+        _ => false,
+    })
+}
+
+/// Builds the relay, or leaves it switched off when an operator declines to
+/// carry other people's connections.
+fn build_relay(config: &Config, local_peer_id: PeerId) -> Toggle<relay::Behaviour> {
+    if !config.relay.enabled {
+        return Toggle::from(None);
+    }
+
+    let settings = relay::Config {
+        max_reservations: config.relay.max_reservations,
+        max_circuit_bytes: config.relay.max_circuit_bytes,
+        max_circuit_duration: Duration::from_secs(config.relay.max_circuit_duration_secs),
+        ..relay::Config::default()
+    };
+
+    Toggle::from(Some(relay::Behaviour::new(local_peer_id, settings)))
+}
+
+/// A byte count as something an operator reads in a startup line.
+fn describe_bytes(bytes: u64) -> String {
+    if bytes == 0 {
+        return "no limit".to_string();
+    }
+
+    if bytes >= 1024 * 1024 {
+        return format!("{} MiB", bytes / (1024 * 1024));
+    }
+
+    format!("{} bytes", bytes)
 }
 
 /// Builds the allowlist, or leaves it switched off for an open server.

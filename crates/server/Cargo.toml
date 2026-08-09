@@ -11,3 +11,8 @@ tokio.workspace = true
 futures.workspace = true
 serde.workspace = true
 toml = "0.9"
+
+# Only the probes use these. The server itself carries streams without
+# understanding them, so it needs no stream behaviour of its own.
+[dev-dependencies]
+libp2p-stream = "0.4.0-alpha"

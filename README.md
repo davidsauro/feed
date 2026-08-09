@@ -29,6 +29,9 @@ There are two programs here:
   able to accept an incoming connection.
 * **Group messages**, end-to-end encrypted per recipient, so relays and former
   members can read nothing.
+* **File transfer**, encrypted chunk by chunk, with a whole-file hash checked on
+  arrival and a partial transfer that resumes where it stopped. Local network
+  only for now.
 * **Self-chosen names**, offered to others as a suggestion they can override.
 * **Optional encryption at rest** for the local database.
 * **Optional relay servers** for reaching people beyond the local network.
@@ -221,6 +224,17 @@ It learns what to mirror because gossipsub tells it. Subscriptions are announced
 between peers as part of the protocol, which is how any node knows where to send
 anything.
 
+It also **relays connections**, which is a second and separate job. A
+conversation is a topic, and a topic is not a connection. A file transfer needs a
+real byte stream between two people, so a client asks the server for a
+reservation, which makes it reachable at an address naming the server and then
+the client. Somebody else dials that address and the server proxies the bytes
+across. This is on by default and an operator can switch it off, keeping
+conversations and refusing to carry files.
+
+The client half of this is not written yet, so **file transfers still only work
+on a local network.** The server is ready for them and nothing asks it yet.
+
 ## Why it knows nothing
 
 Messages are sealed for their recipients before they leave the sending node, so
@@ -232,11 +246,17 @@ should not ask them to trust you.** An operator cannot read messages, cannot
 forge one, and cannot alter one. Every message is signed by whoever wrote it, so
 a server cannot even attribute a message to the wrong person.
 
+A relayed connection is no different. The two ends complete their own encrypted
+handshake through the circuit, so a server proxying a file transfer is moving
+bytes it cannot read any more than it can read a message.
+
 What an operator *can* see is who talks to whom. A conversation is an opaque
 name, but two clients interested in the same name are two clients with something
-to say to each other. Sizes and timing are visible too. That is inherent to
-routing anything at all, and it is the argument for running a server for your own
-circle rather than using a stranger's.
+to say to each other. Sizes and timing are visible too. Relaying adds a little to
+this: a circuit names both of its ends, so an operator carrying a transfer sees
+which two peers are exchanging something and how much of it, though not what.
+That is inherent to routing anything at all, and it is the argument for running a
+server for your own circle rather than using a stranger's.
 
 ## Why servers do not mirror each other
 
@@ -273,6 +293,13 @@ Connection limits are not enough on their own. A single connection can ask for
 any number of conversations, each costing memory, so the number of conversations
 one client may ask for and the number the server will carry in total are capped
 separately.
+
+Relaying is capped separately, because carrying a byte stream between two people
+costs an operator real bandwidth in a way that forwarding small sealed messages
+does not. The one to understand is `max_circuit_bytes`, which is a budget for a
+whole relayed connection rather than a file size limit, and is explained in
+[CONFIGURATION.md](crates/server/CONFIGURATION.md#relay). Running a relay for
+your own circle, the sensible setting is no limit at all.
 
 Not yet implemented: a cap on how *often* a client may publish. Doing that
 properly means taking over message validation from gossipsub. A publicly exposed
@@ -379,6 +406,17 @@ does carry traffic between two nodes that know nothing about each other:
 cargo run -p feed-server --example probe -- <server address> /direct/1.0.0/test
 cargo run -p feed-server --example probe -- <server address> /direct/1.0.0/test "hello"
 ```
+
+Relaying uses a different mechanism and has its own probe, which sends a payload
+between two peers that can only have crossed the server:
+
+```bash
+cargo run -p feed-server --example circuit_probe -- <server address> 25
+```
+
+If this fails where the first probe passed, the server almost certainly needs
+`external_addresses` set. One listening on `0.0.0.0`, which every container does,
+cannot tell a client what address to be reached at.
 
 ## Building for other platforms
 

@@ -6,6 +6,19 @@
 # configured with, so changing it later means updating every client.
 listen_on = ["/ip4/0.0.0.0/tcp/4001"]
 
+# How this server is reached from outside, without the /p2p/ part.
+#
+# Needed for file transfers and nothing else. When a client reserves a slot here
+# so that others can reach it through this server, the reply has to say what
+# address to use. A server listening on 0.0.0.0 does not know, and every
+# reservation fails with NoAddressesInReservation until this is set.
+#
+# Left empty, a listen address naming a real interface is used. A container
+# publishing a port does not qualify, so in Docker this is effectively required.
+external_addresses = [
+    # "/dns4/relay.example.com/tcp/4001",
+]
+
 # Where this server's identity is kept. Clients address a server by its public
 # key as well as its hostname, so losing this file makes every existing client
 # configuration wrong. In a container, put it on a mounted volume.
@@ -50,3 +63,43 @@ max_pending_outgoing = 16
 max_connections_incoming = 512
 max_connections_outgoing = 32
 max_connections_total = 550
+
+[relay]
+# Whether to carry connections between two people who cannot reach each other
+# directly, which is what makes file transfers work off the local network.
+#
+# On by default. Turning it off leaves conversations working and stops file
+# transfers through this server.
+enabled = true
+
+# Total bytes ONE RELAYED CONNECTION may carry before it is cut off.
+#
+# Not a file size limit, which is the mistake this comment exists to prevent. A
+# relayed connection carries everything between two people, in both directions,
+# for as long as it lives: several transfers, plus the conversation traffic
+# alongside them. The count never resets while the connection is up. Set this to
+# 25 MB expecting it to cap a 25 MB file and the second file will be cut off
+# halfway.
+#
+# So keep it well clear of ordinary use. It is a backstop against somebody
+# streaming without end, and the app's own per-file limit is what tells a person
+# a particular file is too big.
+#
+# When it does fire, the connection simply ends. Nothing is said about why, and
+# the transfer is caught by its hash rather than by an error.
+#
+# 0 means no limit.
+max_circuit_bytes = 268435456
+
+# How long one relayed connection may live, in seconds.
+#
+# A hard timer from the moment it is established, not an idle timeout. The libp2p
+# default of two minutes is far too short here, because a relayed connection
+# carries the conversation as well as any transfers and is meant to last as long
+# as two people are talking.
+max_circuit_duration_secs = 3600
+
+# How many clients may hold a reservation. Every client that wants to be
+# reachable through this server needs one, so this wants to be in step with
+# max_connections_incoming above.
+max_reservations = 512

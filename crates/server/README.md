@@ -12,6 +12,13 @@ before they leave the sending node, so what passes through here is ciphertext
 this program has no keys for. It has no idea what a contact is, what a group is,
 or which conversation a topic belongs to.
 
+It does two jobs. It **carries conversations**, forwarding sealed messages for
+topics its clients asked for. It also **relays connections**, so that two people
+who cannot reach each other directly can still open a byte stream between them,
+which is what a file transfer needs and what a topic cannot provide. The two ends
+of a relayed connection complete their own encrypted handshake through it, so
+this program can no more read a transfer than it can read a message.
+
 ## Running it
 
 You do not need this repository. A published image is enough:
@@ -86,6 +93,19 @@ cargo run -p feed-server --example probe -- <server address> /direct/1.0.0/test 
 The two probes are never told each other's addresses, so a message arriving at
 the listener can only have gone through the server.
 
+File transfers use a different mechanism, a relayed connection rather than a
+topic, and have their own probe:
+
+```bash
+cargo run -p feed-server --example circuit_probe -- <server address> 25
+```
+
+Two peers in one process exchange 25 MiB that can only have crossed the relay.
+If this fails where the first probe passed, the usual cause is
+`external_addresses` being unset, since a server that does not know its own
+public address cannot tell a client where to be reached. Conversations keep
+working regardless, which is what makes it easy to miss.
+
 ## Configuration
 
 Optional. With no configuration file the server listens on port 4001 and carries
@@ -95,6 +115,11 @@ To change that, copy `feed-server.example.toml` to `data/feed-server.toml` and
 restart. A configuration that exists but cannot be parsed stops the server rather
 than being guessed at, including when the problem is nothing more than an unknown
 key.
+
+One setting is worth knowing about before you need it. Relaying file transfers
+requires `external_addresses`, because a server listening on `0.0.0.0` cannot
+tell a client what address to be reached at. In Docker that is always the case.
+See [external_addresses](CONFIGURATION.md#external_addresses).
 
 **[CONFIGURATION.md](CONFIGURATION.md) is the reference:** what the server does,
 every setting with its default and what goes wrong if you get it wrong, worked
@@ -151,9 +176,30 @@ same conversations. A conversation is an opaque string, but two clients
 interested in the same one are two clients with something to say to each other.
 Message sizes and timing are visible too.
 
+Relaying adds a little. A circuit names both of its ends, so an operator carrying
+a transfer can see which two peers are exchanging something and roughly how much
+of it, though not what it is or what it is called.
+
 That is inherent to routing anything at all, and worth being straight about with
 the people whose traffic you carry. It is also the argument for running one of
 these for your own circle rather than using somebody else's.
+
+## Relaying file transfers
+
+On by default. A client reserves a slot here, which makes it reachable at an
+address naming this server and then the client, and somebody else dials that
+address to open a connection through this server.
+
+**This needs `external_addresses` set** in any deployment where the listen
+address is not how people actually reach the machine, which includes every
+container. Without it, reservations fail and file transfers do not work, while
+conversations carry on perfectly.
+
+Three settings govern what relaying may cost, covered in
+[CONFIGURATION.md](CONFIGURATION.md#relay). The one worth reading before you set
+it is `max_circuit_bytes`, which is a budget for an entire relayed connection
+rather than a per-file limit. Running a relay for your own circle, no limit is
+the sensible setting.
 
 ## Limits
 

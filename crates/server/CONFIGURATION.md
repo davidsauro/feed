@@ -64,6 +64,23 @@ Clients address a server by that public key as well as by its hostname, which is
 what makes an address unambiguous. See
 [what it stores](README.md#what-it-stores-and-how-to-back-it-up).
 
+### Carries connections, so that file transfers work
+
+A conversation is a topic, and a topic is not a connection. A file transfer needs
+a real byte stream between two people, which is a different thing from
+forwarding sealed messages, and is why relaying is a separate part of the server
+rather than something gossipsub gives for free.
+
+A client asks this server for a **reservation**, which makes it reachable at an
+address naming this server and then the client. Somebody else dials that
+address, the server proxies the connection, and the bytes cross. The server can
+no more read a circuit than it can read a message.
+
+This is on by default and is governed by [its own settings](#relay), separately
+from the conversation limits, because it is a different kind of cost. Forwarding
+sealed messages for topics people asked for is cheap and bounded. Proxying a
+byte stream is bandwidth an operator spends on somebody else's file.
+
 ### Answers pings
 
 The server responds to libp2p pings so that clients can measure the round trip
@@ -105,6 +122,33 @@ configured with, so changing it later means updating every client. Inside Docker
 this is the port *inside* the container, which is the right-hand number in the
 compose file's port mapping. Changing one without the other means a server
 listening where nothing is published.
+
+### `external_addresses`
+
+```toml
+external_addresses = ["/dns4/relay.example.com/tcp/4001"]
+```
+
+**Default:** empty, in which case any `listen_on` address that names a real
+interface is used.
+
+How this server is reached from outside, without the `/p2p/` part.
+
+**When to change it:** whenever the server is behind anything. A container
+publishing a port, a NAT, or a DNS name all mean the listen address is not how
+people get here.
+
+**What to watch out for:** this is only used for relaying, and relaying does not
+work at all without it. When a client reserves a slot, the reply has to say what
+address others should use to reach that client through this server. Listening on
+`0.0.0.0` cannot answer that, so every reservation fails with
+`NoAddressesInReservation` and no file transfer through this server can work.
+Conversations carry on working perfectly, which is what makes this easy to miss.
+
+**In Docker this is effectively required**, because the address inside the
+container is never the address people dial. The server prints
+`reachable at <address>` for each one at startup, and warns when it has none and
+relaying is on.
 
 ### `identity_file`
 
@@ -239,17 +283,91 @@ incoming limit is what stops a busy server and the total is a backstop. Setting
 the total *below* the sum inverts that, and is a reasonable thing to do if you
 care about the combined figure rather than about either side of it.
 
+## Relay
+
+Whether this server carries connections between two people who cannot reach each
+other directly. Settings live in a `[relay]` section:
+
+```toml
+[relay]
+enabled = true
+max_circuit_bytes = 268435456
+max_circuit_duration_secs = 3600
+max_reservations = 512
+```
+
+| Setting | Default | What it does |
+|---|---|---|
+| `enabled` | `true` | Whether to relay connections at all |
+| `max_circuit_bytes` | 256 MiB | Total bytes one relayed connection may carry |
+| `max_circuit_duration_secs` | 3600 | How long one relayed connection may live |
+| `max_reservations` | 512 | How many clients may be reachable through this server |
+
+**Turning `enabled` off** leaves conversations working and stops file transfers
+through this server. That is the switch for an operator willing to carry
+messages but not files.
+
+### `max_circuit_bytes` is not a file size limit
+
+This is the setting people get wrong, so it is worth being blunt. A relayed
+connection carries **everything** between two people, in **both directions**, for
+**as long as it lives**: several transfers one after another, plus the
+conversation traffic alongside them. One counter covers the lot and it never
+resets.
+
+Set it to 25 MB expecting it to cap a 25 MB file and the second file that person
+sends will be cut off partway through.
+
+Keep it well clear of ordinary use. It is a backstop against somebody streaming
+without end. The app's own per-file limit is what tells a person that a
+particular file is too big, and that is the one that produces a sensible message.
+
+When this does fire, the connection simply ends. Nothing is said about why, and
+the transfer is caught by its hash rather than by an error. Setting it to `0`
+removes the limit.
+
+### The other two
+
+`max_circuit_duration_secs` is a hard timer from establishment, not an idle
+timeout. The libp2p default is two minutes, which is far too short, because a
+relayed connection carries the conversation as well as any transfers and should
+last as long as two people are talking.
+
+`max_reservations` wants to be in step with `max_connections_incoming`, since
+every client that wants to be reachable needs one. The libp2p default of 128 sits
+well below the connection limits and would leave most clients unreachable on a
+busy server.
+
+### Checking it works
+
+```bash
+cargo run -p feed-server --example circuit_probe -- <server address> 25
+```
+
+Two peers in one process, neither told the other's address, exchanging 25 MiB
+that can only have crossed the relay. It reports a refused reservation and a
+circuit cut short by name, which are the two ways this goes wrong.
+
 ## Recipes
 
 ### An open relay, for anyone
 
-No configuration file. This is the default, and it is a reasonable thing to run
-if you are willing to spend the bandwidth. Read
+```toml
+# Everything else can stay at its default. This one cannot be guessed, and
+# without it file transfers through this server will not work.
+external_addresses = ["/dns4/relay.example.com/tcp/4001"]
+```
+
+Reasonable to run if you are willing to spend the bandwidth. Read
 [Limits](README.md#limits) first, and note what is not yet implemented.
 
 ### A private relay, for a known group
 
 ```toml
+# Required for file transfers whenever this is not the address people dial,
+# which includes every container.
+external_addresses = ["/dns4/relay.example.com/tcp/4001"]
+
 allowed_peers = [
     "12D3KooW...",  # you
     "12D3KooW...",  # a friend
@@ -261,6 +379,18 @@ allowed_peers = [
 max_topics_total = 512
 max_connections_incoming = 32
 max_connections_total = 64
+
+[relay]
+# No limit, which is the right answer when the operator and the users are the
+# same people. The caps exist to protect an operator from strangers, and there
+# are none here. With a budget set, a long session of sending files is
+# interrupted every time it is reached, which is a nuisance and nothing more,
+# but a pointless one among people who trust each other.
+max_circuit_bytes = 0
+
+# A day. There is no way to switch the timer off, so this is how you say
+# "effectively never".
+max_circuit_duration_secs = 86400
 ```
 
 Everyone on the list needs the server's address. Everyone not on it is refused

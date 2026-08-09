@@ -22,6 +22,24 @@ pub struct Config {
     /// with, so changing it means every client has to be updated.
     pub listen_on: Vec<String>,
 
+    /// How this server is reached from outside, as multiaddresses without the
+    /// `/p2p/` part.
+    ///
+    /// Needed only for relaying. When a client reserves a slot here, the reply
+    /// has to contain the address other people should use to reach that client
+    /// through this server. A listen address of `0.0.0.0` cannot answer that, so
+    /// a server behind NAT, a container, or a DNS name has to be told.
+    ///
+    /// Left empty, any listen address that names a real interface is used, which
+    /// covers a server bound directly to its public address. A container
+    /// publishing a port does not qualify, and reservations there fail with
+    /// `NoAddressesInReservation` until this is set.
+    ///
+    /// ```toml
+    /// external_addresses = ["/dns4/relay.example.com/tcp/4001"]
+    /// ```
+    pub external_addresses: Vec<String>,
+
     /// Where this server's identity is kept.
     ///
     /// Clients address a server by its public key as well as its hostname, so
@@ -42,6 +60,54 @@ pub struct Config {
     pub siblings: Vec<String>,
 
     pub limits: Limits,
+
+    pub relay: Relay,
+}
+
+/// Whether this server will carry file transfers, and what they may cost it.
+///
+/// Separate from `limits` because this is a different kind of traffic. Carrying
+/// conversations means forwarding small sealed messages for topics clients
+/// asked for. Carrying a transfer means proxying a byte stream between two
+/// people, which is bandwidth an operator spends on their behalf. Somebody
+/// running an open relay should be able to say no to the second without closing
+/// the first.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Relay {
+    /// Whether to relay connections at all.
+    ///
+    /// On by default. A relay that cannot pass files is half a relay, and the
+    /// caps below are the answer to abuse rather than switching it off.
+    pub enabled: bool,
+
+    /// Total bytes one relayed connection may carry before it is cut.
+    ///
+    /// Not a file size limit, which is the mistake this comment exists to
+    /// prevent. A relayed connection carries everything between two people, in
+    /// both directions, for as long as it lives: several transfers, and the
+    /// conversation traffic alongside them. The count never resets. So this
+    /// wants to be well clear of ordinary use, and the app's own per-file limit
+    /// is what tells somebody a particular file is too big.
+    ///
+    /// Zero means no limit.
+    pub max_circuit_bytes: u64,
+
+    /// How long one relayed connection may live, in seconds.
+    ///
+    /// A hard timer from the moment it is established, not an idle timeout. The
+    /// libp2p default of two minutes is far too short here: a relayed
+    /// connection carries the conversation as well as any transfers, so it is
+    /// meant to last as long as the two people are talking.
+    pub max_circuit_duration_secs: u64,
+
+    /// How many clients may hold a reservation, which is what makes each of them
+    /// reachable through this server.
+    ///
+    /// Wants to be at least as large as the number of clients served, since
+    /// every one of them needs one. The libp2p default of 128 is far below the
+    /// connection limits above.
+    pub max_reservations: usize,
 }
 
 /// What one client is allowed to cost this server.
@@ -77,10 +143,28 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen_on: vec!["/ip4/0.0.0.0/tcp/4001".to_string()],
+            external_addresses: Vec::new(),
             identity_file: PathBuf::from("identity.bin"),
             allowed_peers: Vec::new(),
             siblings: Vec::new(),
             limits: Limits::default(),
+            relay: Relay::default(),
+        }
+    }
+}
+
+impl Default for Relay {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // Ten times the app's per-file limit, so somebody sending a handful
+            // of files in a sitting never trips it and somebody streaming
+            // without end still does.
+            max_circuit_bytes: 256 * 1024 * 1024,
+            max_circuit_duration_secs: 60 * 60,
+            // In step with max_connections_incoming, since a client that can
+            // connect but cannot reserve is reachable by nobody.
+            max_reservations: 512,
         }
     }
 }
