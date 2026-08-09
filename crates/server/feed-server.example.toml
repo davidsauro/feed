@@ -11,7 +11,8 @@ listen_on = ["/ip4/0.0.0.0/tcp/4001"]
 # configuration wrong. In a container, put it on a mounted volume.
 identity_file = "identity.bin"
 
-# Who may connect, by peer id. Leave empty — the default — and anyone may.
+# Who may connect, by peer id. Leave it empty, which is the default, and anyone
+# may.
 #
 # An open server is useful and easy to run, but it is also bandwidth anyone who
 # finds it can spend. The limits below are what stand between an open server and

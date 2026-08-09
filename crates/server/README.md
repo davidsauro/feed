@@ -92,9 +92,14 @@ Optional. With no configuration file the server listens on port 4001 and carries
 traffic for anyone, which is a useful thing to run as it stands.
 
 To change that, copy `feed-server.example.toml` to `data/feed-server.toml` and
-restart. That file documents every setting. A configuration that exists but
-cannot be parsed stops the server rather than being guessed at, including when
-the problem is nothing more than an unknown key.
+restart. A configuration that exists but cannot be parsed stops the server rather
+than being guessed at, including when the problem is nothing more than an unknown
+key.
+
+**[CONFIGURATION.md](CONFIGURATION.md) is the reference:** what the server does,
+every setting with its default and what goes wrong if you get it wrong, worked
+examples for an open relay, a private one, and a federated pair, and a list of
+the things people look for that do not exist yet.
 
 ## What it stores, and how to back it up
 
@@ -155,7 +160,8 @@ these for your own circle rather than using somebody else's.
 An open server is bandwidth anyone who finds it can spend. The defaults cap what
 one client can cost: 64 conversations each, 4096 across the server, 512 incoming
 connections, and a limit on half-finished handshakes, which are the cheapest
-thing to flood a server with. All of them are configurable.
+thing to flood a server with. All of them are configurable, and
+[CONFIGURATION.md](CONFIGURATION.md#limits) explains which to raise first.
 
 Not yet implemented: a cap on how *often* a client may publish. Doing that
 properly means taking over message validation from gossipsub, which is a larger
