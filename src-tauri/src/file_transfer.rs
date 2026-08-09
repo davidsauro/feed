@@ -297,8 +297,6 @@ pub async fn fetch(
     let mut last_error = "could not start".to_string();
 
     for attempt in 1..=MAX_ATTEMPTS {
-        let before = progress_so_far(&app, &transfer_id);
-
         match fetch_inner(&app, &mut control, peer, &transfer_id).await {
             Ok(()) => {
                 let _ = crate::set_file_status(&app, &transfer_id, "complete", None);
@@ -315,23 +313,7 @@ pub async fn fetch(
             }
         }
 
-        if attempt == MAX_ATTEMPTS {
-            break;
-        }
-
-        // A verification failure means the bytes are wrong rather than missing,
-        // and asking for them again would fail the same way.
-        if last_error.contains("does not match") {
-            break;
-        }
-
-        let after = progress_so_far(&app, &transfer_id);
-
-        // Worth another go if the last attempt moved something, since that is a
-        // transfer being interrupted rather than refused. The first attempt is
-        // always retried, because it may simply have arrived before the sender
-        // was reachable.
-        if attempt > 1 && after <= before {
+        if attempt == MAX_ATTEMPTS || !worth_retrying(&last_error) {
             break;
         }
 
@@ -342,14 +324,28 @@ pub async fn fetch(
     let _ = app.emit("file-changed", &transfer_id);
 }
 
-/// How many bytes of a transfer have been written, or zero if it cannot be read.
-fn progress_so_far(app: &AppHandle, transfer_id: &str) -> u64 {
-    crate::find_incoming_file(app, transfer_id)
-        .ok()
-        .flatten()
-        .map(|transfer| transfer.transferred)
-        .unwrap_or(0)
+/// Whether trying the same transfer again could reasonably do better.
+///
+/// Almost everything is worth another go, because the usual reasons a transfer
+/// stops say nothing about whether it can succeed: a connection being built
+/// through a relay may not be up yet, a server may have just cut a circuit off,
+/// a network may have changed. Two are not worth repeating.
+fn worth_retrying(error: &str) -> bool {
+    // The bytes are wrong rather than missing, so asking again gets the same
+    // wrong bytes.
+    if error.contains("does not match") {
+        return false;
+    }
+
+    // The sender gave no address at all. Nothing about waiting changes that,
+    // and they would have to offer the file again.
+    if error.contains("did not say where") {
+        return false;
+    }
+
+    true
 }
+
 
 async fn fetch_inner(
     app: &AppHandle,
@@ -563,6 +559,30 @@ pub fn encode_key(key: &FileKey) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The reasons a transfer stops that say nothing about whether it could
+    /// work, which is most of them.
+    #[test]
+    fn retries_anything_that_might_do_better_next_time() {
+        assert!(super::worth_retrying(
+            "could not reach them: failed to open stream: io error: Dial error: no addresses for peer"
+        ));
+        assert!(super::worth_retrying("they did not answer in time"));
+        assert!(super::worth_retrying("connection reset by peer"));
+        assert!(super::worth_retrying("Max circuit bytes reached."));
+    }
+
+    /// Asking again for bytes that arrived wrong gets the same wrong bytes, and
+    /// an offer with no address in it will not grow one by waiting.
+    #[test]
+    fn gives_up_on_what_repeating_cannot_fix() {
+        assert!(!super::worth_retrying(
+            "the file does not match what was sent"
+        ));
+        assert!(!super::worth_retrying(
+            "they did not say where they could be reached"
+        ));
+    }
+
     use super::*;
 
     /// The sender picks the file name, so this is the one place a transfer could

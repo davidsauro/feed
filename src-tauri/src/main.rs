@@ -32,6 +32,7 @@ use libp2p::request_response::ProtocolSupport;
 use libp2p::request_response::ResponseChannel;
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::dial_opts::DialOpts;
+use libp2p::swarm::DialError;
 use libp2p::core::transport::ListenerId;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::swarm::SwarmEvent;
@@ -72,6 +73,14 @@ const NAME_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Listen on every network interface, and let the OS pick the port.
 const LISTEN_ADDRESS: &str = "/ip4/0.0.0.0/tcp/0";
+
+/// How long to wait for a connection to somebody we are about to fetch a file
+/// from.
+///
+/// Reaching a peer through a relay is a dial to the server, a circuit request,
+/// and then a handshake between the two ends, so it takes noticeably longer than
+/// reaching somebody on the same network.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How often a configured server we are not connected to is dialled again.
 ///
@@ -1407,9 +1416,15 @@ pub async fn reach_peer(
         .await
         .map_err(|e| e.to_string())?;
 
-    result_rx
+    // Bounded, because a dial that is neither established nor refused would
+    // otherwise leave a transfer waiting forever with nothing on screen to say
+    // why. Building a connection through a relay is several round trips, so this
+    // is generous rather than tight.
+    let answer = tokio::time::timeout(DIAL_TIMEOUT, result_rx)
         .await
-        .map_err(|_| "the network stopped answering".to_string())?
+        .map_err(|_| "they did not answer in time".to_string())?;
+
+    answer.map_err(|_| "the network stopped answering".to_string())?
 }
 
 /// Packs the sender's addresses for storage, dropping anything unusable.
@@ -2644,6 +2659,38 @@ fn get_relayed_addresses(state: State<'_, NetworkState>) -> Result<Vec<String>, 
     Ok(addresses.iter().cloned().collect())
 }
 
+/// The connections the network task is looking after.
+///
+/// Bundled rather than passed one by one, because both handlers need all of it
+/// and the argument lists were getting long enough to hide a mistake.
+#[derive(Default)]
+struct Links {
+    servers: HashMap<PeerId, ServerLink>,
+    /// Callers waiting for a connection to a peer they have asked us to dial.
+    ///
+    /// A dial is not a connection. `Swarm::dial` returns the moment the attempt
+    /// starts, so anything that answered there would be telling the caller they
+    /// can reach somebody they cannot reach yet. These wait for the connection
+    /// to actually be established, or for the attempt to fail.
+    ///
+    /// A list per peer, since two transfers from the same person can be waiting
+    /// on the same connection.
+    pending_dials: HashMap<PeerId, Vec<oneshot::Sender<Result<(), String>>>>,
+}
+
+impl Links {
+    /// Answers everybody waiting on a connection to one peer.
+    fn resolve_dials(&mut self, peer_id: &PeerId, outcome: Result<(), String>) {
+        let Some(waiting) = self.pending_dials.remove(peer_id) else {
+            return;
+        };
+
+        for sender in waiting {
+            let _ = sender.send(outcome.clone());
+        }
+    }
+}
+
 /// What the network task holds about one configured server.
 struct ServerLink {
     address: Multiaddr,
@@ -3021,7 +3068,7 @@ fn handle_swarm_event(
     app: &AppHandle,
     swarm: &mut Swarm<AppBehaviour>,
     keypair: &Keypair,
-    servers: &HashMap<PeerId, ServerLink>,
+    links: &mut Links,
     event: SwarmEvent<AppBehaviourEvent>,
 ) {
     match event {
@@ -3109,6 +3156,8 @@ fn handle_swarm_event(
         SwarmEvent::ConnectionEstablished {
             peer_id, endpoint, ..
         } => {
+            links.resolve_dials(&peer_id, Ok(()));
+
             if !is_relayed(endpoint.get_remote_address()) {
                 count_direct_connection(app, &peer_id, 1);
             }
@@ -3125,7 +3174,7 @@ fn handle_swarm_event(
             // A server does not speak the name protocol anyway, so announcing
             // would only produce a failed negotiation, but the reason to skip it
             // is that our name is none of a relay's business.
-            if !servers.contains_key(&peer_id) {
+            if !links.servers.contains_key(&peer_id) {
                 // Both sides do this as they connect, so each learns what the
                 // other would like to be called without either having to ask.
                 announce_name_to(app, swarm, peer_id);
@@ -3163,6 +3212,8 @@ fn handle_swarm_event(
             error,
             ..
         } => {
+            links.resolve_dials(&peer_id, Err(error.to_string()));
+
             // Why a server could not be reached is the most useful thing there
             // is to show when one cannot. Peers that are not servers are ignored
             // by the recorder.
@@ -3202,12 +3253,12 @@ fn handle_network_command(
     app: &AppHandle,
     swarm: &mut Swarm<AppBehaviour>,
     keypair: &Keypair,
-    servers: &mut HashMap<PeerId, ServerLink>,
+    links: &mut Links,
     command: NetworkCommand,
 ) {
     match command {
         NetworkCommand::TestServers => {
-            redial_missing_servers(swarm, servers);
+            redial_missing_servers(swarm, &links.servers);
         }
 
         NetworkCommand::DialPeer {
@@ -3215,17 +3266,34 @@ fn handle_network_command(
             addresses,
             result_tx,
         } => {
-            let outcome = if swarm.is_connected(&peer_id) {
-                Ok(())
-            } else if addresses.is_empty() {
-                Err("they did not say where they could be reached".to_string())
-            } else {
-                swarm
-                    .dial(DialOpts::peer_id(peer_id).addresses(addresses).build())
-                    .map_err(|error| error.to_string())
-            };
+            if swarm.is_connected(&peer_id) {
+                let _ = result_tx.send(Ok(()));
+                return;
+            }
 
-            let _ = result_tx.send(outcome);
+            if addresses.is_empty() {
+                let _ = result_tx.send(Err(
+                    "they did not say where they could be reached".to_string()
+                ));
+                return;
+            }
+
+            match swarm.dial(DialOpts::peer_id(peer_id).addresses(addresses).build()) {
+                // Started, not finished. The answer comes when the connection is
+                // established or the attempt fails.
+                Ok(()) => links.pending_dials.entry(peer_id).or_default().push(result_tx),
+
+                // Somebody else is already dialling them. Wait on that one
+                // rather than reporting a failure that is really a success in
+                // progress.
+                Err(DialError::DialPeerConditionFalse(_)) => {
+                    links.pending_dials.entry(peer_id).or_default().push(result_tx)
+                }
+
+                Err(error) => {
+                    let _ = result_tx.send(Err(error.to_string()));
+                }
+            }
         }
 
         NetworkCommand::ConnectToServer { peer_id, address } => {
@@ -3237,7 +3305,7 @@ fn handle_network_command(
             // means one place decides what happens when a server is added.
             let reservation = reserve_through(swarm, &address);
 
-            servers.insert(peer_id, ServerLink { address, reservation });
+            links.servers.insert(peer_id, ServerLink { address, reservation });
 
             // What makes the server useful. Gossipsub sends an explicit peer the
             // full list of what we are subscribed to, and forwards our messages
@@ -3248,7 +3316,7 @@ fn handle_network_command(
         }
 
         NetworkCommand::DisconnectFromServer { peer_id } => {
-            if let Some(link) = servers.remove(&peer_id) {
+            if let Some(link) = links.servers.remove(&peer_id) {
                 if let Some(reservation) = link.reservation {
                     // Gives the slot back rather than leaving the server holding
                     // one for a node that is not coming back.
@@ -3485,10 +3553,10 @@ async fn run_network(
     // after this task starts. Commands sent before this loop begins wait in the
     // channel, so nothing is missed.
 
-    // Where the configured servers live for as long as the network is running.
-    // Held here rather than in Tauri state because only this task dials, and a
-    // value one task owns cannot be read at the wrong moment by another.
-    let mut servers: HashMap<PeerId, ServerLink> = HashMap::new();
+    // Everything the network task looks after. Held here rather than in Tauri
+    // state because only this task touches it, and a value one task owns cannot
+    // be read at the wrong moment by another.
+    let mut links = Links::default();
 
     let mut redial = tokio::time::interval(SERVER_REDIAL_INTERVAL);
 
@@ -3497,7 +3565,7 @@ async fn run_network(
     loop {
         tokio::select! {
             swarm_event = swarm.select_next_some() => {
-                handle_swarm_event(&app, &mut swarm, &keypair_for_crypto, &servers, swarm_event);
+                handle_swarm_event(&app, &mut swarm, &keypair_for_crypto, &mut links, swarm_event);
             }
 
             Some(command) = command_rx.recv() => {
@@ -3505,13 +3573,13 @@ async fn run_network(
                     &app,
                     &mut swarm,
                     &keypair_for_crypto,
-                    &mut servers,
+                    &mut links,
                     command,
                 );
             }
 
             _ = redial.tick() => {
-                redial_missing_servers(&mut swarm, &servers);
+                redial_missing_servers(&mut swarm, &links.servers);
             }
         }
     }
