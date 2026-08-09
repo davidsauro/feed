@@ -23,13 +23,16 @@ use futures::stream::StreamExt;
 use libp2p::gossipsub;
 use libp2p::identity::Keypair;
 use libp2p::ping;
+use libp2p::relay;
 use libp2p::request_response::cbor;
 use libp2p::request_response::Config as RequestResponseConfig;
 use libp2p::request_response::Event as RequestResponseEvent;
 use libp2p::request_response::Message as RequestResponseMessage;
 use libp2p::request_response::ProtocolSupport;
 use libp2p::request_response::ResponseChannel;
+use libp2p::multiaddr::Protocol;
 use libp2p::swarm::dial_opts::DialOpts;
+use libp2p::core::transport::ListenerId;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{mdns, noise, tcp, yamux};
@@ -265,6 +268,16 @@ enum NetworkCommand {
     /// Dial every configured server that is not connected, now rather than at
     /// the next scheduled attempt. Sent when somebody presses the test button.
     TestServers,
+    /// Open a connection to one peer at the addresses they gave us.
+    ///
+    /// Needed before a file can be pulled from somebody this node cannot reach
+    /// directly. Reports back so the transfer can say why it could not start,
+    /// rather than failing later with something vaguer.
+    DialPeer {
+        peer_id: PeerId,
+        addresses: Vec<Multiaddr>,
+        result_tx: oneshot::Sender<Result<(), String>>,
+    },
     /// Publish to a group.
     ///
     /// Unlike a direct message this reports back, because gossipsub refuses to
@@ -312,6 +325,25 @@ struct NetworkState {
     /// doesn't start until the app is unlocked. Taking it is what starts the
     /// task, and it can only be taken once, so there is no way to start twice.
     command_rx: Mutex<Option<mpsc::Receiver<NetworkCommand>>>,
+    /// How many direct connections we hold to each peer, by peer id.
+    ///
+    /// Kept apart from `active_peers` because the two answer different
+    /// questions. That one says whether somebody is reachable at all, which is
+    /// what presence means. This says whether we can reach them without a server
+    /// in the middle, which is what decides how large a file may be: bytes over
+    /// a local network cost nobody anything, and bytes across a relay are
+    /// somebody else's bandwidth.
+    ///
+    /// A count rather than a set, since a peer can hold a direct connection and
+    /// a relayed one at the same time and losing the direct one has to be
+    /// noticed.
+    direct_connections: Mutex<HashMap<String, usize>>,
+    /// Addresses this node can be reached at through a relay server.
+    ///
+    /// Filled in as reservations are accepted. These are what contacts need in
+    /// order to open a connection for a file transfer, since nobody can dial a
+    /// node behind a home router directly.
+    relayed_addresses: Mutex<HashSet<String>>,
     /// What we know about each configured server, keyed by its peer id.
     ///
     /// Kept here rather than in the network task because a Tauri command has to
@@ -379,6 +411,14 @@ struct AppBehaviour {
     /// message, and so a transfer gets flow control from the stream rather than
     /// having to invent it.
     files: libp2p_stream::Behaviour,
+    /// Lets this node be reached through a relay server, and reach others that
+    /// way.
+    ///
+    /// Only file transfers need it. Messages travel as gossipsub topics, which a
+    /// server carries without either end holding a connection to the other. A
+    /// transfer needs a real byte stream, and two nodes behind home routers have
+    /// no way to open one, so a server proxies it.
+    relay: relay::client::Behaviour,
 
     /// Checks that the peer on the other end of each connection is still there.
     ///
@@ -660,6 +700,8 @@ fn add_missing_columns(conn: &Connection) -> SqlResult<()> {
     // before anything tracked being looked at. Backfilling them as unseen would
     // announce every file the user has ever received as new, so they start as
     // seen and only genuinely new arrivals raise the badge.
+    add_column_if_missing(conn, "files", "addresses", "TEXT")?;
+
     if add_column_if_missing(conn, "files", "seen", "INTEGER NOT NULL DEFAULT 0")? {
         conn.execute("UPDATE files SET seen = 1", ())?;
     }
@@ -833,6 +875,13 @@ pub struct FileTransfer {
     pub transferred: u64,
     pub error: Option<String>,
     pub sent_at: i64,
+    /// Where the sender said they could be reached, as a JSON array.
+    ///
+    /// Only meaningful on an incoming transfer, and only when the sender cannot
+    /// be reached directly. A node behind a home router cannot be dialled, so it
+    /// tells us the relayed addresses it holds and we go through a server. Kept
+    /// with the transfer so resuming after a restart still knows where to look.
+    pub addresses: Option<String>,
     /// Whether this has been looked at since it arrived.
     ///
     /// Only meaningful for files coming in. Nothing arrives with a prompt, so
@@ -842,7 +891,7 @@ pub struct FileTransfer {
 }
 
 const FILE_COLUMNS: &str =
-    "id, peer_id, direction, name, size, hash, key, path, status, transferred, error, sent_at, seen";
+    "id, peer_id, direction, name, size, hash, key, path, status, transferred, error, sent_at, seen, addresses";
 
 fn read_file_row(row: &rusqlite::Row) -> SqlResult<FileTransfer> {
     Ok(FileTransfer {
@@ -859,6 +908,7 @@ fn read_file_row(row: &rusqlite::Row) -> SqlResult<FileTransfer> {
         error: row.get(10)?,
         sent_at: row.get(11)?,
         seen: row.get::<_, i64>(12)? != 0,
+        addresses: row.get(13)?,
     })
 }
 
@@ -1199,7 +1249,14 @@ struct PickedFile {
 /// that would be refused. Reporting that at the point of picking is far kinder
 /// than accepting it and failing at send time.
 #[tauri::command]
-async fn inspect_files(paths: Vec<String>) -> Result<Vec<PickedFile>, String> {
+async fn inspect_files(
+    app: AppHandle,
+    peer_id: String,
+    paths: Vec<String>,
+) -> Result<Vec<PickedFile>, String> {
+    // Depends on who it is going to, since a file only has a size limit when it
+    // has to cross somebody else's server to get there.
+    let limit = size_limit_for(&app, &peer_id);
     let mut picked = Vec::new();
 
     for path in paths {
@@ -1213,7 +1270,7 @@ async fn inspect_files(paths: Vec<String>) -> Result<Vec<PickedFile>, String> {
                 path,
                 name,
                 size: metadata.len(),
-                too_large: metadata.len() > file_crypto::MAX_FILE_SIZE,
+                too_large: limit.is_some_and(|limit| metadata.len() > limit),
                 unreadable: false,
             }),
             // A directory lands here too. Neither can be sent, and from the
@@ -1252,12 +1309,16 @@ async fn send_file(
     }
 
     let size = metadata.len();
-    if size > file_crypto::MAX_FILE_SIZE {
-        return Err(format!(
-            "that file is {:.1}MB and the limit is {}MB",
-            size as f64 / (1024.0 * 1024.0),
-            file_crypto::MAX_FILE_SIZE / (1024 * 1024)
-        ));
+
+    if let Some(limit) = size_limit_for(&app, &peer_id) {
+        if size > limit {
+            return Err(format!(
+                "that file is {:.1}MB. Sending through a relay server is limited to {}MB, and \
+                 there is no limit to somebody on this network",
+                size as f64 / (1024.0 * 1024.0),
+                limit / (1024 * 1024)
+            ));
+        }
     }
 
     let name = std::path::Path::new(&path)
@@ -1283,6 +1344,9 @@ async fn send_file(
         sent_at,
         // Ours already, so there is nothing to notice about it.
         seen: true,
+        // Outgoing. We are the one being fetched from, so it is the recipient
+        // who needs an address, not us.
+        addresses: None,
     };
 
     insert_file(&app, &transfer)?;
@@ -1306,6 +1370,77 @@ pub struct IncomingOffer {
     pub hash: String,
     pub key: String,
     pub sent_at: i64,
+    /// Where the sender says they can be reached through a relay.
+    ///
+    /// Carried in the offer rather than announced separately, which avoids the
+    /// timing problem an announcement would have: this arrives sealed, to
+    /// exactly the person who needs it, at exactly the moment they need it. The
+    /// offer itself is proof the sender is reachable somehow, so nothing has to
+    /// be remembered between transfers.
+    #[serde(default)]
+    pub addresses: Vec<String>,
+}
+
+/// Opens a connection to somebody we are about to pull a file from.
+///
+/// A no-op when we already have one, which is the local network case. Otherwise
+/// it dials the relayed addresses they sent with their offer, since a node
+/// behind a home router cannot be reached any other way.
+pub async fn reach_peer(
+    app: &AppHandle,
+    peer_id: PeerId,
+    addresses: Vec<Multiaddr>,
+) -> Result<(), String> {
+    let network_tx = {
+        let state = app.state::<NetworkState>();
+        network_sender(&state)?
+    };
+
+    let (result_tx, result_rx) = oneshot::channel();
+
+    network_tx
+        .send(NetworkCommand::DialPeer {
+            peer_id,
+            addresses,
+            result_tx,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    result_rx
+        .await
+        .map_err(|_| "the network stopped answering".to_string())?
+}
+
+/// Packs the sender's addresses for storage, dropping anything unusable.
+///
+/// Filtered rather than trusted. These are strings from another node, and one
+/// that cannot be parsed would only fail later at the point of dialling, where
+/// the reason would be much harder to see.
+fn encode_addresses(addresses: &[String]) -> Option<String> {
+    let usable: Vec<&String> = addresses
+        .iter()
+        .filter(|address| address.parse::<Multiaddr>().is_ok())
+        .collect();
+
+    if usable.is_empty() {
+        return None;
+    }
+
+    serde_json::to_string(&usable).ok()
+}
+
+/// Reads back what `encode_addresses` stored.
+pub fn decode_addresses(stored: Option<&str>) -> Vec<Multiaddr> {
+    let Some(stored) = stored else {
+        return Vec::new();
+    };
+
+    serde_json::from_str::<Vec<String>>(stored)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|address| address.parse().ok())
+        .collect()
 }
 
 /// Records a file we have been offered and starts fetching it.
@@ -1327,10 +1462,20 @@ async fn receive_file(
         hash,
         key,
         sent_at,
+        addresses,
     } = offer;
 
-    if size > file_crypto::MAX_FILE_SIZE {
-        return Err(format!("{} is larger than this node will accept", name));
+    // Checked here as well as by the sender. A limit only one side enforces is a
+    // limit the other side may simply not implement.
+    if let Some(limit) = size_limit_for(&app, &peer_id) {
+        if size > limit {
+            return Err(format!(
+                "{} is {:.1}MB, and this node accepts at most {}MB through a relay",
+                name,
+                size as f64 / (1024.0 * 1024.0),
+                limit / (1024 * 1024)
+            ));
+        }
     }
 
     let peer = parse_peer(&peer_id)?;
@@ -1357,6 +1502,7 @@ async fn receive_file(
         error: None,
         sent_at,
         seen: false,
+        addresses: encode_addresses(&addresses),
     };
 
     insert_file(&app, &transfer)?;
@@ -1372,8 +1518,8 @@ fn insert_file(app: &AppHandle, transfer: &FileTransfer) -> Result<(), String> {
     let conn = get_db_connection(app).map_err(|e| e.to_string())?;
 
     conn.execute(
-        "INSERT OR IGNORE INTO files (id, peer_id, direction, name, size, hash, key, path, status, transferred, error, sent_at, seen)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT OR IGNORE INTO files (id, peer_id, direction, name, size, hash, key, path, status, transferred, error, sent_at, seen, addresses)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         (
             &transfer.id,
             &transfer.peer_id,
@@ -1388,6 +1534,7 @@ fn insert_file(app: &AppHandle, transfer: &FileTransfer) -> Result<(), String> {
             &transfer.error,
             transfer.sent_at,
             i64::from(transfer.seen),
+            &transfer.addresses,
         ),
     )
     .map_err(|e| e.to_string())?;
@@ -2342,7 +2489,9 @@ fn build_swarm(keypair: Keypair) -> Swarm<AppBehaviour> {
             yamux::Config::default,
         )
         .expect("failed to configure the TCP transport")
-        .with_behaviour(|key| {
+        .with_relay_client(noise::Config::new, yamux::Config::default)
+        .expect("failed to configure the relay transport")
+        .with_behaviour(|key, relay| {
             let mdns_config = mdns::Config {
                 ttl: MDNS_RECORD_TTL,
                 query_interval: MDNS_QUERY_INTERVAL,
@@ -2374,6 +2523,7 @@ fn build_swarm(keypair: Keypair) -> Swarm<AppBehaviour> {
                 files: libp2p_stream::Behaviour::new(),
                 names,
                 groups,
+                relay,
                 ping,
             }
         })
@@ -2391,6 +2541,124 @@ fn build_swarm(keypair: Keypair) -> Swarm<AppBehaviour> {
 fn emit_to_frontend<P: Serialize + Clone>(app: &AppHandle, event: &str, payload: P) {
     if let Err(error) = app.emit(event, payload) {
         eprintln!("could not emit '{}' to the frontend: {}", event, error);
+    }
+}
+
+/// Whether an address reaches a node through a relay rather than directly.
+fn is_relayed(address: &Multiaddr) -> bool {
+    address.iter().any(|part| part == Protocol::P2pCircuit)
+}
+
+/// Records a direct connection opening or closing.
+fn count_direct_connection(app: &AppHandle, peer_id: &PeerId, change: i32) {
+    let state = app.state::<NetworkState>();
+    let peer_id = peer_id.to_string();
+
+    match state.direct_connections.lock() {
+        Ok(mut counts) => {
+            let held = counts.entry(peer_id.clone()).or_insert(0);
+
+            if change > 0 {
+                *held += 1;
+            } else {
+                *held = held.saturating_sub(1);
+            }
+
+            if *held == 0 {
+                counts.remove(&peer_id);
+            }
+        }
+        Err(error) => eprintln!("could not count a direct connection: {}", error),
+    };
+}
+
+/// Whether we can reach this peer without a server in the middle.
+fn is_directly_connected(app: &AppHandle, peer_id: &str) -> bool {
+    let state = app.state::<NetworkState>();
+
+    let held = match state.direct_connections.lock() {
+        Ok(counts) => counts.contains_key(peer_id),
+        Err(error) => {
+            eprintln!("could not check for a direct connection: {}", error);
+            false
+        }
+    };
+
+    held
+}
+
+/// The largest file that may be sent to one peer right now.
+///
+/// Unlimited to somebody we can reach directly, which on a local network is
+/// everybody. Those bytes never leave the network and cost nobody anything, and
+/// the people involved have already added each other, so there is nothing here
+/// to protect anyone from.
+///
+/// Capped to somebody we can only reach through a relay, because then the bytes
+/// are spending an operator's bandwidth rather than ours.
+fn size_limit_for(app: &AppHandle, peer_id: &str) -> Option<u64> {
+    if is_directly_connected(app, peer_id) {
+        None
+    } else {
+        Some(file_crypto::MAX_RELAYED_FILE_SIZE)
+    }
+}
+
+/// Adds or removes one of our own relayed addresses.
+fn remember_relayed_address(app: &AppHandle, address: &Multiaddr, present: bool) {
+    let state = app.state::<NetworkState>();
+
+    match state.relayed_addresses.lock() {
+        Ok(mut addresses) => {
+            if present {
+                addresses.insert(address.to_string());
+            } else {
+                addresses.remove(&address.to_string());
+            }
+        }
+        Err(error) => eprintln!("could not record a relayed address: {}", error),
+    };
+
+    // The frontend announces these to contacts, so it has to know they changed.
+    emit_to_frontend(app, "relayed-addresses-changed", ());
+}
+
+/// The addresses this node can currently be reached at through a relay.
+#[tauri::command]
+fn get_relayed_addresses(state: State<'_, NetworkState>) -> Result<Vec<String>, String> {
+    let addresses = state
+        .relayed_addresses
+        .lock()
+        .map_err(|e| format!("could not read the relayed addresses: {}", e))?;
+
+    Ok(addresses.iter().cloned().collect())
+}
+
+/// What the network task holds about one configured server.
+struct ServerLink {
+    address: Multiaddr,
+    /// The listener holding our reservation, once we have one.
+    ///
+    /// A reservation is what makes this node reachable *through* that server, so
+    /// somebody who cannot dial us directly can still open a connection for a
+    /// file transfer. Kept so it can be torn down when the server is removed.
+    reservation: Option<ListenerId>,
+}
+
+/// Asks a server to make this node reachable through it.
+///
+/// Listening on `<server>/p2p-circuit` is how a reservation is requested. The
+/// swarm reuses the connection we already hold to that server, so this costs
+/// nothing beyond the request itself.
+fn reserve_through(swarm: &mut Swarm<AppBehaviour>, address: &Multiaddr) -> Option<ListenerId> {
+    let circuit = address.clone().with(Protocol::P2pCircuit);
+
+    match swarm.listen_on(circuit.clone()) {
+        Ok(listener) => Some(listener),
+        Err(error) => {
+            eprintln!("could not ask {} for a reservation: {}", circuit, error);
+            None
+        }
     }
 }
 
@@ -2417,11 +2685,11 @@ fn dial_server(swarm: &mut Swarm<AppBehaviour>, peer_id: PeerId, address: &Multi
 /// restarts later, has to be picked up again without the user doing anything.
 /// Dialling one we are already connected to is refused harmlessly, but checking
 /// first keeps the log quiet.
-fn redial_missing_servers(swarm: &mut Swarm<AppBehaviour>, servers: &HashMap<PeerId, Multiaddr>) {
+fn redial_missing_servers(swarm: &mut Swarm<AppBehaviour>, servers: &HashMap<PeerId, ServerLink>) {
     let missing: Vec<(PeerId, Multiaddr)> = servers
         .iter()
         .filter(|(peer_id, _)| !swarm.is_connected(peer_id))
-        .map(|(peer_id, address)| (*peer_id, address.clone()))
+        .map(|(peer_id, link)| (*peer_id, link.address.clone()))
         .collect();
 
     for (peer_id, address) in missing {
@@ -2743,7 +3011,7 @@ fn handle_swarm_event(
     app: &AppHandle,
     swarm: &mut Swarm<AppBehaviour>,
     keypair: &Keypair,
-    servers: &HashMap<PeerId, Multiaddr>,
+    servers: &HashMap<PeerId, ServerLink>,
     event: SwarmEvent<AppBehaviourEvent>,
 ) {
     match event {
@@ -2813,7 +3081,28 @@ fn handle_swarm_event(
             swarm.close_connection(connection);
         }
 
-        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+        SwarmEvent::NewListenAddr { address, .. } => {
+            // Only the relayed ones matter to anyone else. A local address is of
+            // no use to somebody who cannot reach this network.
+            if is_relayed(&address) {
+                println!("reachable through a relay at {}", address);
+                remember_relayed_address(app, &address, true);
+            }
+        }
+
+        SwarmEvent::ExpiredListenAddr { address, .. } => {
+            if is_relayed(&address) {
+                remember_relayed_address(app, &address, false);
+            }
+        }
+
+        SwarmEvent::ConnectionEstablished {
+            peer_id, endpoint, ..
+        } => {
+            if !is_relayed(endpoint.get_remote_address()) {
+                count_direct_connection(app, &peer_id, 1);
+            }
+
             handle_peer_connected(app, peer_id);
 
             record_server_health(app, &peer_id, |health| {
@@ -2836,8 +3125,13 @@ fn handle_swarm_event(
         SwarmEvent::ConnectionClosed {
             peer_id,
             num_established,
+            endpoint,
             ..
         } => {
+            if !is_relayed(endpoint.get_remote_address()) {
+                count_direct_connection(app, &peer_id, -1);
+            }
+
             // Peers can hold more than one connection; they're only gone when
             // the last one closes.
             if num_established == 0 {
@@ -2898,7 +3192,7 @@ fn handle_network_command(
     app: &AppHandle,
     swarm: &mut Swarm<AppBehaviour>,
     keypair: &Keypair,
-    servers: &mut HashMap<PeerId, Multiaddr>,
+    servers: &mut HashMap<PeerId, ServerLink>,
     command: NetworkCommand,
 ) {
     match command {
@@ -2906,10 +3200,34 @@ fn handle_network_command(
             redial_missing_servers(swarm, servers);
         }
 
+        NetworkCommand::DialPeer {
+            peer_id,
+            addresses,
+            result_tx,
+        } => {
+            let outcome = if swarm.is_connected(&peer_id) {
+                Ok(())
+            } else if addresses.is_empty() {
+                Err("they did not say where they could be reached".to_string())
+            } else {
+                swarm
+                    .dial(DialOpts::peer_id(peer_id).addresses(addresses).build())
+                    .map_err(|error| error.to_string())
+            };
+
+            let _ = result_tx.send(outcome);
+        }
+
         NetworkCommand::ConnectToServer { peer_id, address } => {
-            servers.insert(peer_id, address);
             begin_tracking_server(app, &peer_id);
-            dial_server(swarm, peer_id, &servers[&peer_id]);
+            dial_server(swarm, peer_id, &address);
+
+            // Asked for straight away rather than after the connection is up.
+            // The swarm queues it behind the dial either way, and doing it here
+            // means one place decides what happens when a server is added.
+            let reservation = reserve_through(swarm, &address);
+
+            servers.insert(peer_id, ServerLink { address, reservation });
 
             // What makes the server useful. Gossipsub sends an explicit peer the
             // full list of what we are subscribed to, and forwards our messages
@@ -2920,7 +3238,14 @@ fn handle_network_command(
         }
 
         NetworkCommand::DisconnectFromServer { peer_id } => {
-            servers.remove(&peer_id);
+            if let Some(link) = servers.remove(&peer_id) {
+                if let Some(reservation) = link.reservation {
+                    // Gives the slot back rather than leaving the server holding
+                    // one for a node that is not coming back.
+                    swarm.remove_listener(reservation);
+                }
+            }
+
             stop_tracking_server(app, &peer_id);
             swarm.behaviour_mut().groups.remove_explicit_peer(&peer_id);
 
@@ -3153,7 +3478,7 @@ async fn run_network(
     // Where the configured servers live for as long as the network is running.
     // Held here rather than in Tauri state because only this task dials, and a
     // value one task owns cannot be read at the wrong moment by another.
-    let mut servers: HashMap<PeerId, Multiaddr> = HashMap::new();
+    let mut servers: HashMap<PeerId, ServerLink> = HashMap::new();
 
     let mut redial = tokio::time::interval(SERVER_REDIAL_INTERVAL);
 
@@ -3205,6 +3530,8 @@ fn main() {
                 peer_names: Mutex::new(HashMap::new()),
                 network_tx: Mutex::new(network_tx),
                 command_rx: Mutex::new(Some(command_rx)),
+                direct_connections: Mutex::new(HashMap::new()),
+                relayed_addresses: Mutex::new(HashSet::new()),
                 server_health: Mutex::new(HashMap::new()),
             });
 
@@ -3266,6 +3593,7 @@ fn main() {
             connect_to_saved_servers,
             test_servers,
             get_server_status,
+            get_relayed_addresses,
             // Files
             get_files,
             mark_files_seen,
@@ -3310,6 +3638,53 @@ mod tests {
         fs::create_dir_all(&dir).expect("could not create the scratch directory");
 
         dir
+    }
+
+    /// Addresses from another node are strings, and one that does not parse
+    /// would otherwise fail much later at the point of dialling.
+    #[test]
+    fn keeps_only_addresses_that_can_be_dialled() {
+        let stored = encode_addresses(&[
+            "/ip4/203.0.113.7/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+                .to_string(),
+            "not an address".to_string(),
+        ])
+        .expect("one address was usable");
+
+        let read_back = decode_addresses(Some(&stored));
+
+        assert_eq!(read_back.len(), 1, "the unusable one should be dropped");
+        assert!(read_back[0].to_string().contains("203.0.113.7"));
+    }
+
+    /// Nothing usable should be stored as nothing, not as an empty list, so a
+    /// transfer with no addresses is plainly a transfer with no addresses.
+    #[test]
+    fn stores_nothing_when_no_address_is_usable() {
+        assert!(encode_addresses(&[]).is_none());
+        assert!(encode_addresses(&["rubbish".to_string()]).is_none());
+    }
+
+    /// An older node sends an offer with no addresses at all.
+    #[test]
+    fn reads_a_transfer_that_carries_no_addresses() {
+        assert!(decode_addresses(None).is_empty());
+        assert!(decode_addresses(Some("")).is_empty());
+        assert!(decode_addresses(Some("[]")).is_empty());
+    }
+
+    /// A relayed address is what tells the app a peer is not reachable directly,
+    /// which is what decides whether a size limit applies.
+    #[test]
+    fn recognises_an_address_that_goes_through_a_relay() {
+        let direct: Multiaddr = "/ip4/192.168.1.5/tcp/4001".parse().expect("valid");
+        let relayed: Multiaddr =
+            "/ip4/203.0.113.7/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit"
+                .parse()
+                .expect("valid");
+
+        assert!(!is_relayed(&direct));
+        assert!(is_relayed(&relayed));
     }
 
     /// A files table as it was before arrivals were tracked.

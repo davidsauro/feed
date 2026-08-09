@@ -1,0 +1,176 @@
+# Testing file transfers across a relay
+
+For two machines and a server. Written to be worked through in order, because
+each part rests on the one before it and finding out that step 9 fails is far
+less useful when step 3 was already broken.
+
+Set the server up first with [crates/server/DOCKER.md](crates/server/DOCKER.md).
+
+Throughout: **A** and **B** are the two machines, **S** is the server.
+
+## Before anything else
+
+| Check | How | Expect |
+|---|---|---|
+| S is up | `docker logs feed-server` | `reachable at <your address>`, no `WARNING` |
+| S carries conversations | `probe` example, twice | The message arrives |
+| S relays connections | `circuit_probe` example | `OK: 25 MiB crossed the relay` |
+
+If `circuit_probe` fails where `probe` passed, stop. `external_addresses` is
+wrong, and nothing below will work.
+
+## 1. Local network, no server involved
+
+Put A and B on the same network. Do not configure any server yet.
+
+1. They find each other, both showing under Discovered.
+2. Add each other as contacts. **Both sides must add**, since a conversation only
+   reaches somebody listening for it.
+3. Send a message each way.
+4. Send a small file, A to B. It arrives, opens, and appears in Files under B's
+   name on A and A's name on B.
+5. **Send a file larger than 25 MB.** It should go through. There is no limit on
+   this path, and if you are told there is one, the direct connection is not
+   being recognised.
+
+This is the path that worked before any of the relay work, so a failure here is a
+regression rather than something new.
+
+## 2. Server configured, still on the same network
+
+Add S to both A and B under Settings, Servers.
+
+1. The server list shows **Online** with a round trip figure.
+2. The sidebar shows `1/1` with a green dot.
+3. **Test connections** reports Online within a few seconds.
+4. Messages still work.
+5. **A file over 25 MB still goes through.** Being connected to a server must not
+   impose the relayed limit while a direct connection exists. If this now fails,
+   the size split is reading the wrong thing.
+
+## 3. Separate networks, the real case
+
+Move B somewhere else. A phone hotspot is the easiest way, and using a different
+carrier from A's network is better than the same one.
+
+1. Both still show their server Online.
+2. Messages work in both directions. This is the existing relay path and does not
+   involve any of the new work.
+3. Presence: A and B should show each other online.
+
+### 3a. A small file, B to A
+
+The first genuinely new thing. Expect it to take a few seconds longer to start
+than on a local network, because a connection has to be built through S first.
+
+- It completes.
+- The hash check passes, meaning no error about the file not matching.
+- It opens on the receiving side.
+
+### 3b. A small file, A to B
+
+The reverse direction. Worth doing separately: the receiver dials the sender, so
+the two directions exercise different halves of the address exchange.
+
+### 3c. A file over 25 MB
+
+Should be **refused before sending**, in the picker, saying it is too large to
+send through a relay. Not accepted and then failed partway.
+
+### 3d. A file just under 25 MB
+
+Should go through. Watch the progress bar move steadily rather than in one jump
+at the end.
+
+## 4. Interruptions
+
+The parts most likely to be wrong, since they are the least exercised.
+
+### 4a. Pull the network mid-transfer
+
+Start a large transfer from 3d, then disconnect B's network for about ten seconds
+and reconnect it.
+
+- The transfer should **resume rather than restart**. Watch the progress figure:
+  it should carry on from roughly where it stopped.
+- Up to five attempts are made, five seconds apart. Beyond that it gives up and
+  says so.
+
+### 4b. Close the laptop lid mid-transfer
+
+The same thing by a different route, and the one likely to behave differently,
+because the whole process is suspended rather than just the network.
+
+### 4c. Restart the app mid-transfer
+
+Stop the receiving app partway and start it again.
+
+- The partial file should still be on disk.
+- Whether it resumes by itself or needs the sender to offer again is worth
+  recording either way. **This is not implemented**, so expect it to sit as
+  failed. What matters is that the partial file is kept and nothing is corrupted.
+
+### 4d. Restart the server mid-transfer
+
+`docker restart feed-server`. The transfer will fail. Once the server is back,
+both clients should reconnect within 30 seconds and a new transfer should work.
+
+## 5. Circuit limits
+
+Only if you want to see the failure mode described in the docs. On S:
+
+```bash
+# a deliberately small budget
+sed -i 's/max_circuit_bytes = 0/max_circuit_bytes = 2097152/' data/feed-server.toml
+docker restart feed-server
+```
+
+Send a 10 MB file. It should stop around 2 MB, then **retry and resume**,
+possibly several times, and eventually complete. This is the behaviour that makes
+a byte budget a nuisance rather than a wall.
+
+Put it back to `0` afterwards.
+
+## 6. Several files, and both directions at once
+
+1. Stage several files in the Files view and send them as one batch.
+2. Send from A to B and B to A at the same time.
+3. Check the Files view groups them under the right contact, with counts and a
+   total size that look right.
+
+## 7. Things that should fail cleanly
+
+Failure is fine. Failing in a way nobody can act on is not.
+
+| Do this | Expect |
+|---|---|
+| Add a server address with no `/p2p/` | Refused when you add it, saying what is missing |
+| Add a server that is not running | Listed as Offline with a reason, not a hang |
+| Send to a contact who is offline | Says so, does not sit at 0% forever |
+| Remove a contact who sent you files | Conversation goes, files stay, shown under their peer id |
+| Stop the server while chatting | Both show the server Offline within about 30 seconds |
+
+## What to write down
+
+For anything that fails, this is what makes it fixable:
+
+- Which step, and which machine was sending.
+- Whether A and B were on the same network.
+- The exact message shown.
+- The last few lines of `docker logs feed-server`.
+- Whether it fails every time or sometimes. **Sometimes is the more important
+  answer**, and the one people forget to check.
+
+## Known gaps before you start
+
+Not bugs, and worth knowing so they are not reported as such:
+
+- **A transfer interrupted by closing the app does not resume by itself.** The
+  partial file is kept and the offset is recorded, and nothing yet retries it on
+  startup.
+- **No hole punching.** Every relayed byte crosses the server, so a transfer
+  between two machines in the same building still goes out to S and back if they
+  cannot see each other directly. DCUtR would fix that and is not written.
+- **Groups cannot send files.** One to one only.
+- **Nothing checks free disk space**, so an unlimited transfer on a local network
+  can fill a disk.

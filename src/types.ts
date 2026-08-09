@@ -154,6 +154,12 @@ export interface FileTransfer {
   error: string | null;
   sent_at: number;
   /**
+   * Where the sender said they could be reached, as a JSON array.
+   *
+   * Only set on an incoming transfer from somebody not reachable directly.
+   */
+  addresses: string | null;
+  /**
    * Whether this has been looked at since it arrived.
    *
    * Only meaningful on an incoming file. Nothing arrives with a prompt, so this
@@ -189,8 +195,10 @@ export function describeProblem(file: PickedFile): string | null {
     return "could not be read";
   }
 
+  // Only ever set for somebody who has to be reached through a relay server.
+  // There is no limit to somebody on this network.
   if (file.too_large) {
-    return "too large to send";
+    return "too large to send through a relay";
   }
 
   return null;

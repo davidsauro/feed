@@ -26,6 +26,7 @@
 //! anyway that the transfer was offered to the peer now asking for it, so a
 //! contact cannot fetch a file meant for somebody else even if an id leaks.
 
+use std::time::Duration;
 use std::path::{Path, PathBuf};
 
 use futures::{AsyncReadExt, AsyncWriteExt};
@@ -177,6 +178,16 @@ async fn serve_inner(
         .path
         .ok_or_else(|| "that file is no longer on this node".to_string())?;
 
+    // Opens a connection first. On a local network there is already one and
+    // this does nothing. Otherwise it dials the relayed addresses the sender put
+    // in their offer, because there is no other way to reach them.
+    crate::reach_peer(
+        app,
+        peer,
+        crate::decode_addresses(transfer.addresses.as_deref()),
+    )
+    .await?;
+
     let key = FileKey::from_bytes(decode_key(&transfer.key)?);
     let chunks = file_crypto::chunk_count(transfer.size);
 
@@ -258,26 +269,86 @@ async fn read_up_to(file: &mut tokio::fs::File, buffer: &mut [u8]) -> Result<usi
 // Receiving
 // ---------------------------------------------------------------------------
 
+/// How many times a transfer is tried before it is given up on.
+const MAX_ATTEMPTS: usize = 5;
+
+/// How long to wait before trying again.
+///
+/// Long enough that a server which has just cut a circuit off has settled, and
+/// short enough that somebody watching a progress bar does not think it has
+/// stopped. Relay servers rate limit new circuits, typically to one every two
+/// minutes after an initial burst, so retrying faster than this would not help.
+const RETRY_DELAY: Duration = Duration::from_secs(5);
+
 /// Fetches a file that was offered to us, resuming if there is a partial one.
+///
+/// Tries more than once on purpose. A transfer that crosses a relay can be cut
+/// off partway for reasons that have nothing to do with either end: a server
+/// enforcing a limit on how much one connection may carry, a laptop lid closing,
+/// a network changing. All of those look the same from here, and all of them are
+/// worth another go, because the bytes already written are kept and the next
+/// attempt asks only for the rest.
 pub async fn fetch(
     app: AppHandle,
     mut control: libp2p_stream::Control,
     peer: PeerId,
     transfer_id: String,
 ) {
-    let outcome = fetch_inner(&app, &mut control, peer, &transfer_id).await;
+    let mut last_error = "could not start".to_string();
 
-    match outcome {
-        Ok(()) => {
-            let _ = crate::set_file_status(&app, &transfer_id, "complete", None);
+    for attempt in 1..=MAX_ATTEMPTS {
+        let before = progress_so_far(&app, &transfer_id);
+
+        match fetch_inner(&app, &mut control, peer, &transfer_id).await {
+            Ok(()) => {
+                let _ = crate::set_file_status(&app, &transfer_id, "complete", None);
+                let _ = app.emit("file-changed", &transfer_id);
+                return;
+            }
+
+            Err(error) => {
+                eprintln!(
+                    "could not receive a file from {} (attempt {} of {}): {}",
+                    peer, attempt, MAX_ATTEMPTS, error
+                );
+                last_error = error;
+            }
         }
-        Err(error) => {
-            eprintln!("could not receive a file from {}: {}", peer, error);
-            let _ = crate::set_file_status(&app, &transfer_id, "failed", Some(&error));
+
+        if attempt == MAX_ATTEMPTS {
+            break;
         }
+
+        // A verification failure means the bytes are wrong rather than missing,
+        // and asking for them again would fail the same way.
+        if last_error.contains("does not match") {
+            break;
+        }
+
+        let after = progress_so_far(&app, &transfer_id);
+
+        // Worth another go if the last attempt moved something, since that is a
+        // transfer being interrupted rather than refused. The first attempt is
+        // always retried, because it may simply have arrived before the sender
+        // was reachable.
+        if attempt > 1 && after <= before {
+            break;
+        }
+
+        tokio::time::sleep(RETRY_DELAY).await;
     }
 
+    let _ = crate::set_file_status(&app, &transfer_id, "failed", Some(&last_error));
     let _ = app.emit("file-changed", &transfer_id);
+}
+
+/// How many bytes of a transfer have been written, or zero if it cannot be read.
+fn progress_so_far(app: &AppHandle, transfer_id: &str) -> u64 {
+    crate::find_incoming_file(app, transfer_id)
+        .ok()
+        .flatten()
+        .map(|transfer| transfer.transferred)
+        .unwrap_or(0)
 }
 
 async fn fetch_inner(

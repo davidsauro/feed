@@ -55,13 +55,19 @@ pub const CHUNK_SIZE: usize = 64 * 1024;
 /// What one sealed chunk occupies.
 pub const SEALED_CHUNK_SIZE: usize = CHUNK_SIZE + 16;
 
-/// The largest file this node will send or accept.
+/// The largest file this node will send or accept **through a relay server**.
 ///
-/// Not a trust boundary. Both people have added each other, which is the
-/// decision that matters. This is a guard against a bug or a runaway loop on
-/// either side filling a disk, and it is far easier to raise later than to
-/// introduce once people are relying on the absence of a limit.
-pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+/// There is deliberately no limit on a file sent to somebody reachable directly.
+/// Those bytes stay on the local network, cost nobody anything, and pass between
+/// two people who have already added each other, which is the decision that
+/// matters. A limit there would be a rule with nothing behind it.
+///
+/// A relayed transfer is different. The bytes cross a machine somebody else pays
+/// for, and the person running it did not agree to any particular file. So this
+/// one exists, and it is checked by both ends: the sender so it can say
+/// something useful before sending, and the receiver so that the limit is not
+/// merely a courtesy the sender may decline to observe.
+pub const MAX_RELAYED_FILE_SIZE: u64 = 25 * 1024 * 1024;
 
 /// The key for one file, used for that file and nothing else.
 ///
@@ -345,7 +351,7 @@ mod tests {
         assert_eq!(chunk_count(1), 1);
         assert_eq!(chunk_count(CHUNK_SIZE as u64), 1);
         assert_eq!(chunk_count(CHUNK_SIZE as u64 + 1), 2);
-        assert_eq!(chunk_count(MAX_FILE_SIZE), 160);
+        assert_eq!(chunk_count(MAX_RELAYED_FILE_SIZE), 400);
     }
 
     /// The hash has to come out the same however the bytes were fed in, since one

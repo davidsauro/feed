@@ -382,6 +382,11 @@ The sidebar footer shows which instance a window belongs to.
 
 ## Running a Server
 
+Full command line walkthrough: **[`crates/server/DOCKER.md`](crates/server/DOCKER.md)**
+
+Checking it all works across two machines and a server:
+**[`TESTING.md`](TESTING.md)**
+
 Nobody needs this repository to run one:
 
 ```bash

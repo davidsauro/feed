@@ -848,7 +848,9 @@ async function stageFilesFor(peerId: string) {
 
   let picked: PickedFile[];
   try {
-    picked = await invoke<PickedFile[]>("inspect_files", { paths });
+    // The peer matters: a file only has a size limit when it has to cross a
+    // relay server to get there.
+    picked = await invoke<PickedFile[]>("inspect_files", { peerId, paths });
   } catch (error) {
     notify(`Could not read those files: ${error}`);
     return;
@@ -947,6 +949,16 @@ watch(view, async (now) => {
   }
 });
 
+/** Where this node can be reached through a relay, if anywhere. */
+async function relayedAddresses(): Promise<string[]> {
+  try {
+    return await invoke<string[]>("get_relayed_addresses");
+  } catch (error) {
+    console.error("Could not read our relayed addresses", error);
+    return [];
+  }
+}
+
 async function sendOneFile(contact: Contact, path: string) {
   const sentAt = Date.now();
 
@@ -961,6 +973,11 @@ async function sendOneFile(contact: Contact, path: string) {
 
     rememberFile(file);
 
+    // Where they should come and get it. Empty on a local network, where
+    // they can already reach us, and carried in the offer rather than
+    // announced separately so it arrives exactly when it is needed.
+    const addresses = await relayedAddresses();
+
     await invoke("send_direct", {
       peerId: contact.peer_id,
       message: JSON.stringify({
@@ -970,6 +987,7 @@ async function sendOneFile(contact: Contact, path: string) {
         size: file.size,
         hash: file.hash,
         key: file.key,
+        addresses,
         sentAt,
       }),
     });
@@ -981,7 +999,14 @@ async function sendOneFile(contact: Contact, path: string) {
 /** Handles a file somebody has offered us, and starts fetching it. */
 async function receiveOffer(
   sender: string,
-  offer: { id: string; name: string; size: number; hash: string; key: string },
+  offer: {
+    id: string;
+    name: string;
+    size: number;
+    hash: string;
+    key: string;
+    addresses?: string[];
+  },
   sentAt: number,
 ) {
   const contact = savedContacts.value.find((saved) => saved.peer_id === sender);
@@ -996,6 +1021,9 @@ async function receiveOffer(
         size: offer.size,
         hash: offer.hash,
         key: offer.key,
+        // Absent from an offer sent by an older node, which simply means they
+        // are only reachable directly.
+        addresses: offer.addresses ?? [],
         sentAt,
       },
     });

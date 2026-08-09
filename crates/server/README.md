@@ -21,6 +21,9 @@ this program can no more read a transfer than it can read a message.
 
 ## Running it
 
+**[DOCKER.md](DOCKER.md) is the step by step version**, from a bare command
+line, including the one setting file transfers will not work without.
+
 You do not need this repository. A published image is enough:
 
 ```bash
