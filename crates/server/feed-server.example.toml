@@ -31,7 +31,7 @@ identity_file = "identity.bin"
 # finds it can spend. The limits below are what stand between an open server and
 # whoever wants to take advantage of it.
 allowed_peers = [
-    # "12D3KooWCfRCgiQUEL6MkbU8rBNGySLjJCi3iYSKRpAc2w7u8TPW",
+    # "12D3KooWEXAMPLEonlyREPLACEwithTHEIRrealPEERid00000000",
 ]
 
 # Other servers to connect to. People using those servers and people using this

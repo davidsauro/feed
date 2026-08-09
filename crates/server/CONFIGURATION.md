@@ -174,7 +174,7 @@ means a new identity and a server nobody can reach any more.
 
 ```toml
 allowed_peers = [
-    "12D3KooWCfRCgiQUEL6MkbU8rBNGySLjJCi3iYSKRpAc2w7u8TPW",
+    "12D3KooWEXAMPLEonlyREPLACEwithTHEIRrealPEERid00000000",
 ]
 ```
 
@@ -202,7 +202,7 @@ cost a handshake, which is what `max_pending_incoming` is for.
 
 ```toml
 siblings = [
-    "/dns4/relay2.example.com/tcp/4001/p2p/12D3KooWCfRCgiQUEL6MkbU8rBNGySLjJCi3iYSKRpAc2w7u8TPW",
+    "/dns4/relay2.example.com/tcp/4001/p2p/12D3KooWEXAMPLEonlyREPLACEwithTHEIRrealPEERid00000000",
 ]
 ```
 

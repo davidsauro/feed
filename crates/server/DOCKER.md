@@ -140,7 +140,7 @@ clicked:
 cat >> data/feed-server.toml <<'EOF'
 
 allowed_peers = [
-  "12D3KooWCfRCgiQUEL6MkbU8rBNGySLjJCi3iYSKRpAc2w7u8TPW",
+  "12D3KooWEXAMPLEonlyREPLACEwithTHEIRrealPEERid00000000",
 ]
 EOF
 

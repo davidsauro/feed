@@ -453,15 +453,41 @@ async function loadGroups() {
 
 // --- Contacts -------------------------------------------------------------
 
+/**
+ * Adds somebody and starts listening for what they say.
+ *
+ * Both halves or neither. A contact saved without a subscription looks added and
+ * is not: messages to them fail with nobody listening, because listening is what
+ * makes the conversation exist. Undoing the save is better than leaving one of
+ * those behind for somebody to puzzle over.
+ */
 async function addContact(peerId: string, nickname: string) {
+  const id = peerId.trim();
+
   try {
-    await invoke("save_contact", { peerId, nickname });
-    await invoke("subscribe_direct", { peerId });
-    await loadContacts();
-    notify(`Added ${nickname}.`, "info");
+    await invoke("save_contact", { peerId: id, nickname });
   } catch (error) {
     notify(`Could not add contact: ${error}`);
+    return;
   }
+
+  try {
+    await invoke("subscribe_direct", { peerId: id });
+  } catch (error) {
+    // Put it back the way it was rather than leaving a contact that cannot
+    // receive anything.
+    try {
+      await invoke("delete_contact", { peerId: id });
+    } catch (cleanup) {
+      console.error("Could not undo a half-finished contact", cleanup);
+    }
+
+    notify(`Could not listen for ${nickname}, so they were not added: ${error}`);
+    return;
+  }
+
+  await loadContacts();
+  notify(`Added ${nickname}.`, "info");
 }
 
 async function renameContact(peerId: string, nickname: string) {

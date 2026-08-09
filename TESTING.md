@@ -53,6 +53,18 @@ Add S to both A and B under Settings, Servers.
 Move B somewhere else. A phone hotspot is the easiest way, and using a different
 carrier from A's network is better than the same one.
 
+**Adding each other now takes the peer id**, since discovery does not leave a
+local network. On each machine, click the id at the top of the sidebar to copy
+it, send it across, and use **Add someone by their ID** under Discovered. Both
+sides must do it.
+
+Copy it. Do not read it off the screen and type it. Every peer id starts
+`12D3KooW`, so a wrong one looks entirely plausible, and the result is two people
+subscribed to different conversations with no obvious sign of it. If you want to
+be sure, `docker logs feed-server` shows a `carrying` line per conversation, and
+two people who have added each other correctly share one: the second to connect
+produces one fewer line than they have contacts.
+
 1. Both still show their server Online.
 2. Messages work in both directions. This is the existing relay path and does not
    involve any of the new work.
