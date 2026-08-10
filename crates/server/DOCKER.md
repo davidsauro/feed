@@ -36,10 +36,6 @@ curl -s https://api.ipify.org
 If the server sits behind a router, forward TCP 4001 to it, and make sure the
 host firewall allows it:
 
-```bash
-sudo ufw allow 4001/tcp        # if you use ufw
-```
-
 ## 3. Make a directory for the server's identity
 
 ```bash
