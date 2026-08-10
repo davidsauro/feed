@@ -178,16 +178,6 @@ async fn serve_inner(
         .path
         .ok_or_else(|| "that file is no longer on this node".to_string())?;
 
-    // Opens a connection first. On a local network there is already one and
-    // this does nothing. Otherwise it dials the relayed addresses the sender put
-    // in their offer, because there is no other way to reach them.
-    crate::reach_peer(
-        app,
-        peer,
-        crate::decode_addresses(transfer.addresses.as_deref()),
-    )
-    .await?;
-
     let key = FileKey::from_bytes(decode_key(&transfer.key)?);
     let chunks = file_crypto::chunk_count(transfer.size);
 
@@ -367,6 +357,17 @@ async fn fetch_inner(
     // file on disk always ends on a boundary and resuming lands exactly right.
     let from_chunk = transfer.transferred / CHUNK_SIZE as u64;
     let mut transferred = from_chunk * CHUNK_SIZE as u64;
+
+    // A connection has to exist before a stream can be opened on it. On a local
+    // network there already is one and this does nothing. Otherwise it dials the
+    // relayed addresses the sender put in their offer, which is the only way to
+    // reach somebody behind a home router.
+    crate::reach_peer(
+        app,
+        peer,
+        crate::decode_addresses(transfer.addresses.as_deref()),
+    )
+    .await?;
 
     crate::set_file_status(app, transfer_id, "transferring", None)?;
 

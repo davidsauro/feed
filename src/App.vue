@@ -1791,6 +1791,10 @@ async function startSession() {
           size: data.size,
           hash: data.hash,
           key: data.key,
+          // Where to go and get it. Without these there is no way to reach
+          // somebody who is not on this network, and the offer is the only
+          // place they are carried.
+          addresses: Array.isArray(data.addresses) ? data.addresses : [],
         },
         claimedSentAt(data.sentAt),
       );
@@ -1967,6 +1971,8 @@ function parsePayload(
   size?: number;
   hash?: string;
   key?: string;
+  /** Where a file's sender says they can be reached. Offers only. */
+  addresses?: string[];
   groupId?: string;
   groupName?: string;
   members?: string[];
