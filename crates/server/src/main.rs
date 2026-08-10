@@ -216,6 +216,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
 
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                // Forwarding to a client is this server's entire job, so say so
+                // rather than leaving it to the mesh to work out.
+                //
+                // It also has to be said, because clients treat this server as
+                // an explicit peer and gossipsub refuses to graft one into a
+                // mesh: it answers every GRAFT with a PRUNE. Left one sided, the
+                // mesh here stays empty and nothing can be forwarded directly.
+                // Messages still arrive, by being advertised on the next
+                // heartbeat and asked for, which turns a round trip of
+                // milliseconds into one of seconds.
+                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+
                 println!("{} connected", peer_id);
             }
 
@@ -227,6 +239,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // Only when the last connection to them is gone: a peer that
                 // still has another one open hasn't left.
                 if num_established == 0 {
+                    // Or gossipsub would keep dialling somebody who has left.
+                    swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+
                     for topic in mirror.forget(&peer_id) {
                         stop_carrying(&mut swarm, &topic);
                     }

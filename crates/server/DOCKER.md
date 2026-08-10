@@ -204,6 +204,11 @@ container cannot write to `data/`. See below.
 Confirm the logs say `reachable at <your address>` and that the address is one
 that actually resolves to this machine. `docker logs feed-server | grep reachable`
 
+**Messages take a second or more to arrive.** The server is older than its
+clients. A server forwards to its clients directly only if it treats them as
+explicit peers, which older builds did not, leaving every message to wait for a
+gossip round. Pull the image again and restart. `latency_probe` measures it.
+
 **A transfer stops partway through, every time, at about the same point.** A
 circuit byte limit. `max_circuit_bytes` covers a whole relayed connection rather
 than one file, so it is reached sooner than people expect. Set it to `0`.

@@ -16,9 +16,14 @@ Throughout: **A** and **B** are the two machines, **S** is the server.
 | S carries conversations | `probe` example, twice | The message arrives |
 | S relays connections | `circuit_probe` example | `OK: 25 MiB crossed the relay` |
 | A reservation survives the app's ordering | `reserve_probe` example | `RESERVED: …/p2p-circuit/…` |
+| Messages cross quickly | `latency_probe` example | Single or low double digit ms |
 
 If `circuit_probe` fails where `probe` passed, stop. `external_addresses` is
 wrong, and nothing below will work.
+
+`latency_probe` times a message across the server. Anything approaching a second
+means the server is older than its clients and cannot forward directly, so every
+message is waiting on a gossip round instead.
 
 `reserve_probe` exists because the app dials a server first and asks to be
 reachable through it second, which the other probes do not. Run it with

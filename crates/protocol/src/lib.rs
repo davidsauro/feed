@@ -37,17 +37,26 @@ pub fn is_app_topic(topic: &str) -> bool {
     topic.starts_with(GROUP_TOPIC_PREFIX) || topic.starts_with(DIRECT_TOPIC_PREFIX)
 }
 
-/// How often gossipsub maintains its mesh.
+/// How often gossipsub maintains its mesh and sends gossip.
 ///
-/// The default is every second, which is more upkeep than a network of this size
-/// needs. Both ends use the same value so their meshes settle at the same pace.
-pub const GOSSIPSUB_HEARTBEAT: Duration = Duration::from_secs(10);
+/// The libp2p default, and it stays there. This was ten seconds for a while, on
+/// the reasoning that a network this small needs less upkeep. That saved
+/// nothing worth having and cost a great deal: the heartbeat also paces gossip,
+/// which is how a message reaches anybody it could not be forwarded to
+/// directly. Every such message waited for the next beat, so a chat message
+/// took seconds to arrive on a link with a thirty millisecond round trip.
+///
+/// The upkeep it saved is a few comparisons over a handful of topics. Latency
+/// people can feel is not worth trading for that.
+pub const GOSSIPSUB_HEARTBEAT: Duration = Duration::from_secs(1);
 
 /// How often gossipsub retries peers it has been told to stay connected to,
-/// counted in heartbeats. Three of them is thirty seconds, so a peer that was
-/// briefly unreachable is picked up again promptly rather than in the fifty
-/// minutes the default would give at our heartbeat.
-pub const GOSSIPSUB_EXPLICIT_PEER_TICKS: u64 = 3;
+/// counted in heartbeats.
+///
+/// Thirty of them at a one second heartbeat is thirty seconds, so a peer that
+/// was briefly unreachable is picked up again promptly rather than in the
+/// fifty minutes the default would give.
+pub const GOSSIPSUB_EXPLICIT_PEER_TICKS: u64 = 30;
 
 /// Builds the gossipsub configuration both ends use.
 ///
