@@ -1,6 +1,8 @@
 [package]
 name = "tauri-feed"
-version = "1.0.0"
+# From the workspace, like the other two crates, so one place decides and the
+# three cannot drift apart.
+version.workspace = true
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
