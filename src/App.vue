@@ -61,6 +61,25 @@ const peerNames = ref<Record<string, string>>({});
 
 /** Peer IDs mDNS can currently see, contacts and strangers alike. */
 const activePeers = ref<Set<string>>(new Set());
+
+/**
+ * When each contact was last heard from, in milliseconds since the epoch.
+ *
+ * Presence for people we hold no connection to. That covers anybody reached
+ * through a relay server, where both sides are connected to the server and
+ * neither to the other, so a connection cannot answer the question even while
+ * messages pass perfectly. They say so instead, every fifteen seconds.
+ */
+const seenPeers = ref<Record<string, number>>({});
+
+/**
+ * Ticks so a contact who stops announcing turns grey without anything else
+ * happening.
+ *
+ * Presence expiring is the one thing here that is not driven by an event: an
+ * announcement that does not arrive produces nothing to react to.
+ */
+const clockTick = ref(Date.now());
 const savedContacts = ref<Contact[]>([]);
 const groups = ref<Group[]>([]);
 
@@ -314,8 +333,37 @@ const currentFiles = computed(() => {
   return files.value.filter((file) => file.peer_id === selection.value?.id);
 });
 
+/**
+ * How long a contact stays online after their last announcement.
+ *
+ * Three intervals, so a single one going astray does not blink somebody offline
+ * who is sitting right there. The cost is that somebody who really has gone
+ * takes up to this long to turn grey, which is the right way round: a wrong
+ * "offline" is far more annoying than a late one.
+ */
+const PRESENCE_TIMEOUT = 45_000;
+
+/**
+ * Everybody reachable, by either means.
+ *
+ * A connection is the better answer where there is one, because it is a fact
+ * about right now rather than a claim made a moment ago. Announcements cover
+ * everybody else, which is anybody reached through a relay server.
+ */
+const onlinePeers = computed(() => {
+  const online = new Set(activePeers.value);
+
+  for (const [peer, seen] of Object.entries(seenPeers.value)) {
+    if (clockTick.value - seen < PRESENCE_TIMEOUT) {
+      online.add(peer);
+    }
+  }
+
+  return online;
+});
+
 const selectedIsOnline = computed(
-  () => selectedContact.value !== null && activePeers.value.has(selectedContact.value.peer_id),
+  () => selectedContact.value !== null && onlinePeers.value.has(selectedContact.value.peer_id),
 );
 
 /** Unread flags for one kind, keyed by bare id the way the lists expect them. */
@@ -1474,6 +1522,12 @@ async function confirmRemoval() {
       }
 
       deleted += await invoke<number>("delete_contact", { peerId: pending.id });
+
+      // Forget when they were last heard from as well, or adding them back
+      // would show them online on the strength of an announcement made before
+      // they were removed.
+      const { [pending.id]: _forgotten, ...stillKnown } = seenPeers.value;
+      seenPeers.value = stillKnown;
       await invoke("unsubscribe_direct", { peerId: pending.id });
       await loadContacts();
       await loadGroups();
@@ -1762,6 +1816,16 @@ async function startSession() {
       return;
     }
 
+    // Anything arriving from somebody is proof they are there, whether or not it
+    // was sent to say so. Recorded before the payload is routed so a message
+    // counts as much as an announcement does.
+    seenPeers.value = { ...seenPeers.value, [sender]: Date.now() };
+
+    if (data.type === "presence") {
+      // Nothing further. Being here was the whole message.
+      return;
+    }
+
     if (data.type === "chat" && data.id && typeof data.text === "string") {
       await receiveChatMessage(sender, data.id, data.text, claimedSentAt(data.sentAt));
     } else if (data.type === "ack" && data.id) {
@@ -2028,7 +2092,7 @@ function parsePayload(
       <ContactList
         class="fill"
         :contacts="savedContacts"
-        :online-peers="activePeers"
+        :online-peers="onlinePeers"
         :unread="contactUnread"
         :selected-peer-id="selectedContact?.peer_id ?? null"
         @select="selectContact"

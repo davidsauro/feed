@@ -74,6 +74,20 @@ const NAME_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Listen on every network interface, and let the OS pick the port.
 const LISTEN_ADDRESS: &str = "/ip4/0.0.0.0/tcp/0";
 
+/// How often this node tells each contact it is still here.
+///
+/// Presence is normally read off a connection, which says exactly the right
+/// thing: the peer is there right now. That only works for somebody we hold a
+/// connection to, which on a local network is everybody and across the internet
+/// is nobody. Two people talking through a server each hold a connection to the
+/// server and none to each other, so neither can see the other by that means
+/// even while their messages arrive perfectly.
+///
+/// So for those, presence is announced instead. It travels the same sealed path
+/// as a message, which means it works exactly where messages work, and the
+/// server carrying it learns nothing it did not already know.
+const PRESENCE_INTERVAL: Duration = Duration::from_secs(15);
+
 /// How long to wait for a connection to somebody we are about to fetch a file
 /// from.
 ///
@@ -2676,6 +2690,12 @@ struct Links {
     /// A list per peer, since two transfers from the same person can be waiting
     /// on the same connection.
     pending_dials: HashMap<PeerId, Vec<oneshot::Sender<Result<(), String>>>>,
+    /// Contacts whose conversations this node is listening to.
+    ///
+    /// Kept so presence can be announced to each of them. Held here rather than
+    /// read from the database, because the network task has no passphrase and
+    /// this is the same list it was told to subscribe to anyway.
+    direct_peers: HashSet<PeerId>,
 }
 
 impl Links {
@@ -2723,6 +2743,34 @@ fn reserve_through(swarm: &mut Swarm<AppBehaviour>, address: &Multiaddr) -> Opti
             eprintln!("could not ask {} for a reservation: {}", circuit, error);
             None
         }
+    }
+}
+
+/// Tells each contact this node is still here.
+///
+/// Only those we have no connection to. A connection already answers the
+/// question better than any announcement could, and saying so twice would be
+/// traffic spent on something already known.
+///
+/// Failures are ignored on purpose. Publishing to somebody who is not listening
+/// is the ordinary case for a contact who is offline, and is not worth a line of
+/// output every fifteen seconds.
+fn announce_presence(swarm: &mut Swarm<AppBehaviour>, keypair: &Keypair, links: &Links) {
+    let away: Vec<PeerId> = links
+        .direct_peers
+        .iter()
+        .filter(|peer| !swarm.is_connected(peer))
+        .copied()
+        .collect();
+
+    if away.is_empty() {
+        return;
+    }
+
+    let payload = serde_json::json!({ "type": "presence" }).to_string();
+
+    for peer in away {
+        let _ = publish_direct(swarm, keypair, &peer.to_string(), &payload);
     }
 }
 
@@ -3428,10 +3476,13 @@ fn handle_network_command(
         }
 
         NetworkCommand::SubscribeToDirect { peer_id } => {
-            match parse_peer(&peer_id).and_then(|peer| direct_topic(keypair, &peer)) {
-                Ok(topic) => {
+            match parse_peer(&peer_id).and_then(|peer| direct_topic(keypair, &peer).map(|t| (peer, t)))
+            {
+                Ok((peer, topic)) => {
                     if let Err(error) = swarm.behaviour_mut().groups.subscribe(&topic) {
                         eprintln!("could not listen for messages from {}: {}", peer_id, error);
+                    } else {
+                        links.direct_peers.insert(peer);
                     }
                 }
                 Err(error) => eprintln!("cannot listen for {}: {}", peer_id, error),
@@ -3439,9 +3490,11 @@ fn handle_network_command(
         }
 
         NetworkCommand::UnsubscribeFromDirect { peer_id } => {
-            match parse_peer(&peer_id).and_then(|peer| direct_topic(keypair, &peer)) {
-                Ok(topic) => {
+            match parse_peer(&peer_id).and_then(|peer| direct_topic(keypair, &peer).map(|t| (peer, t)))
+            {
+                Ok((peer, topic)) => {
                     swarm.behaviour_mut().groups.unsubscribe(&topic);
+                    links.direct_peers.remove(&peer);
                 }
                 Err(error) => eprintln!("cannot stop listening for {}: {}", peer_id, error),
             }
@@ -3641,6 +3694,7 @@ async fn run_network(
     let mut links = Links::default();
 
     let mut redial = tokio::time::interval(SERVER_REDIAL_INTERVAL);
+    let mut presence = tokio::time::interval(PRESENCE_INTERVAL);
 
     // The first tick of a Tokio interval fires immediately. Nothing is
     // configured yet at this point, so it does nothing, which is fine.
@@ -3662,6 +3716,10 @@ async fn run_network(
 
             _ = redial.tick() => {
                 redial_missing_servers(&mut swarm, &links.servers);
+            }
+
+            _ = presence.tick() => {
+                announce_presence(&mut swarm, &keypair_for_crypto, &links);
             }
         }
     }
