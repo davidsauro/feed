@@ -1360,14 +1360,14 @@ dependencies = [
 
 [[package]]
 name = "feed-protocol"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libp2p",
 ]
 
 [[package]]
 name = "feed-server"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "feed-protocol",
  "futures",
@@ -5310,7 +5310,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-feed"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
