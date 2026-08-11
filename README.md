@@ -423,6 +423,46 @@ If this fails where the first probe passed, the server almost certainly needs
 `external_addresses` set. One listening on `0.0.0.0`, which every container does,
 cannot tell a client what address to be reached at.
 
+## Branches and releasing
+
+Work happens on `develop`. `main` holds what has been released, and reaching it
+goes through a pull request rather than a push.
+
+**The version in `package.json` decides everything.** Merging into `main` with a
+version that has not been released builds all three desktop platforms and the
+server image, tags the commit, and opens a **draft** release with the installers
+attached. Merging with a version that has already been released does nothing at
+all, so ordinary merges cost nothing and only a deliberate bump publishes.
+
+So a release is:
+
+1. On `develop`, bump the version. Four files declare it, and three of them
+   inherit from the workspace, so it is `package.json`, the workspace
+   `Cargo.toml`, and `src-tauri/tauri.conf.json`.
+2. Open a pull request into `main` and merge it.
+3. Wait for the build. Three desktop platforms take a while.
+4. Find the draft release, write the notes, publish it.
+
+No tag is ever created by hand. The draft exists so that nothing becomes public
+until somebody has written the notes, and so the binaries can be tried before
+anybody else sees them.
+
+The server image does not wait for that. It publishes to both registries as soon
+as it builds, tagged with the version and moving `latest`, since an image is not
+something a draft can hold.
+
+### The workflows
+
+| Workflow | When | What it does |
+|---|---|---|
+| `release.yml` | Push to `main` | Decides whether to release, runs the other two, opens the draft |
+| `build-desktop.yml` | Called, or by hand | Windows, macOS and Linux installers, left as artifacts |
+| `publish-server.yml` | Called, or by hand | The relay server image, to GHCR and Docker Hub |
+
+Either build can be run on its own from the Actions tab to try something without
+releasing. Run that way they leave artifacts on the run page, which expire after
+ninety days, and touch no release.
+
 ## Building for other platforms
 
 The long term aim is binaries for Windows, Linux, macOS, Android and iOS. Some

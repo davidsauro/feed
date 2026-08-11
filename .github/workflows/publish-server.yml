@@ -13,19 +13,19 @@
 
 name: Publish server image
 
-# Deliberately not on every push to main. Building and publishing both
-# architectures takes several minutes, and while the first release is still being
-# worked towards, most commits are not something anyone should be pulling.
+# Called by the release workflow, which passes the version being released, and
+# available on its own for publishing whatever is on main.
 #
-# So it runs when asked — Actions → Publish server image → Run workflow — and
-# automatically for a version tag, which is the point at which an image is worth
-# publishing without being asked:
-#
-#     git tag v0.1.0 && git push origin v0.1.0
+# Deliberately not on every push. Building both architectures takes several
+# minutes and most commits are not something anyone should be pulling.
 on:
+  workflow_call:
+    inputs:
+      version:
+        description: The version being released, without a leading v.
+        required: false
+        type: string
   workflow_dispatch:
-  push:
-    tags: ["v*"]
 
 jobs:
   test:
@@ -107,12 +107,11 @@ jobs:
           images: ${{ steps.registries.outputs.images }}
           tags: |
             type=sha,format=short
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            # Both cases move `latest`: a release, and a deliberate run from
-            # main. Without the tag half, publishing v0.1.0 would leave `latest`
-            # pointing at whatever came before it.
-            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/v') }}
+            # The version comes from the caller rather than from the git ref,
+            # because a release is cut from main before any tag exists. Absent
+            # on a manual run, where the sha and `latest` are all there is.
+            type=raw,value=${{ inputs.version }},enable=${{ inputs.version != '' }}
+            type=raw,value=latest
           labels: |
             org.opencontainers.image.title=feed-server
             org.opencontainers.image.description=Relay for a peer-to-peer chat network, which carries traffic it cannot read
