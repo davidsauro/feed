@@ -97,10 +97,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Every platform's artifact, each landing in a directory named after it.
+      # Only the installers, each landing in a directory named after it.
+      #
+      # The pattern is not optional. Building the server image uploads a build
+      # record of its own as an artifact, and downloading everything means
+      # fetching that too, which is both a file nobody wants attached to a
+      # release and, the one time it failed, enough to fail this whole job after
+      # every build had already succeeded.
       - uses: actions/download-artifact@v4
         with:
           path: installers
+          pattern: "*-installers"
 
       - name: List what was built
         run: find installers -type f | sort
