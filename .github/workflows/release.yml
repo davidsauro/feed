@@ -22,6 +22,10 @@ jobs:
   decide:
     name: Decide whether to release
     runs-on: ubuntu-latest
+
+    # Enough to read the tags and ask whether a release already exists.
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.read.outputs.version }}
       releasing: ${{ steps.read.outputs.releasing }}
@@ -54,16 +58,27 @@ jobs:
             echo "::notice::Releasing v$version."
           fi
 
+  # A called workflow cannot hold more permission than the job calling it, and a
+  # job that says nothing gets the repository default. So both of these spell out
+  # what the workflow they call is going to ask for, or the run is rejected
+  # before any of it starts.
   desktop:
     name: Desktop
     needs: decide
     if: needs.decide.outputs.releasing == 'true'
+    permissions:
+      contents: read
     uses: ./.github/workflows/build-desktop.yml
 
   server:
     name: Server image
     needs: decide
     if: needs.decide.outputs.releasing == 'true'
+    permissions:
+      contents: read
+      # What the image push needs, and the reason the first attempt at this was
+      # rejected outright.
+      packages: write
     uses: ./.github/workflows/publish-server.yml
     with:
       version: ${{ needs.decide.outputs.version }}
