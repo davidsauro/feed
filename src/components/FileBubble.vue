@@ -6,7 +6,7 @@
  * sending somebody a file is a thing you said to them.
  */
 import type { FileTransfer } from "../types";
-import { describeSize } from "../types";
+import { describeSize, describeTransferError } from "../types";
 
 const props = defineProps<{
   file: FileTransfer;
@@ -21,8 +21,7 @@ const emit = defineEmits<{
 
 /** Only the receiving side can ask for the rest, since only it knows how much
  * it already has. */
-const canResume = () =>
-  props.file.direction === "incoming" && props.file.status === "failed";
+const canResume = () => props.file.status === "failed";
 
 /** How far along, as a percentage, for the bar under an active transfer. */
 const progress = () => {
@@ -48,7 +47,7 @@ const detail = () => {
     case "transferring":
       return `${describeSize(props.file.transferred)} of ${size}`;
     case "failed":
-      return props.file.error ?? "did not arrive";
+      return props.file.error ? describeTransferError(props.file.error) : "did not arrive";
     default:
       return size;
   }
@@ -73,7 +72,7 @@ const detail = () => {
 
       <span class="text">
         <span class="name" :title="file.name">{{ file.name }}</span>
-        <span class="detail">{{ detail() }}</span>
+        <span class="detail" :title="file.error ?? undefined">{{ detail() }}</span>
       </span>
 
       <span v-if="canResume()" class="actions">
@@ -179,6 +178,8 @@ const detail = () => {
 .detail {
   font-size: 11px;
   opacity: 0.75;
+  /* A failure can carry an address, which has no spaces to break at. */
+  overflow-wrap: anywhere;
 }
 
 .actions {

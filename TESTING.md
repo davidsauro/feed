@@ -139,8 +139,12 @@ Stop the receiving app partway and start it again.
   spend a full dial timeout, so it keeps trying for the better part of three
   minutes. Bringing the sender back within that window picks the transfer up
   without pressing anything again.
-- The sender does nothing. They do not re-offer, and their own row saying failed
-  does not stop them serving.
+- The sender has a Resume button too. Pressing it offers the same file again
+  rather than sending a second copy, and the receiver picks up from where it
+  stopped. Either side can start it off.
+- Failures should read as a short phrase, not a paragraph. The full text is on
+  hover. A relay failure in particular arrives as three hundred characters of
+  nested causes and two addresses, and a row is not the place for it.
 
 ### 4d. Restart the server mid-transfer
 

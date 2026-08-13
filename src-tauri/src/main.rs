@@ -1234,6 +1234,44 @@ fn get_files(app: AppHandle) -> Result<Vec<FileTransfer>, String> {
     Ok(files)
 }
 
+/// Offers a file again, for a transfer that stopped partway.
+///
+/// The sender's half of resuming. Only the receiver can ask for the rest, since
+/// only it knows how much it holds, so this does not send anything itself: it
+/// puts the record back to offered and hands back what the offer needs. The
+/// receiver takes it from there and asks from where it stopped.
+#[tauri::command]
+fn reoffer_file(app: AppHandle, id: String) -> Result<FileTransfer, String> {
+    let transfer = find_outgoing_file_by_id(&app, &id)?
+        .ok_or_else(|| "no such transfer".to_string())?;
+
+    if transfer.status == "complete" {
+        return Err("that one already arrived".to_string());
+    }
+
+    set_file_status(&app, &id, "offered", None)?;
+
+    Ok(transfer)
+}
+
+/// One outgoing transfer, whoever it was for.
+fn find_outgoing_file_by_id(app: &AppHandle, id: &str) -> Result<Option<FileTransfer>, String> {
+    let conn = get_db_connection(app).map_err(|e| e.to_string())?;
+
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT {} FROM files WHERE id = ?1 AND direction = 'outgoing'",
+            FILE_COLUMNS
+        ))
+        .map_err(|e| e.to_string())?;
+
+    let mut rows = statement
+        .query_map((id,), read_file_row)
+        .map_err(|e| e.to_string())?;
+
+    rows.next().transpose().map_err(|e| e.to_string())
+}
+
 /// Asks again for the rest of a transfer that stopped partway.
 ///
 /// The bytes already written are kept and the offset is recorded, so this picks
@@ -1569,11 +1607,18 @@ async fn receive_file(
 
     insert_file(&app, &transfer)?;
 
+    // Read back rather than returned as built. An offer for a transfer we
+    // already have is a sender asking us to pick it up again, and the insert
+    // ignores it, so what is on disk is the record that matters: its path, and
+    // how far it already got. Returning the freshly built one would report zero
+    // progress and a path that was never used.
+    let stored = find_incoming_file(&app, &id)?.unwrap_or(transfer);
+
     // Its own task, so a large file does not hold up anything else.
     let control = state.0.clone();
     tauri::async_runtime::spawn(file_transfer::fetch(app.clone(), control, peer, id));
 
-    Ok(transfer)
+    Ok(stored)
 }
 
 fn insert_file(app: &AppHandle, transfer: &FileTransfer) -> Result<(), String> {
@@ -3865,6 +3910,7 @@ fn main() {
             get_files,
             mark_files_seen,
             resume_file,
+            reoffer_file,
             inspect_files,
             // Groups
             save_group,

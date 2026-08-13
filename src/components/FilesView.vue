@@ -17,7 +17,14 @@
  */
 import { computed } from "vue";
 import type { Contact, FileTransfer, PickedFile } from "../types";
-import { canSend, describeProblem, describeSize, describeWhen, shortPeerId } from "../types";
+import {
+  canSend,
+  describeProblem,
+  describeSize,
+  describeTransferError,
+  describeWhen,
+  shortPeerId,
+} from "../types";
 
 const props = defineProps<{
   files: FileTransfer[];
@@ -36,6 +43,14 @@ const props = defineProps<{
    * while you are reading them, instead of clearing under your eyes.
    */
   newlyArrived: Set<string>;
+  /**
+   * Who is reachable right now.
+   *
+   * Shown beside each name because this is where somebody decides to send
+   * something, and a transfer to a contact who is not there will sit waiting
+   * rather than failing. Worth knowing before pressing Send, not after.
+   */
+  onlinePeers: Set<string>;
 }>();
 
 const emit = defineEmits<{
@@ -60,7 +75,7 @@ const emit = defineEmits<{
  * is nothing for the sender to retry.
  */
 const canResume = (file: FileTransfer) =>
-  file.direction === "incoming" && file.status === "failed";
+  file.status === "failed";
 
 interface Group {
   peerId: string;
@@ -171,7 +186,7 @@ function describeStatus(file: FileTransfer): string {
     case "offered":
       return "waiting for them";
     case "failed":
-      return file.error ?? "failed";
+      return file.error ? describeTransferError(file.error) : "failed";
     default:
       return file.status;
   }
@@ -252,8 +267,18 @@ const inFlight = (file: FileTransfer) =>
       >
         <header class="group-header">
           <span class="who">
-            <span class="name" :class="{ unknown: group.unknown }" :title="group.peerId">
-              {{ group.name }}
+            <span class="who-line">
+              <!-- Not shown for somebody who is no longer a contact, where
+                   there is nothing to be reachable for. -->
+              <span
+                v-if="!group.unknown"
+                class="presence"
+                :class="{ online: onlinePeers.has(group.peerId) }"
+                :title="onlinePeers.has(group.peerId) ? 'Online' : 'Offline'"
+              />
+              <span class="name" :class="{ unknown: group.unknown }" :title="group.peerId">
+                {{ group.name }}
+              </span>
             </span>
             <span class="summary">{{ describeCounts(group) }}</span>
           </span>
@@ -352,7 +377,9 @@ const inFlight = (file: FileTransfer) =>
                 <!-- Turned up while you were somewhere else. -->
                 <span v-if="newlyArrived.has(file.id)" class="new">New</span>
               </span>
-              <span class="meta">
+              <!-- The full text on hover, since the detail is what somebody
+                   wants at exactly the moment they are working out why. -->
+              <span class="meta" :title="file.error ?? undefined">
                 {{ describeSize(file.size) }} · {{ describeStatus(file) }} ·
                 {{ describeWhen(file.sent_at) }}
               </span>
@@ -514,6 +541,25 @@ const inFlight = (file: FileTransfer) =>
   display: flex;
   flex-direction: column;
   min-width: 0;
+}
+
+.who-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.presence {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: var(--offline);
+}
+
+.presence.online {
+  background-color: var(--online);
 }
 
 .name {
@@ -749,6 +795,9 @@ const inFlight = (file: FileTransfer) =>
 .meta {
   font-size: 11px;
   color: var(--text-faint);
+  /* A failure can carry an address, which has no spaces to break at and would
+     otherwise run straight through the buttons beside it. */
+  overflow-wrap: anywhere;
 }
 
 .row.failed .meta {
