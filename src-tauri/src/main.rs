@@ -1256,6 +1256,12 @@ async fn resume_file(
     let peer = parse_peer(&transfer.peer_id)?;
     let control = state.0.clone();
 
+    // Marked before the work starts, so pressing the button visibly does
+    // something. Reaching somebody who is not there spends a full dial timeout
+    // per attempt, and the row would otherwise sit unchanged for minutes.
+    set_file_status(&app, &id, "pending", Some("reaching them"))?;
+    emit_to_frontend(&app, "file-changed", &id);
+
     tauri::async_runtime::spawn(file_transfer::fetch(app.clone(), control, peer, id));
 
     Ok(())

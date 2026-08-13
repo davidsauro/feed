@@ -165,7 +165,9 @@ function describeStatus(file: FileTransfer): string {
     case "transferring":
       return incoming ? "receiving" : "sending";
     case "pending":
-      return "starting";
+      // The backend says what it is waiting on, which for a peer who is not
+      // answering is the difference between a progress report and a frozen row.
+      return file.error ?? "starting";
     case "offered":
       return "waiting for them";
     case "failed":

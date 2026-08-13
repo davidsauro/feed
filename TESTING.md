@@ -134,6 +134,11 @@ Stop the receiving app partway and start it again.
   once.
 - A **Resume** button should be on that row. Pressing it asks for the rest and
   the progress bar should carry on from where it stopped rather than from zero.
+- Pressing it while the sender is **offline** should say `reaching them`, then
+  `no answer, trying again (2 of 5)` and so on. Five attempts, each able to
+  spend a full dial timeout, so it keeps trying for the better part of three
+  minutes. Bringing the sender back within that window picks the transfer up
+  without pressing anything again.
 - The sender does nothing. They do not re-offer, and their own row saying failed
   does not stop them serving.
 

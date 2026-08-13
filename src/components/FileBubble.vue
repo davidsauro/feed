@@ -44,7 +44,7 @@ const detail = () => {
     case "offered":
       return `${size}, waiting for them to fetch it`;
     case "pending":
-      return `${size}, starting`;
+      return `${size}, ${props.file.error ?? "starting"}`;
     case "transferring":
       return `${describeSize(props.file.transferred)} of ${size}`;
     case "failed":
