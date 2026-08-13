@@ -1108,6 +1108,22 @@ async function receiveOffer(
   }
 }
 
+/**
+ * Asks again for the rest of a transfer that stopped partway.
+ *
+ * Only the receiving side can do this, because the receiver is the one who
+ * knows how much it already has. The sender serves whatever chunk it is asked
+ * for, so nothing on their end needs to be retried or re-offered.
+ */
+async function resumeFile(file: FileTransfer) {
+  try {
+    await invoke("resume_file", { id: file.id });
+    await loadFiles();
+  } catch (error) {
+    notify(`Could not pick that up again: ${error}`);
+  }
+}
+
 async function openFile(file: FileTransfer) {
   if (!file.path) {
     return;
@@ -2168,6 +2184,7 @@ function parsePayload(
         @clear="clearStaged"
         @open="openFile"
         @reveal="revealFile"
+        @resume="resumeFile"
       />
 
       <ChatPane
@@ -2184,6 +2201,7 @@ function parsePayload(
         @attach="attachFiles"
         @open-file="openFile"
         @reveal-file="revealFile"
+        @resume-file="resumeFile"
       />
 
       <ChatPane

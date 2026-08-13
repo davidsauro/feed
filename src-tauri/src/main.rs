@@ -1234,6 +1234,33 @@ fn get_files(app: AppHandle) -> Result<Vec<FileTransfer>, String> {
     Ok(files)
 }
 
+/// Asks again for the rest of a transfer that stopped partway.
+///
+/// The bytes already written are kept and the offset is recorded, so this picks
+/// up where it left off rather than starting again. Nothing is negotiated: the
+/// receiver knows how much it has, and the sender serves from whatever chunk it
+/// is asked for regardless of what its own record says happened.
+#[tauri::command]
+async fn resume_file(
+    app: AppHandle,
+    state: State<'_, FileControl>,
+    id: String,
+) -> Result<(), String> {
+    let transfer = find_incoming_file(&app, &id)?
+        .ok_or_else(|| "no such transfer".to_string())?;
+
+    if transfer.status == "complete" {
+        return Err("that one already arrived".to_string());
+    }
+
+    let peer = parse_peer(&transfer.peer_id)?;
+    let control = state.0.clone();
+
+    tauri::async_runtime::spawn(file_transfer::fetch(app.clone(), control, peer, id));
+
+    Ok(())
+}
+
 /// Marks everything that has finished arriving as looked at.
 ///
 /// Called when the files view is opened. A transfer still in flight is left
@@ -2436,6 +2463,22 @@ fn fail_stale_sends(app: AppHandle) -> Result<(), String> {
 
     conn.execute(
         "UPDATE messages SET status = 'failed' WHERE status = 'sending'",
+        (),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // A transfer in flight when the app stopped is not in flight now, and
+    // nothing else will ever say so. Left alone it reads as "receiving" for
+    // ever, with a progress bar frozen at wherever it got to, which is the
+    // interface stating something that was true once and is not any more.
+    //
+    // How far it got is deliberately kept. That number is what lets it carry on
+    // from where it stopped rather than starting again.
+    conn.execute(
+        "UPDATE files
+            SET status = 'failed',
+                error = 'interrupted, and can be resumed'
+          WHERE status IN ('transferring', 'pending')",
         (),
     )
     .map_err(|e| e.to_string())?;
@@ -3815,6 +3858,7 @@ fn main() {
             // Files
             get_files,
             mark_files_seen,
+            resume_file,
             inspect_files,
             // Groups
             save_group,

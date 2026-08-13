@@ -48,7 +48,19 @@ const emit = defineEmits<{
   clear: [peerId: string];
   open: [file: FileTransfer];
   reveal: [file: FileTransfer];
+  /** Ask again for the rest of one that stopped partway. */
+  resume: [file: FileTransfer];
 }>();
+
+/**
+ * Whether asking again could finish this one off.
+ *
+ * Only ever the receiving side. The receiver is the one that knows how much it
+ * already has, and the sender serves whatever chunk it is asked for, so there
+ * is nothing for the sender to retry.
+ */
+const canResume = (file: FileTransfer) =>
+  file.direction === "incoming" && file.status === "failed";
 
 interface Group {
   peerId: string;
@@ -348,7 +360,13 @@ const inFlight = (file: FileTransfer) =>
               </span>
             </span>
 
-            <span v-if="file.status === 'complete'" class="actions">
+            <span v-if="canResume(file)" class="actions">
+              <button class="resume" title="Ask for the rest" @click="emit('resume', file)">
+                Resume
+              </button>
+            </span>
+
+            <span v-else-if="file.status === 'complete'" class="actions">
               <button class="action" title="Open" @click="emit('open', file)">
                 <svg
                   viewBox="0 0 24 24"
@@ -756,6 +774,21 @@ const inFlight = (file: FileTransfer) =>
   display: flex;
   gap: 2px;
   flex: none;
+}
+
+/* Only on a transfer that stopped partway, where the bytes already written are
+   kept and asking again carries on from there. */
+.resume {
+  padding: 4px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.resume:hover {
+  background-color: var(--bg-hover);
 }
 
 .action {

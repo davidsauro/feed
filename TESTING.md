@@ -128,10 +128,14 @@ because the whole process is suspended rather than just the network.
 
 Stop the receiving app partway and start it again.
 
-- The partial file should still be on disk.
-- Whether it resumes by itself or needs the sender to offer again is worth
-  recording either way. **This is not implemented**, so expect it to sit as
-  failed. What matters is that the partial file is kept and nothing is corrupted.
+- On restart it should read as **interrupted, and can be resumed**, not as still
+  receiving. A transfer that was in flight when the app stopped is not in flight
+  now, and saying otherwise is the interface reporting something that was true
+  once.
+- A **Resume** button should be on that row. Pressing it asks for the rest and
+  the progress bar should carry on from where it stopped rather than from zero.
+- The sender does nothing. They do not re-offer, and their own row saying failed
+  does not stop them serving.
 
 ### 4d. Restart the server mid-transfer
 
@@ -188,9 +192,9 @@ For anything that fails, this is what makes it fixable:
 
 Not bugs, and worth knowing so they are not reported as such:
 
-- **A transfer interrupted by closing the app does not resume by itself.** The
-  partial file is kept and the offset is recorded, and nothing yet retries it on
-  startup.
+- **A transfer interrupted by closing the app does not resume by itself.** It is
+  marked resumable on the next start and there is a Resume button, but nothing
+  picks it up unprompted.
 - **No hole punching.** Every relayed byte crosses the server, so a transfer
   between two machines in the same building still goes out to S and back if they
   cannot see each other directly. DCUtR would fix that and is not written.
