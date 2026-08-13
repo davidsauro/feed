@@ -184,7 +184,9 @@ function describeStatus(file: FileTransfer): string {
       // answering is the difference between a progress report and a frozen row.
       return file.error ?? "starting";
     case "offered":
-      return "waiting for them";
+      // Carries which attempt it is on, because waiting for somebody who is not
+      // there should not read like waiting for somebody who is.
+      return file.error ?? "waiting for them";
     case "failed":
       return file.error ? describeTransferError(file.error) : "failed";
     default:

@@ -1234,6 +1234,90 @@ fn get_files(app: AppHandle) -> Result<Vec<FileTransfer>, String> {
     Ok(files)
 }
 
+/// How many times an offer is put in front of somebody before giving up.
+const OFFER_ATTEMPTS: usize = 4;
+
+/// How long to give them to start pulling before offering again.
+///
+/// Somebody who is there begins within a second or two, so this is mostly spent
+/// waiting on somebody who is not.
+const OFFER_WAIT: Duration = Duration::from_secs(15);
+
+/// Watches an offer, and gives up on it out loud.
+///
+/// An offer is an ordinary message, and nothing stores those. Sent to somebody
+/// who is not running, it reaches the server, reaches nobody, and is gone. The
+/// record said "waiting for them" and would have said it for ever, which reads
+/// as a promise that it will go through when they return. It will not.
+///
+/// So the offer is repeated a few times, in case they appear, and then called
+/// what it is. A failed transfer can be resumed, which is what puts the button
+/// back within reach rather than leaving somebody with a row they cannot act on.
+///
+/// Whether they picked it up is read off the record rather than asked: serving
+/// them moves it off `offered` by itself, so anything else means they started.
+#[tauri::command]
+async fn watch_offer(
+    app: AppHandle,
+    state: State<'_, NetworkState>,
+    id: String,
+    message: String,
+) -> Result<(), String> {
+    let transfer = find_outgoing_file_by_id(&app, &id)?
+        .ok_or_else(|| "no such transfer".to_string())?;
+
+    let peer_id = transfer.peer_id;
+    let network_tx = network_sender(&state)?;
+
+    tauri::async_runtime::spawn(async move {
+        for attempt in 1..=OFFER_ATTEMPTS {
+            let _ = set_file_status(
+                &app,
+                &id,
+                "offered",
+                Some(&format!(
+                    "waiting for them ({} of {})",
+                    attempt, OFFER_ATTEMPTS
+                )),
+            );
+            emit_to_frontend(&app, "file-changed", &id);
+
+            tokio::time::sleep(OFFER_WAIT).await;
+
+            // Anything other than still offering means they took it up.
+            match find_outgoing_file_by_id(&app, &id) {
+                Ok(Some(current)) if current.status != "offered" => return,
+                // Gone, or unreadable. Either way there is nothing left to watch.
+                Ok(None) | Err(_) => return,
+                Ok(Some(_)) => {}
+            }
+
+            if attempt < OFFER_ATTEMPTS {
+                let (result_tx, result_rx) = oneshot::channel();
+
+                if network_tx
+                    .send(NetworkCommand::PublishToDirect {
+                        peer_id: peer_id.clone(),
+                        message: message.clone(),
+                        result_tx,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+
+                let _ = result_rx.await;
+            }
+        }
+
+        let _ = set_file_status(&app, &id, "failed", Some("they are not answering"));
+        emit_to_frontend(&app, "file-changed", &id);
+    });
+
+    Ok(())
+}
+
 /// Offers a file again, for a transfer that stopped partway.
 ///
 /// The sender's half of resuming. Only the receiver can ask for the rest, since
@@ -3911,6 +3995,7 @@ fn main() {
             mark_files_seen,
             resume_file,
             reoffer_file,
+            watch_offer,
             inspect_files,
             // Groups
             save_group,

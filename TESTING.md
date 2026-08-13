@@ -142,6 +142,11 @@ Stop the receiving app partway and start it again.
 - The sender has a Resume button too. Pressing it offers the same file again
   rather than sending a second copy, and the receiver picks up from where it
   stopped. Either side can start it off.
+- Pressing it while the **receiver** is offline should count out
+  `waiting for them (1 of 4)` and end at `they are not answering`, with the
+  Resume button back. An offer is an ordinary message and nothing stores those,
+  so one sent to a node that is not running is gone: it does not go through when
+  they return, and a row that says it is waiting is saying something untrue.
 - Failures should read as a short phrase, not a paragraph. The full text is on
   hover. A relay failure in particular arrives as three hundred characters of
   nested causes and two addresses, and a row is not the place for it.

@@ -1052,19 +1052,23 @@ async function sendOneFile(contact: Contact, path: string) {
     // announced separately so it arrives exactly when it is needed.
     const addresses = await relayedAddresses();
 
-    await invoke("send_direct", {
-      peerId: contact.peer_id,
-      message: JSON.stringify({
-        type: "file-offer",
-        id: file.id,
-        name: file.name,
-        size: file.size,
-        hash: file.hash,
-        key: file.key,
-        addresses,
-        sentAt,
-      }),
+    const offer = JSON.stringify({
+      type: "file-offer",
+      id: file.id,
+      name: file.name,
+      size: file.size,
+      hash: file.hash,
+      key: file.key,
+      addresses,
+      sentAt,
     });
+
+    await invoke("send_direct", { peerId: contact.peer_id, message: offer });
+
+    // An offer is an ordinary message and nothing stores those, so one sent to
+    // somebody who is not running is gone. This repeats it a few times and then
+    // says so, rather than leaving a row that waits for ever.
+    await invoke("watch_offer", { id: file.id, message: offer });
   } catch (error) {
     notify(`Could not send that file: ${error}`);
   }
@@ -1142,19 +1146,19 @@ async function reoffer(file: FileTransfer) {
   const restored = await invoke<FileTransfer>("reoffer_file", { id: file.id });
   const addresses = await relayedAddresses();
 
-  await invoke("send_direct", {
-    peerId: restored.peer_id,
-    message: JSON.stringify({
-      type: "file-offer",
-      id: restored.id,
-      name: restored.name,
-      size: restored.size,
-      hash: restored.hash,
-      key: restored.key,
-      addresses,
-      sentAt: restored.sent_at,
-    }),
+  const offer = JSON.stringify({
+    type: "file-offer",
+    id: restored.id,
+    name: restored.name,
+    size: restored.size,
+    hash: restored.hash,
+    key: restored.key,
+    addresses,
+    sentAt: restored.sent_at,
   });
+
+  await invoke("send_direct", { peerId: restored.peer_id, message: offer });
+  await invoke("watch_offer", { id: restored.id, message: offer });
 }
 
 async function openFile(file: FileTransfer) {
