@@ -5,7 +5,7 @@
 //! reaches it through that reservation, and a stream carries bytes across. If
 //! that works, a file transfer can work the same way.
 //!
-//!     cargo run -p feed-server --example circuit_probe -- <server address> [megabytes]
+//!     cargo run -p indicium-server --example circuit_probe -- <server address> [megabytes]
 
 use std::error::Error;
 use std::time::Duration;
@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|| "1".to_string())
         .parse()?;
 
-    let (_relay_peer, server) = feed_protocol::parse_server_address(&address)?;
+    let (_relay_peer, server) = indicium_protocol::parse_server_address(&address)?;
 
     let listener_key = identity::Keypair::generate_ed25519();
     let listener_id = PeerId::from(listener_key.public());

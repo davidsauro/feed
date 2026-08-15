@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "tauri-feed",
-  "version": "1.0.1",
-  "identifier": "com.daves.tauri-feed",
+  "productName": "Indicium",
+  "version": "1.1.0",
+  "identifier": "com.daves.indicium",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "tauri-feed",
+        "title": "Indicium",
         "width": 800,
         "height": 600
       }

@@ -18,7 +18,7 @@ export type ThemeMode = "system" | "light" | "dark";
 /** What actually gets applied to the document. */
 export type ResolvedTheme = "light" | "dark";
 
-const STORAGE_KEY = "feed.theme-mode";
+const STORAGE_KEY = "indicium.theme-mode";
 
 const systemPrefersDark = window.matchMedia("(prefers-color-scheme: dark)");
 

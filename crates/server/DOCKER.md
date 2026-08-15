@@ -39,8 +39,8 @@ host firewall allows it:
 ## 3. Make a directory for the server's identity
 
 ```bash
-mkdir -p ~/feed-server/data
-cd ~/feed-server
+mkdir -p ~/indicium-server/data
+cd ~/indicium-server
 ```
 
 The container runs as uid 1000, the first account on most Linux systems, so a
@@ -57,7 +57,7 @@ Replace the address with yours from step 2. Use `/dns4/` for a hostname, `/ip4/`
 for a bare IP:
 
 ```bash
-cat > data/feed-server.toml <<'EOF'
+cat > data/indicium-server.toml <<'EOF'
 # How people reach this machine. Required for file transfers.
 external_addresses = ["/dns4/relay.example.com/tcp/4001"]
 
@@ -72,13 +72,13 @@ EOF
 ## 5. Start it
 
 ```bash
-docker run -d --name feed-server \
+docker run -d --name indicium-server \
   -p 4001:4001 \
   -v "$PWD/data:/data" \
   --restart unless-stopped \
-  ghcr.io/davidsauro/feed-server:latest
+  ghcr.io/davidsauro/indicium-server:latest
 
-docker logs -f feed-server
+docker logs -f indicium-server
 ```
 
 A healthy start looks like this:
@@ -116,11 +116,11 @@ From a clone of this repository, the two probes check more than a port:
 
 ```bash
 # Carries conversations
-cargo run -p feed-server --example probe -- <server address> /direct/1.0.0/test
-cargo run -p feed-server --example probe -- <server address> /direct/1.0.0/test "hello"
+cargo run -p indicium-server --example probe -- <server address> /direct/1.0.0/test
+cargo run -p indicium-server --example probe -- <server address> /direct/1.0.0/test "hello"
 
 # Relays connections, which is what file transfers need
-cargo run -p feed-server --example circuit_probe -- <server address> 25
+cargo run -p indicium-server --example circuit_probe -- <server address> 25
 ```
 
 If the first passes and the second fails, `external_addresses` is wrong or
@@ -130,7 +130,7 @@ There is a third, for the reservation a client needs before anyone can fetch a
 file from it:
 
 ```bash
-cargo run -p feed-server --example reserve_probe -- <server address>
+cargo run -p indicium-server --example reserve_probe -- <server address>
 ```
 
 ## Closing it to a known group
@@ -140,14 +140,14 @@ person's peer id, which the app shows at the top of its sidebar and copies when
 clicked:
 
 ```bash
-cat >> data/feed-server.toml <<'EOF'
+cat >> data/indicium-server.toml <<'EOF'
 
 allowed_peers = [
   "12D3KooWEXAMPLEonlyREPLACEwithTHEIRrealPEERid00000000",
 ]
 EOF
 
-docker restart feed-server
+docker restart indicium-server
 ```
 
 An empty list means open, so this only takes effect once there is a name in it.
@@ -172,8 +172,8 @@ treat the backup like the private key it is.
 ### Moving to another machine
 
 ```bash
-docker stop feed-server                     # on the old machine
-scp data/identity.bin newhost:~/feed-server/data/
+docker stop indicium-server                     # on the old machine
+scp data/identity.bin newhost:~/indicium-server/data/
 # point DNS at the new machine, then start it there
 ```
 
@@ -181,11 +181,34 @@ Every client keeps working. **Never run two servers with the same identity at
 once**, or they will fight over connections and confuse every peer that reaches
 either.
 
+## Coming from a server called feed-server
+
+The image, the binary and the configuration file were all renamed with the app.
+Nothing about your server's identity changed, so clients keep working without
+being touched, but the container has to be replaced and one file renamed:
+
+```bash
+cd ~/indicium-server            # whatever you called the directory
+mv data/feed-server.toml data/indicium-server.toml
+
+docker stop feed-server && docker rm feed-server
+docker pull ghcr.io/davidsauro/indicium-server:latest
+# then the docker run from step 5, with the new image name
+```
+
+**Rename the configuration file or the server will not read it.** It looks for
+`indicium-server.toml` now, finds nothing, and starts with the defaults: open to
+anyone, and with no external address, which quietly stops file transfers
+working. The startup log says which file it looked for.
+
+`identity.bin` is untouched, so the peer id stays the same and every client
+configuration remains correct.
+
 ## Updating
 
 ```bash
-docker pull ghcr.io/davidsauro/feed-server:latest
-docker stop feed-server && docker rm feed-server
+docker pull ghcr.io/davidsauro/indicium-server:latest
+docker stop indicium-server && docker rm indicium-server
 # then the docker run from step 5 again
 ```
 
@@ -198,7 +221,7 @@ container cannot write to `data/`. See below.
 
 **Chat works, file transfers do not.** Almost always `external_addresses`.
 Confirm the logs say `reachable at <your address>` and that the address is one
-that actually resolves to this machine. `docker logs feed-server | grep reachable`
+that actually resolves to this machine. `docker logs indicium-server | grep reachable`
 
 **Messages take a second or more to arrive.** The server is older than its
 clients. A server forwards to its clients directly only if it treats them as
@@ -213,7 +236,7 @@ than one file, so it is reached sooner than people expect. Set it to `0`.
 `0.0.0.0:4001->4001/tcp`, then the host firewall, then the router.
 
 **A configuration change did nothing.** It is read at startup only.
-`docker restart feed-server`.
+`docker restart indicium-server`.
 
 **The server exits complaining about the configuration.** A file that exists but
 cannot be parsed stops the server rather than being guessed at, including for a

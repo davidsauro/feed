@@ -12,7 +12,7 @@ Throughout: **A** and **B** are the two machines, **S** is the server.
 
 | Check | How | Expect |
 |---|---|---|
-| S is up | `docker logs feed-server` | `reachable at <your address>`, no `WARNING` |
+| S is up | `docker logs indicium-server` | `reachable at <your address>`, no `WARNING` |
 | S carries conversations | `probe` example, twice | The message arrives |
 | S relays connections | `circuit_probe` example | `OK: 25 MiB crossed the relay` |
 | A reservation survives the app's ordering | `reserve_probe` example | `RESERVED: …/p2p-circuit/…` |
@@ -72,7 +72,7 @@ sides must do it.
 Copy it. Do not read it off the screen and type it. Every peer id starts
 `12D3KooW`, so a wrong one looks entirely plausible, and the result is two people
 subscribed to different conversations with no obvious sign of it. If you want to
-be sure, `docker logs feed-server` shows a `carrying` line per conversation, and
+be sure, `docker logs indicium-server` shows a `carrying` line per conversation, and
 two people who have added each other correctly share one: the second to connect
 produces one fewer line than they have contacts.
 
@@ -153,7 +153,7 @@ Stop the receiving app partway and start it again.
 
 ### 4d. Restart the server mid-transfer
 
-`docker restart feed-server`. The transfer will fail. Once the server is back,
+`docker restart indicium-server`. The transfer will fail. Once the server is back,
 both clients should reconnect within 30 seconds and a new transfer should work.
 
 ## 5. Circuit limits
@@ -162,8 +162,8 @@ Only if you want to see the failure mode described in the docs. On S:
 
 ```bash
 # a deliberately small budget
-sed -i 's/max_circuit_bytes = 0/max_circuit_bytes = 2097152/' data/feed-server.toml
-docker restart feed-server
+sed -i 's/max_circuit_bytes = 0/max_circuit_bytes = 2097152/' data/indicium-server.toml
+docker restart indicium-server
 ```
 
 Send a 10 MB file. It should stop around 2 MB, then **retry and resume**,
@@ -198,7 +198,7 @@ For anything that fails, this is what makes it fixable:
 - Which step, and which machine was sending.
 - Whether A and B were on the same network.
 - The exact message shown.
-- The last few lines of `docker logs feed-server`.
+- The last few lines of `docker logs indicium-server`.
 - Whether it fails every time or sometimes. **Sometimes is the more important
   answer**, and the one people forget to check.
 

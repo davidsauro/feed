@@ -29,7 +29,7 @@ dist-ssr
 # can impersonate that server — and the config may list who is allowed to use it.
 crates/server/data/
 **/identity.bin
-feed-server.toml
+indicium-server.toml
 **/*.rs.bk
 
 # Environment Variables

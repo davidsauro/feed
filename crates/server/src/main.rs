@@ -40,11 +40,11 @@ use crate::config::Config;
 use crate::mirror::{Caps, Decision, Mirror};
 
 const USAGE: &str = "\
-feed-server — carries traffic between nodes that cannot reach each other
+indicium-server — carries traffic between nodes that cannot reach each other
 
-    feed-server [config file]
+    indicium-server [config file]
 
-With no argument it looks for feed-server.toml in the working directory, and
+With no argument it looks for indicium-server.toml in the working directory, and
 runs with defaults if there isn't one: listening on port 4001 and carrying
 traffic for anyone.
 
@@ -163,7 +163,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_behaviour(|key| {
             // Shared with the app rather than written out again here. Two nodes
             // that disagree about this don't fail to start, they fail to talk.
-            let gossipsub_config = feed_protocol::gossipsub_config()
+            let gossipsub_config = indicium_protocol::gossipsub_config()
                 .expect("the shared gossipsub configuration is not valid");
 
             let gossipsub = gossipsub::Behaviour::new(
@@ -313,7 +313,7 @@ fn stop_carrying(swarm: &mut libp2p::Swarm<ServerBehaviour>, topic: &gossipsub::
 fn parse_siblings(addresses: &[String]) -> Result<Vec<(PeerId, Multiaddr)>, String> {
     addresses
         .iter()
-        .map(|address| feed_protocol::parse_server_address(address))
+        .map(|address| indicium_protocol::parse_server_address(address))
         .collect()
 }
 

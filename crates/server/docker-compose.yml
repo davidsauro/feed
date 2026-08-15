@@ -9,7 +9,7 @@
 #     UID=$(id -u) GID=$(id -g) docker compose up -d --build
 
 services:
-  feed-server:
+  indicium-server:
     build:
       # The workspace root, because the server is one crate within it.
       context: ../..
@@ -17,8 +17,8 @@ services:
       args:
         UID: ${UID:-1000}
         GID: ${GID:-1000}
-    image: feed-server
-    container_name: feed-server
+    image: indicium-server
+    container_name: indicium-server
     restart: unless-stopped
 
     ports:

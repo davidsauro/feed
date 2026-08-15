@@ -391,8 +391,8 @@ Nobody needs this repository to run one:
 
 ```bash
 mkdir -p data
-docker run -d --name feed-server -p 4001:4001 -v "$PWD/data:/data" \
-  --restart unless-stopped ghcr.io/davidsauro/feed-server:latest
+docker run -d --name indicium-server -p 4001:4001 -v "$PWD/data:/data" \
+  --restart unless-stopped ghcr.io/davidsauro/indicium-server:latest
 ```
 
 From a clone, with compose:
@@ -408,15 +408,15 @@ There is a probe that stands in for the app, for checking that a server really
 does carry traffic between two nodes that know nothing about each other:
 
 ```bash
-cargo run -p feed-server --example probe -- <server address> /direct/1.0.0/test
-cargo run -p feed-server --example probe -- <server address> /direct/1.0.0/test "hello"
+cargo run -p indicium-server --example probe -- <server address> /direct/1.0.0/test
+cargo run -p indicium-server --example probe -- <server address> /direct/1.0.0/test "hello"
 ```
 
 Relaying uses a different mechanism and has its own probe, which sends a payload
 between two peers that can only have crossed the server:
 
 ```bash
-cargo run -p feed-server --example circuit_probe -- <server address> 25
+cargo run -p indicium-server --example circuit_probe -- <server address> 25
 ```
 
 If this fails where the first probe passed, the server almost certainly needs

@@ -1,6 +1,6 @@
 # Build with the repository root as the context, so the workspace resolves:
 #
-#     docker build -f crates/server/Dockerfile -t feed-server .
+#     docker build -f crates/server/Dockerfile -t indicium-server .
 #
 # ---------------------------------------------------------------------------
 # Build
@@ -54,8 +54,8 @@ COPY src-tauri/Cargo.toml ./src-tauri/Cargo.toml
 # manifest needs something to point at. This stub is never built.
 RUN mkdir -p src-tauri/src && echo 'fn main() {}' > src-tauri/src/main.rs
 
-RUN cargo build --release --target "$(cat /target)" -p feed-server \
-    && cp "target/$(cat /target)/release/feed-server" /feed-server
+RUN cargo build --release --target "$(cat /target)" -p indicium-server \
+    && cp "target/$(cat /target)/release/indicium-server" /indicium-server
 
 # ---------------------------------------------------------------------------
 # Run
@@ -77,14 +77,14 @@ FROM debian:bookworm-slim
 ARG UID=1000
 ARG GID=1000
 
-RUN groupadd --gid $GID feed \
-    && useradd --system --uid $UID --gid $GID feed \
+RUN groupadd --gid $GID indicium \
+    && useradd --system --uid $UID --gid $GID indicium \
     && mkdir /data \
     && chown $UID:$GID /data
 
-COPY --from=builder /feed-server /usr/local/bin/feed-server
+COPY --from=builder /indicium-server /usr/local/bin/indicium-server
 
-USER feed
+USER indicium
 
 # Everything the server keeps lives here, so this is the directory to mount:
 # the identity, and the configuration if you supply one.
@@ -93,5 +93,5 @@ VOLUME ["/data"]
 
 EXPOSE 4001
 
-ENTRYPOINT ["feed-server"]
-CMD ["/data/feed-server.toml"]
+ENTRYPOINT ["indicium-server"]
+CMD ["/data/indicium-server.toml"]

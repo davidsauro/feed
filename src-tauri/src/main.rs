@@ -18,7 +18,7 @@ mod file_crypto;
 mod file_transfer;
 mod group_crypto;
 
-use feed_protocol::{DIRECT_TOPIC_PREFIX, GROUP_TOPIC_PREFIX};
+use indicium_protocol::{DIRECT_TOPIC_PREFIX, GROUP_TOPIC_PREFIX};
 use futures::stream::StreamExt;
 use libp2p::gossipsub;
 use libp2p::identity::Keypair;
@@ -1069,7 +1069,7 @@ async fn add_server(
     state: State<'_, NetworkState>,
     address: String,
 ) -> Result<Server, String> {
-    let (peer_id, parsed) = feed_protocol::parse_server_address(&address)?;
+    let (peer_id, parsed) = indicium_protocol::parse_server_address(&address)?;
 
     // Connecting to ourselves is not useful, and the confusion it would cause is
     // worth a couple of lines to prevent.
@@ -1103,7 +1103,7 @@ async fn remove_server(
     state: State<'_, NetworkState>,
     address: String,
 ) -> Result<(), String> {
-    let (peer_id, _) = feed_protocol::parse_server_address(&address)?;
+    let (peer_id, _) = indicium_protocol::parse_server_address(&address)?;
 
     {
         let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
@@ -1133,7 +1133,7 @@ async fn connect_to_saved_servers(
     let servers = get_servers(app)?;
 
     for server in &servers {
-        match feed_protocol::parse_server_address(&server.address) {
+        match indicium_protocol::parse_server_address(&server.address) {
             Ok((peer_id, parsed)) => connect_to_server(&state, peer_id, parsed).await?,
             // A stored address that no longer parses should not stop the others
             // from being dialled.
@@ -2720,7 +2720,7 @@ fn build_swarm(keypair: Keypair) -> Swarm<AppBehaviour> {
 
             // Shared with the server rather than written out twice. Two nodes
             // that disagree about this don't fail to start, they fail to talk.
-            let gossipsub_config = feed_protocol::gossipsub_config()
+            let gossipsub_config = indicium_protocol::gossipsub_config()
                 .expect("the shared gossipsub configuration is not valid");
 
             let groups = gossipsub::Behaviour::new(
@@ -4031,7 +4031,7 @@ mod tests {
 
     /// A private directory for one test to work in.
     fn scratch_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("feed-test-{}-{}", std::process::id(), name));
+        let dir = std::env::temp_dir().join(format!("indicium-test-{}-{}", std::process::id(), name));
 
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("could not create the scratch directory");

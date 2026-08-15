@@ -1,4 +1,4 @@
-# feed-server
+# indicium-server
 
 Carries traffic between nodes that cannot reach each other directly.
 
@@ -28,13 +28,13 @@ You do not need this repository. A published image is enough:
 
 ```bash
 mkdir -p data
-docker run -d --name feed-server \
+docker run -d --name indicium-server \
   -p 4001:4001 \
   -v "$PWD/data:/data" \
   --restart unless-stopped \
-  ghcr.io/davidsauro/feed-server:latest
+  ghcr.io/davidsauro/indicium-server:latest
 
-docker logs -f feed-server
+docker logs -f indicium-server
 ```
 
 Images are published for `linux/amd64` and `linux/arm64`, so the cheap virtual
@@ -89,8 +89,8 @@ There is a probe that stands in for the app:
 
 ```bash
 # a listener, and then a sender, each connected only to the server
-cargo run -p feed-server --example probe -- <server address> /direct/1.0.0/test
-cargo run -p feed-server --example probe -- <server address> /direct/1.0.0/test "hello"
+cargo run -p indicium-server --example probe -- <server address> /direct/1.0.0/test
+cargo run -p indicium-server --example probe -- <server address> /direct/1.0.0/test "hello"
 ```
 
 The two probes are never told each other's addresses, so a message arriving at
@@ -100,7 +100,7 @@ File transfers use a different mechanism, a relayed connection rather than a
 topic, and have their own probe:
 
 ```bash
-cargo run -p feed-server --example circuit_probe -- <server address> 25
+cargo run -p indicium-server --example circuit_probe -- <server address> 25
 ```
 
 Two peers in one process exchange 25 MiB that can only have crossed the relay.
@@ -114,7 +114,7 @@ working regardless, which is what makes it easy to miss.
 Optional. With no configuration file the server listens on port 4001 and carries
 traffic for anyone, which is a useful thing to run as it stands.
 
-To change that, copy `feed-server.example.toml` to `data/feed-server.toml` and
+To change that, copy `indicium-server.example.toml` to `data/indicium-server.toml` and
 restart. A configuration that exists but cannot be parsed stops the server rather
 than being guessed at, including when the problem is nothing more than an unknown
 key.
@@ -136,7 +136,7 @@ Two files, in the mounted directory:
 | File | Size | What it is |
 |---|---|---|
 | `identity.bin` | **68 bytes** | This server's private key |
-| `feed-server.toml` | a few hundred bytes | Your configuration, if you wrote one |
+| `indicium-server.toml` | a few hundred bytes | Your configuration, if you wrote one |
 
 That is all, and it does not grow. No messages are kept: connections, mesh state
 and the record of which conversations to carry all live in memory and rebuild

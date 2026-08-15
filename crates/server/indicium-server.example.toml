@@ -1,6 +1,6 @@
 # Example configuration. Every setting here is optional: a server started with
 # no configuration file at all listens on port 4001 and carries traffic for
-# anyone. Copy this to feed-server.toml and change what you care about.
+# anyone. Copy this to indicium-server.toml and change what you care about.
 
 # Addresses to listen on. The port is part of the address every client is
 # configured with, so changing it later means updating every client.

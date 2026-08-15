@@ -1359,26 +1359,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "feed-protocol"
-version = "1.0.1"
-dependencies = [
- "libp2p",
-]
-
-[[package]]
-name = "feed-server"
-version = "1.0.1"
-dependencies = [
- "feed-protocol",
- "futures",
- "libp2p",
- "libp2p-stream",
- "serde",
- "tokio",
- "toml 0.9.12+spec-1.1.0",
-]
-
-[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2392,6 +2372,50 @@ dependencies = [
  "hashbrown 0.17.1",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "indicium"
+version = "1.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "futures",
+ "hkdf",
+ "indicium-protocol",
+ "libp2p",
+ "libp2p-stream",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "tokio",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "indicium-protocol"
+version = "1.1.0"
+dependencies = [
+ "libp2p",
+]
+
+[[package]]
+name = "indicium-server"
+version = "1.1.0"
+dependencies = [
+ "futures",
+ "indicium-protocol",
+ "libp2p",
+ "libp2p-stream",
+ "serde",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
 ]
 
 [[package]]
@@ -5306,30 +5330,6 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
-]
-
-[[package]]
-name = "tauri-feed"
-version = "1.0.1"
-dependencies = [
- "base64 0.22.1",
- "chacha20poly1305",
- "ed25519-dalek",
- "feed-protocol",
- "futures",
- "hkdf",
- "libp2p",
- "libp2p-stream",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "tokio",
- "x25519-dalek",
 ]
 
 [[package]]

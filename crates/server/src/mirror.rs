@@ -75,7 +75,7 @@ impl Mirror {
 
     /// Records that a client wants a conversation carried.
     pub fn wanted(&mut self, peer: PeerId, topic: TopicHash) -> Decision {
-        if !feed_protocol::is_app_topic(topic.as_str()) {
+        if !indicium_protocol::is_app_topic(topic.as_str()) {
             return Decision::Refused(Refusal::NotOurs);
         }
 

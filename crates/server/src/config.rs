@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// Where the configuration is read from when nothing else is specified.
-pub const DEFAULT_PATH: &str = "feed-server.toml";
+pub const DEFAULT_PATH: &str = "indicium-server.toml";
 
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]

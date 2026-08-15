@@ -5,7 +5,7 @@
 //! exactly as the app does, so what this measures is the path a real message
 //! takes rather than an idealised one.
 //!
-//!     cargo run -p feed-server --example latency_probe -- <server address> [count]
+//!     cargo run -p indicium-server --example latency_probe -- <server address> [count]
 
 use std::error::Error;
 use std::time::{Duration, Instant};
@@ -31,7 +31,7 @@ fn build(relay: PeerId) -> Swarm<Probe> {
         .with_behaviour(|key| Probe {
             gossipsub: gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
-                feed_protocol::gossipsub_config().expect("config"),
+                indicium_protocol::gossipsub_config().expect("config"),
             )
             .expect("gossipsub"),
         })
@@ -52,9 +52,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|| "5".to_string())
         .parse()?;
 
-    let (relay, server) = feed_protocol::parse_server_address(&address)?;
+    let (relay, server) = indicium_protocol::parse_server_address(&address)?;
 
-    let topic = gossipsub::IdentTopic::new(format!("{}latency-probe", feed_protocol::DIRECT_TOPIC_PREFIX));
+    let topic = gossipsub::IdentTopic::new(format!("{}latency-probe", indicium_protocol::DIRECT_TOPIC_PREFIX));
 
     let mut sender = build(relay);
     let mut receiver = build(relay);

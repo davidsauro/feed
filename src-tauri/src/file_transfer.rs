@@ -655,7 +655,7 @@ mod tests {
 
     #[test]
     fn a_taken_name_gets_a_number() {
-        let directory = std::env::temp_dir().join(format!("feed-names-{}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!("indicium-names-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
 
         let first = available_path(&directory, "report.pdf");
