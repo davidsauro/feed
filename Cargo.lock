@@ -2376,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "indicium"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -2400,14 +2400,14 @@ dependencies = [
 
 [[package]]
 name = "indicium-protocol"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "libp2p",
 ]
 
 [[package]]
 name = "indicium-server"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "futures",
  "indicium-protocol",
