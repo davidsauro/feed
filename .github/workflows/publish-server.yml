@@ -42,10 +42,10 @@ jobs:
       # system libraries to build, none of which a runner has or the server
       # needs.
       - name: Test the server and the shared protocol
-        run: cargo test --locked -p feed-protocol -p feed-server
+        run: cargo test --locked -p indicium-protocol -p indicium-server
 
       - name: Check for lints
-        run: cargo clippy --locked -p feed-protocol -p feed-server -- -D warnings
+        run: cargo clippy --locked -p indicium-protocol -p indicium-server -- -D warnings
 
   publish:
     name: Publish
@@ -93,9 +93,9 @@ jobs:
         run: |
           {
             echo 'images<<END_OF_LIST'
-            echo "ghcr.io/${{ github.repository_owner }}/feed-server"
+            echo "ghcr.io/${{ github.repository_owner }}/indicium-server"
             if [ -n "$DOCKERHUB_USERNAME" ]; then
-              echo "docker.io/$DOCKERHUB_USERNAME/feed-server"
+              echo "docker.io/$DOCKERHUB_USERNAME/indicium-server"
             fi
             echo 'END_OF_LIST'
           } >> "$GITHUB_OUTPUT"
@@ -113,7 +113,7 @@ jobs:
             type=raw,value=${{ inputs.version }},enable=${{ inputs.version != '' }}
             type=raw,value=latest
           labels: |
-            org.opencontainers.image.title=feed-server
+            org.opencontainers.image.title=indicium-server
             org.opencontainers.image.description=Relay for a peer-to-peer chat network, which carries traffic it cannot read
 
       - name: Build and publish

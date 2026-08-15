@@ -18,7 +18,7 @@ mod file_crypto;
 mod file_transfer;
 mod group_crypto;
 
-use feed_protocol::{DIRECT_TOPIC_PREFIX, GROUP_TOPIC_PREFIX};
+use indicium_protocol::{DIRECT_TOPIC_PREFIX, GROUP_TOPIC_PREFIX};
 use futures::stream::StreamExt;
 use libp2p::gossipsub;
 use libp2p::identity::Keypair;
@@ -1069,7 +1069,7 @@ async fn add_server(
     state: State<'_, NetworkState>,
     address: String,
 ) -> Result<Server, String> {
-    let (peer_id, parsed) = feed_protocol::parse_server_address(&address)?;
+    let (peer_id, parsed) = indicium_protocol::parse_server_address(&address)?;
 
     // Connecting to ourselves is not useful, and the confusion it would cause is
     // worth a couple of lines to prevent.
@@ -1103,7 +1103,7 @@ async fn remove_server(
     state: State<'_, NetworkState>,
     address: String,
 ) -> Result<(), String> {
-    let (peer_id, _) = feed_protocol::parse_server_address(&address)?;
+    let (peer_id, _) = indicium_protocol::parse_server_address(&address)?;
 
     {
         let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
@@ -1133,7 +1133,7 @@ async fn connect_to_saved_servers(
     let servers = get_servers(app)?;
 
     for server in &servers {
-        match feed_protocol::parse_server_address(&server.address) {
+        match indicium_protocol::parse_server_address(&server.address) {
             Ok((peer_id, parsed)) => connect_to_server(&state, peer_id, parsed).await?,
             // A stored address that no longer parses should not stop the others
             // from being dialled.
@@ -1232,6 +1232,161 @@ fn get_files(app: AppHandle) -> Result<Vec<FileTransfer>, String> {
     }
 
     Ok(files)
+}
+
+/// How many times an offer is put in front of somebody before giving up.
+const OFFER_ATTEMPTS: usize = 4;
+
+/// How long to give them to start pulling before offering again.
+///
+/// Somebody who is there begins within a second or two, so this is mostly spent
+/// waiting on somebody who is not.
+const OFFER_WAIT: Duration = Duration::from_secs(15);
+
+/// Watches an offer, and gives up on it out loud.
+///
+/// An offer is an ordinary message, and nothing stores those. Sent to somebody
+/// who is not running, it reaches the server, reaches nobody, and is gone. The
+/// record said "waiting for them" and would have said it for ever, which reads
+/// as a promise that it will go through when they return. It will not.
+///
+/// So the offer is repeated a few times, in case they appear, and then called
+/// what it is. A failed transfer can be resumed, which is what puts the button
+/// back within reach rather than leaving somebody with a row they cannot act on.
+///
+/// Whether they picked it up is read off the record rather than asked: serving
+/// them moves it off `offered` by itself, so anything else means they started.
+#[tauri::command]
+async fn watch_offer(
+    app: AppHandle,
+    state: State<'_, NetworkState>,
+    id: String,
+    message: String,
+) -> Result<(), String> {
+    let transfer = find_outgoing_file_by_id(&app, &id)?
+        .ok_or_else(|| "no such transfer".to_string())?;
+
+    let peer_id = transfer.peer_id;
+    let network_tx = network_sender(&state)?;
+
+    tauri::async_runtime::spawn(async move {
+        for attempt in 1..=OFFER_ATTEMPTS {
+            let _ = set_file_status(
+                &app,
+                &id,
+                "offered",
+                Some(&format!(
+                    "waiting for them ({} of {})",
+                    attempt, OFFER_ATTEMPTS
+                )),
+            );
+            emit_to_frontend(&app, "file-changed", &id);
+
+            tokio::time::sleep(OFFER_WAIT).await;
+
+            // Anything other than still offering means they took it up.
+            match find_outgoing_file_by_id(&app, &id) {
+                Ok(Some(current)) if current.status != "offered" => return,
+                // Gone, or unreadable. Either way there is nothing left to watch.
+                Ok(None) | Err(_) => return,
+                Ok(Some(_)) => {}
+            }
+
+            if attempt < OFFER_ATTEMPTS {
+                let (result_tx, result_rx) = oneshot::channel();
+
+                if network_tx
+                    .send(NetworkCommand::PublishToDirect {
+                        peer_id: peer_id.clone(),
+                        message: message.clone(),
+                        result_tx,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+
+                let _ = result_rx.await;
+            }
+        }
+
+        let _ = set_file_status(&app, &id, "failed", Some("they are not answering"));
+        emit_to_frontend(&app, "file-changed", &id);
+    });
+
+    Ok(())
+}
+
+/// Offers a file again, for a transfer that stopped partway.
+///
+/// The sender's half of resuming. Only the receiver can ask for the rest, since
+/// only it knows how much it holds, so this does not send anything itself: it
+/// puts the record back to offered and hands back what the offer needs. The
+/// receiver takes it from there and asks from where it stopped.
+#[tauri::command]
+fn reoffer_file(app: AppHandle, id: String) -> Result<FileTransfer, String> {
+    let transfer = find_outgoing_file_by_id(&app, &id)?
+        .ok_or_else(|| "no such transfer".to_string())?;
+
+    if transfer.status == "complete" {
+        return Err("that one already arrived".to_string());
+    }
+
+    set_file_status(&app, &id, "offered", None)?;
+
+    Ok(transfer)
+}
+
+/// One outgoing transfer, whoever it was for.
+fn find_outgoing_file_by_id(app: &AppHandle, id: &str) -> Result<Option<FileTransfer>, String> {
+    let conn = get_db_connection(app).map_err(|e| e.to_string())?;
+
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT {} FROM files WHERE id = ?1 AND direction = 'outgoing'",
+            FILE_COLUMNS
+        ))
+        .map_err(|e| e.to_string())?;
+
+    let mut rows = statement
+        .query_map((id,), read_file_row)
+        .map_err(|e| e.to_string())?;
+
+    rows.next().transpose().map_err(|e| e.to_string())
+}
+
+/// Asks again for the rest of a transfer that stopped partway.
+///
+/// The bytes already written are kept and the offset is recorded, so this picks
+/// up where it left off rather than starting again. Nothing is negotiated: the
+/// receiver knows how much it has, and the sender serves from whatever chunk it
+/// is asked for regardless of what its own record says happened.
+#[tauri::command]
+async fn resume_file(
+    app: AppHandle,
+    state: State<'_, FileControl>,
+    id: String,
+) -> Result<(), String> {
+    let transfer = find_incoming_file(&app, &id)?
+        .ok_or_else(|| "no such transfer".to_string())?;
+
+    if transfer.status == "complete" {
+        return Err("that one already arrived".to_string());
+    }
+
+    let peer = parse_peer(&transfer.peer_id)?;
+    let control = state.0.clone();
+
+    // Marked before the work starts, so pressing the button visibly does
+    // something. Reaching somebody who is not there spends a full dial timeout
+    // per attempt, and the row would otherwise sit unchanged for minutes.
+    set_file_status(&app, &id, "pending", Some("reaching them"))?;
+    emit_to_frontend(&app, "file-changed", &id);
+
+    tauri::async_runtime::spawn(file_transfer::fetch(app.clone(), control, peer, id));
+
+    Ok(())
 }
 
 /// Marks everything that has finished arriving as looked at.
@@ -1536,11 +1691,18 @@ async fn receive_file(
 
     insert_file(&app, &transfer)?;
 
+    // Read back rather than returned as built. An offer for a transfer we
+    // already have is a sender asking us to pick it up again, and the insert
+    // ignores it, so what is on disk is the record that matters: its path, and
+    // how far it already got. Returning the freshly built one would report zero
+    // progress and a path that was never used.
+    let stored = find_incoming_file(&app, &id)?.unwrap_or(transfer);
+
     // Its own task, so a large file does not hold up anything else.
     let control = state.0.clone();
     tauri::async_runtime::spawn(file_transfer::fetch(app.clone(), control, peer, id));
 
-    Ok(transfer)
+    Ok(stored)
 }
 
 fn insert_file(app: &AppHandle, transfer: &FileTransfer) -> Result<(), String> {
@@ -2440,6 +2602,22 @@ fn fail_stale_sends(app: AppHandle) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
+    // A transfer in flight when the app stopped is not in flight now, and
+    // nothing else will ever say so. Left alone it reads as "receiving" for
+    // ever, with a progress bar frozen at wherever it got to, which is the
+    // interface stating something that was true once and is not any more.
+    //
+    // How far it got is deliberately kept. That number is what lets it carry on
+    // from where it stopped rather than starting again.
+    conn.execute(
+        "UPDATE files
+            SET status = 'failed',
+                error = 'interrupted, and can be resumed'
+          WHERE status IN ('transferring', 'pending')",
+        (),
+    )
+    .map_err(|e| e.to_string())?;
+
     Ok(())
 }
 
@@ -2542,7 +2720,7 @@ fn build_swarm(keypair: Keypair) -> Swarm<AppBehaviour> {
 
             // Shared with the server rather than written out twice. Two nodes
             // that disagree about this don't fail to start, they fail to talk.
-            let gossipsub_config = feed_protocol::gossipsub_config()
+            let gossipsub_config = indicium_protocol::gossipsub_config()
                 .expect("the shared gossipsub configuration is not valid");
 
             let groups = gossipsub::Behaviour::new(
@@ -3815,6 +3993,9 @@ fn main() {
             // Files
             get_files,
             mark_files_seen,
+            resume_file,
+            reoffer_file,
+            watch_offer,
             inspect_files,
             // Groups
             save_group,
@@ -3850,7 +4031,7 @@ mod tests {
 
     /// A private directory for one test to work in.
     fn scratch_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("feed-test-{}-{}", std::process::id(), name));
+        let dir = std::env::temp_dir().join(format!("indicium-test-{}-{}", std::process::id(), name));
 
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("could not create the scratch directory");

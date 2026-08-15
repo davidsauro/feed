@@ -5,8 +5,8 @@
 //! published by one arrives at the other, the only path it can have taken is
 //! through the server, which is the whole premise the design rests on.
 //!
-//!     cargo run -p feed-server --example probe -- <server address> <topic>
-//!     cargo run -p feed-server --example probe -- <server address> <topic> "hello"
+//!     cargo run -p indicium-server --example probe -- <server address> <topic>
+//!     cargo run -p indicium-server --example probe -- <server address> <topic> "hello"
 //!
 //! Without a message it listens and prints what arrives. With one it waits for
 //! the server to start carrying the conversation, then publishes.
@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_behaviour(|key| {
             // The same configuration the app and the server use. A probe that
             // configured gossipsub differently would prove nothing about them.
-            let config = feed_protocol::gossipsub_config().expect("shared config is not valid");
+            let config = indicium_protocol::gossipsub_config().expect("shared config is not valid");
 
             ProbeBehaviour {
                 gossipsub: gossipsub::Behaviour::new(

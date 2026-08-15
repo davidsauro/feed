@@ -287,6 +287,20 @@ pub async fn fetch(
     let mut last_error = "could not start".to_string();
 
     for attempt in 1..=MAX_ATTEMPTS {
+        // Said out loud before each attempt rather than only at the end. A dial
+        // to somebody who is not there spends its full timeout before failing,
+        // so all five attempts can take the better part of three minutes, and
+        // saying nothing for that long is indistinguishable from having ignored
+        // the request.
+        let waiting = if attempt == 1 {
+            "reaching them".to_string()
+        } else {
+            format!("no answer, trying again ({} of {})", attempt, MAX_ATTEMPTS)
+        };
+
+        let _ = crate::set_file_status(&app, &transfer_id, "pending", Some(&waiting));
+        let _ = app.emit("file-changed", &transfer_id);
+
         match fetch_inner(&app, &mut control, peer, &transfer_id).await {
             Ok(()) => {
                 let _ = crate::set_file_status(&app, &transfer_id, "complete", None);
@@ -641,7 +655,7 @@ mod tests {
 
     #[test]
     fn a_taken_name_gets_a_number() {
-        let directory = std::env::temp_dir().join(format!("feed-names-{}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!("indicium-names-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
 
         let first = available_path(&directory, "report.pdf");

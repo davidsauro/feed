@@ -12,7 +12,7 @@ Throughout: **A** and **B** are the two machines, **S** is the server.
 
 | Check | How | Expect |
 |---|---|---|
-| S is up | `docker logs feed-server` | `reachable at <your address>`, no `WARNING` |
+| S is up | `docker logs indicium-server` | `reachable at <your address>`, no `WARNING` |
 | S carries conversations | `probe` example, twice | The message arrives |
 | S relays connections | `circuit_probe` example | `OK: 25 MiB crossed the relay` |
 | A reservation survives the app's ordering | `reserve_probe` example | `RESERVED: …/p2p-circuit/…` |
@@ -72,7 +72,7 @@ sides must do it.
 Copy it. Do not read it off the screen and type it. Every peer id starts
 `12D3KooW`, so a wrong one looks entirely plausible, and the result is two people
 subscribed to different conversations with no obvious sign of it. If you want to
-be sure, `docker logs feed-server` shows a `carrying` line per conversation, and
+be sure, `docker logs indicium-server` shows a `carrying` line per conversation, and
 two people who have added each other correctly share one: the second to connect
 produces one fewer line than they have contacts.
 
@@ -128,14 +128,32 @@ because the whole process is suspended rather than just the network.
 
 Stop the receiving app partway and start it again.
 
-- The partial file should still be on disk.
-- Whether it resumes by itself or needs the sender to offer again is worth
-  recording either way. **This is not implemented**, so expect it to sit as
-  failed. What matters is that the partial file is kept and nothing is corrupted.
+- On restart it should read as **interrupted, and can be resumed**, not as still
+  receiving. A transfer that was in flight when the app stopped is not in flight
+  now, and saying otherwise is the interface reporting something that was true
+  once.
+- A **Resume** button should be on that row. Pressing it asks for the rest and
+  the progress bar should carry on from where it stopped rather than from zero.
+- Pressing it while the sender is **offline** should say `reaching them`, then
+  `no answer, trying again (2 of 5)` and so on. Five attempts, each able to
+  spend a full dial timeout, so it keeps trying for the better part of three
+  minutes. Bringing the sender back within that window picks the transfer up
+  without pressing anything again.
+- The sender has a Resume button too. Pressing it offers the same file again
+  rather than sending a second copy, and the receiver picks up from where it
+  stopped. Either side can start it off.
+- Pressing it while the **receiver** is offline should count out
+  `waiting for them (1 of 4)` and end at `they are not answering`, with the
+  Resume button back. An offer is an ordinary message and nothing stores those,
+  so one sent to a node that is not running is gone: it does not go through when
+  they return, and a row that says it is waiting is saying something untrue.
+- Failures should read as a short phrase, not a paragraph. The full text is on
+  hover. A relay failure in particular arrives as three hundred characters of
+  nested causes and two addresses, and a row is not the place for it.
 
 ### 4d. Restart the server mid-transfer
 
-`docker restart feed-server`. The transfer will fail. Once the server is back,
+`docker restart indicium-server`. The transfer will fail. Once the server is back,
 both clients should reconnect within 30 seconds and a new transfer should work.
 
 ## 5. Circuit limits
@@ -144,8 +162,8 @@ Only if you want to see the failure mode described in the docs. On S:
 
 ```bash
 # a deliberately small budget
-sed -i 's/max_circuit_bytes = 0/max_circuit_bytes = 2097152/' data/feed-server.toml
-docker restart feed-server
+sed -i 's/max_circuit_bytes = 0/max_circuit_bytes = 2097152/' data/indicium-server.toml
+docker restart indicium-server
 ```
 
 Send a 10 MB file. It should stop around 2 MB, then **retry and resume**,
@@ -180,7 +198,7 @@ For anything that fails, this is what makes it fixable:
 - Which step, and which machine was sending.
 - Whether A and B were on the same network.
 - The exact message shown.
-- The last few lines of `docker logs feed-server`.
+- The last few lines of `docker logs indicium-server`.
 - Whether it fails every time or sometimes. **Sometimes is the more important
   answer**, and the one people forget to check.
 
@@ -188,9 +206,9 @@ For anything that fails, this is what makes it fixable:
 
 Not bugs, and worth knowing so they are not reported as such:
 
-- **A transfer interrupted by closing the app does not resume by itself.** The
-  partial file is kept and the offset is recorded, and nothing yet retries it on
-  startup.
+- **A transfer interrupted by closing the app does not resume by itself.** It is
+  marked resumable on the next start and there is a Resume button, but nothing
+  picks it up unprompted.
 - **No hole punching.** Every relayed byte crosses the server, so a transfer
   between two machines in the same building still goes out to S and back if they
   cannot see each other directly. DCUtR would fix that and is not written.

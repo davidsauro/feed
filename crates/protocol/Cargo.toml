@@ -1,5 +1,5 @@
 [package]
-name = "feed-protocol"
+name = "indicium-protocol"
 description = "The parts of the network both the app and the server must agree on"
 version.workspace = true
 edition.workspace = true

@@ -117,4 +117,4 @@ echo "On WSL2 it is usually better to enable Docker Desktop's integration for"
 echo "this distro than to run a second daemon inside it."
 echo
 echo "The server itself builds with cargo alone and needs nothing extra:"
-echo "  cargo run -p feed-server"
+echo "  cargo run -p indicium-server"

@@ -1,11 +1,11 @@
 [package]
-name = "feed-server"
+name = "indicium-server"
 description = "Carries traffic between nodes that cannot reach each other directly"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-feed-protocol.workspace = true
+indicium-protocol.workspace = true
 libp2p.workspace = true
 tokio.workspace = true
 futures.workspace = true

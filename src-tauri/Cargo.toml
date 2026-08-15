@@ -1,5 +1,5 @@
 [package]
-name = "tauri-feed"
+name = "indicium"
 # From the workspace, like the other two crates, so one place decides and the
 # three cannot drift apart.
 version.workspace = true
@@ -17,7 +17,7 @@ tauri = { version = "2", features = [] }
 
 # Inherited from the workspace, so the app and the server cannot end up on
 # different versions of the things they use to talk to each other.
-feed-protocol.workspace = true
+indicium-protocol.workspace = true
 libp2p.workspace = true
 tokio.workspace = true
 futures.workspace = true

@@ -47,6 +47,7 @@ const emit = defineEmits<{
   attach: [];
   openFile: [file: FileTransfer];
   revealFile: [file: FileTransfer];
+  resumeFile: [file: FileTransfer];
 }>();
 
 /**
@@ -161,6 +162,7 @@ watch(
           :outgoing="entry.file.direction === 'outgoing'"
           @open="emit('openFile', $event)"
           @reveal="emit('revealFile', $event)"
+          @resume="emit('resumeFile', $event)"
         />
       </template>
     </div>

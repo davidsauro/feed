@@ -1,4 +1,4 @@
-# Configuring feed-server
+# Configuring indicium-server
 
 Everything here is optional. A server started with no configuration at all
 listens on port 4001 and carries traffic for anyone, which is a useful thing to
@@ -9,14 +9,14 @@ For running the thing in the first place, see [README.md](README.md).
 
 ## How configuration is loaded
 
-The server reads `feed-server.toml` from its working directory. In the container
+The server reads `indicium-server.toml` from its working directory. In the container
 that is `/data`, which is the mounted volume, so the file belongs at
-`data/feed-server.toml` alongside the identity.
+`data/indicium-server.toml` alongside the identity.
 
 A different path can be given as the first argument:
 
 ```bash
-feed-server /etc/feed/relay.toml
+indicium-server /etc/indicium/relay.toml
 ```
 
 Three rules govern what happens next:
@@ -341,7 +341,7 @@ busy server.
 ### Checking it works
 
 ```bash
-cargo run -p feed-server --example circuit_probe -- <server address> 25
+cargo run -p indicium-server --example circuit_probe -- <server address> 25
 ```
 
 Two peers in one process, neither told the other's address, exchanging 25 MiB
@@ -432,7 +432,7 @@ nothing to obtain, renew, or configure. A reverse proxy in front of this server
 is not useful and will break the handshake.
 
 **Logging configuration.** The server prints to standard output and that is all.
-`docker logs feed-server` is the interface.
+`docker logs indicium-server` is the interface.
 
 **A metrics endpoint.** Nothing is exported. What a client can see about a server
 it uses is in the app, under Settings, including round trip time and the reason

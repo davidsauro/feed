@@ -64,11 +64,11 @@ const ENVELOPE_VERSION: u8 = 1;
 
 /// Separates this use of a shared secret from any other. Two systems deriving
 /// keys from the same secret should never arrive at the same key.
-const KEY_WRAP_INFO: &[u8] = b"feed/group-key-wrap/v1";
+const KEY_WRAP_INFO: &[u8] = b"indicium/group-key-wrap/v1";
 
 /// Separates the conversation-naming use of a shared secret from the key-wrapping
 /// use of the very same secret.
-const DIRECT_TOPIC_INFO: &[u8] = b"feed/direct-topic/v1";
+const DIRECT_TOPIC_INFO: &[u8] = b"indicium/direct-topic/v1";
 
 /// The multihash code meaning "this is the key itself, not a hash of it".
 const MULTIHASH_IDENTITY_CODE: u64 = 0x00;
@@ -280,7 +280,7 @@ pub fn direct_topic_id(keypair: &Keypair, peer: &PeerId) -> Result<String, Strin
 /// what the sender used. That is what stops a member replaying somebody else's
 /// message as their own, or moving one between groups.
 fn binding_context(group_id: &str, sender: &PeerId) -> String {
-    format!("feed/group/v{}|{}|{}", ENVELOPE_VERSION, group_id, sender)
+    format!("indicium/group/v{}|{}|{}", ENVELOPE_VERSION, group_id, sender)
 }
 
 /// Turns a shared secret into the key that wraps the content key.

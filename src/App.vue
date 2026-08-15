@@ -1052,19 +1052,23 @@ async function sendOneFile(contact: Contact, path: string) {
     // announced separately so it arrives exactly when it is needed.
     const addresses = await relayedAddresses();
 
-    await invoke("send_direct", {
-      peerId: contact.peer_id,
-      message: JSON.stringify({
-        type: "file-offer",
-        id: file.id,
-        name: file.name,
-        size: file.size,
-        hash: file.hash,
-        key: file.key,
-        addresses,
-        sentAt,
-      }),
+    const offer = JSON.stringify({
+      type: "file-offer",
+      id: file.id,
+      name: file.name,
+      size: file.size,
+      hash: file.hash,
+      key: file.key,
+      addresses,
+      sentAt,
     });
+
+    await invoke("send_direct", { peerId: contact.peer_id, message: offer });
+
+    // An offer is an ordinary message and nothing stores those, so one sent to
+    // somebody who is not running is gone. This repeats it a few times and then
+    // says so, rather than leaving a row that waits for ever.
+    await invoke("watch_offer", { id: file.id, message: offer });
   } catch (error) {
     notify(`Could not send that file: ${error}`);
   }
@@ -1106,6 +1110,55 @@ async function receiveOffer(
   } catch (error) {
     notify(`Could not accept ${offer.name}: ${error}`);
   }
+}
+
+/**
+ * Asks again for the rest of a transfer that stopped partway.
+ *
+ * Only the receiving side can do this, because the receiver is the one who
+ * knows how much it already has. The sender serves whatever chunk it is asked
+ * for, so nothing on their end needs to be retried or re-offered.
+ */
+async function resumeFile(file: FileTransfer) {
+  try {
+    if (file.direction === "incoming") {
+      // We hold the partial file, so we are the ones who ask for the rest.
+      await invoke("resume_file", { id: file.id });
+    } else {
+      await reoffer(file);
+    }
+
+    await loadFiles();
+  } catch (error) {
+    notify(`Could not pick that up again: ${error}`);
+  }
+}
+
+/**
+ * Offers a file again, keeping the same transfer.
+ *
+ * The sender cannot push, so this does not resend anything. It puts the offer
+ * back in front of the recipient, who still has whatever arrived last time and
+ * asks from there. Same id throughout, which is what makes it the same transfer
+ * rather than a second copy alongside the first.
+ */
+async function reoffer(file: FileTransfer) {
+  const restored = await invoke<FileTransfer>("reoffer_file", { id: file.id });
+  const addresses = await relayedAddresses();
+
+  const offer = JSON.stringify({
+    type: "file-offer",
+    id: restored.id,
+    name: restored.name,
+    size: restored.size,
+    hash: restored.hash,
+    key: restored.key,
+    addresses,
+    sentAt: restored.sent_at,
+  });
+
+  await invoke("send_direct", { peerId: restored.peer_id, message: offer });
+  await invoke("watch_offer", { id: restored.id, message: offer });
 }
 
 async function openFile(file: FileTransfer) {
@@ -2162,12 +2215,14 @@ function parsePayload(
         :staged="staged"
         :selected-peer-id="selectedContact?.peer_id ?? null"
         :newly-arrived="newlyArrived"
+        :online-peers="onlinePeers"
         @add="stageFilesFor"
         @send="sendStaged"
         @unstage="unstage"
         @clear="clearStaged"
         @open="openFile"
         @reveal="revealFile"
+        @resume="resumeFile"
       />
 
       <ChatPane
@@ -2184,6 +2239,7 @@ function parsePayload(
         @attach="attachFiles"
         @open-file="openFile"
         @reveal-file="revealFile"
+        @resume-file="resumeFile"
       />
 
       <ChatPane

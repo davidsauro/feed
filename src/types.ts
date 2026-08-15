@@ -204,6 +204,58 @@ export function describeProblem(file: PickedFile): string | null {
   return null;
 }
 
+/**
+ * A transfer failure as something worth reading in a list.
+ *
+ * libp2p reports these in its own terms, which are precise and unbounded: a
+ * failed relay dial arrives as a nested chain of causes wrapped around two full
+ * multiaddresses. That is the right thing for a log and the wrong thing for a
+ * row in a list, where it swamps everything around it.
+ *
+ * So the known ones are said plainly and anything else is cut short. The full
+ * text is kept for a tooltip, since the detail matters exactly when somebody is
+ * trying to work out why.
+ */
+export function describeTransferError(error: string): string {
+  // The other end has no reservation on the relay, which in practice means they
+  // are not running.
+  if (error.includes("no reservation")) {
+    return "they are not reachable right now";
+  }
+
+  if (error.includes("no addresses for peer")) {
+    return "no way to reach them was given";
+  }
+
+  if (error.includes("did not say where")) {
+    return "they did not say where to find them";
+  }
+
+  if (error.includes("Failed to negotiate transport") || error.includes("Failed to connect")) {
+    return "could not connect to them";
+  }
+
+  if (error.includes("does not match")) {
+    return "what arrived did not match what was sent";
+  }
+
+  // A relay cutting a connection off at its byte limit.
+  if (error.includes("Max circuit bytes")) {
+    return "the server stopped carrying it";
+  }
+
+  if (error.includes("connection is closed") || error.includes("ConnectionReset")) {
+    return "the connection closed";
+  }
+
+  if (error.includes("in time")) {
+    return "they did not answer in time";
+  }
+
+  // Anything unrecognised, kept short enough not to take over the row.
+  return error.length > 60 ? `${error.slice(0, 57)}…` : error;
+}
+
 /** Bytes as something a person reads. */
 export function describeSize(bytes: number): string {
   if (bytes < 1024) {

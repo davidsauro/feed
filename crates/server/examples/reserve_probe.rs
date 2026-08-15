@@ -6,7 +6,7 @@
 //! dials the relay itself when it does not. A dial issued while one is already
 //! in flight is refused, taking the reservation with it.
 //!
-//!     cargo run -p feed-server --example reserve_probe -- <server address> [when]
+//!     cargo run -p indicium-server --example reserve_probe -- <server address> [when]
 //!
 //! `when` is `after` (the default, what the app does now) or `during`, which
 //! reproduces the failure.
@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let address = std::env::args().nth(1).ok_or("a server address is required")?;
     let when = std::env::args().nth(2).unwrap_or_else(|| "after".to_string());
 
-    let (relay_peer, server) = feed_protocol::parse_server_address(&address)?;
+    let (relay_peer, server) = indicium_protocol::parse_server_address(&address)?;
 
     let mut swarm =
         libp2p::SwarmBuilder::with_existing_identity(identity::Keypair::generate_ed25519())
