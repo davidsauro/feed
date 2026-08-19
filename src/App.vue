@@ -866,9 +866,17 @@ function rememberFile(file: FileTransfer) {
  * One offer per file rather than one for the batch, so that a file that fails
  * takes only itself down.
  */
+/**
+ * Sends files from whichever conversation is open.
+ *
+ * A group takes a different path to one person, since it becomes one transfer
+ * per member, but from here it is the same gesture in the same place.
+ */
 async function attachFiles() {
   if (selectedContact.value) {
     await attachFilesTo(selectedContact.value.peer_id);
+  } else if (selectedGroup.value) {
+    await sendFilesToGroup(selectedGroup.value.id);
   }
 }
 
@@ -1023,6 +1031,89 @@ watch(view, async (now) => {
   }
 });
 
+/**
+ * Picks files and sends them to everybody in a group.
+ *
+ * One transfer per member, each offered to that member alone, so somebody who
+ * is offline fails on their own and can be tried again on their own. The file
+ * is read and hashed once however many members there are.
+ */
+async function sendFilesToGroup(groupId: string) {
+  const group = groups.value.find((candidate) => candidate.id === groupId);
+  if (!group) {
+    return;
+  }
+
+  const paths = await pickPaths(`Send to ${group.name}`);
+  if (paths.length === 0) {
+    return;
+  }
+
+  // One batch for everything chosen together, which is what lets a member's
+  // row say "file three of five" about this send rather than about everything
+  // ever sent to the group.
+  const batch = crypto.randomUUID();
+  const addresses = await relayedAddresses();
+
+  for (const path of paths) {
+    const sentAt = Date.now();
+
+    let transfers: FileTransfer[];
+    try {
+      transfers = await invoke<FileTransfer[]>("send_file_to_group", {
+        groupId,
+        path,
+        sentAt,
+        batch,
+      });
+    } catch (error) {
+      notify(`Could not send that file: ${error}`);
+      continue;
+    }
+
+    for (const transfer of transfers) {
+      rememberFile(transfer);
+      await offerFile(transfer, addresses, sentAt);
+    }
+  }
+}
+
+/**
+ * Puts one transfer in front of its recipient and watches whether they take it.
+ *
+ * Shared by every path that offers a file, so that a group send gets the same
+ * treatment as a single one: repeated a few times if nobody answers, and then
+ * called a failure rather than waiting for ever.
+ */
+async function offerFile(file: FileTransfer, addresses: string[], sentAt: number) {
+  const offer = JSON.stringify({
+    type: "file-offer",
+    id: file.id,
+    name: file.name,
+    size: file.size,
+    hash: file.hash,
+    key: file.key,
+    addresses,
+    groupId: file.group_id,
+    batch: file.batch,
+    sentAt,
+  });
+
+  try {
+    await invoke("send_direct", { peerId: file.peer_id, message: offer });
+    await invoke("watch_offer", { id: file.id, message: offer });
+  } catch (error) {
+    console.error(`Could not offer ${file.name} to ${file.peer_id}`, error);
+  }
+}
+
+/** Try again everything that failed for one member of a group. */
+async function resumeMember(files: FileTransfer[]) {
+  for (const file of files) {
+    await resumeFile(file);
+  }
+}
+
 /** Where this node can be reached through a relay, if anywhere. */
 async function relayedAddresses(): Promise<string[]> {
   try {
@@ -1043,6 +1134,8 @@ async function sendOneFile(contact: Contact, path: string) {
       peerId: contact.peer_id,
       path,
       sentAt,
+      groupId: null,
+      batch: null,
     });
 
     rememberFile(file);
@@ -2216,7 +2309,10 @@ function parsePayload(
         :selected-peer-id="selectedContact?.peer_id ?? null"
         :newly-arrived="newlyArrived"
         :online-peers="onlinePeers"
+        :groups="groups"
         @add="stageFilesFor"
+        @add-to-group="sendFilesToGroup"
+        @resume-member="resumeMember"
         @send="sendStaged"
         @unstage="unstage"
         @clear="clearStaged"
@@ -2255,6 +2351,7 @@ function parsePayload(
         :can-add-members="true"
         @send="sendGroupMessage"
         @retry="retryMessage"
+        @attach="attachFiles"
         @add-members="addingMembers = true"
       />
 

@@ -179,6 +179,28 @@ Put it back to `0` afterwards.
 3. Check the Files view groups them under the right contact, with counts and a
    total size that look right.
 
+## 6b. Files to a group
+
+Needs a group with at least two other members, one of which you can take offline.
+
+1. Open the group and use the attach button, or Add files on its section in the
+   Files view. Send two or three files at once.
+2. In the Files view the group gets a section of its own, above the one to one
+   history, with **one line per member** rather than one per file. Three members
+   and three files is three lines, not nine.
+3. A member's line should say how far along they are and, while something is
+   moving, which file. Opening it with the arrow shows their files.
+4. **Take one member offline and send again.** Everyone else should complete.
+   The absent member should count out its attempts and end at "they are not
+   answering", and their line should say something did not go, in red, without
+   needing to be opened.
+5. **Resume on that member's line** should retry only their failures. Nobody
+   else is disturbed.
+6. Bring them back and press it again. It should go through, resuming any
+   partial file rather than starting over.
+7. Check the size limit: a file over 25 MB should be refused if **any** member
+   has to be reached through a relay, even when the others are on this network.
+
 ## 7. Things that should fail cleanly
 
 Failure is fine. Failing in a way nobody can act on is not.
@@ -212,6 +234,8 @@ Not bugs, and worth knowing so they are not reported as such:
 - **No hole punching.** Every relayed byte crosses the server, so a transfer
   between two machines in the same building still goes out to S and back if they
   cannot see each other directly. DCUtR would fix that and is not written.
-- **Groups cannot send files.** One to one only.
+- **A group's files appear in the Files view, not in the group conversation.**
+  One file sent to fifteen people is fifteen transfers, and showing that in a
+  conversation would show the same file fifteen times.
 - **Nothing checks free disk space**, so an unlimited transfer on a local network
   can fill a disk.

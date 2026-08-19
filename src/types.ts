@@ -160,6 +160,16 @@ export interface FileTransfer {
    */
   addresses: string | null;
   /**
+   * The group this belonged to, if it went to a group at all.
+   *
+   * A group send is one transfer per member rather than one transfer to many,
+   * so a member who is offline fails alone and can be tried again alone. This
+   * is what gathers them back together for display.
+   */
+  group_id: string | null;
+  /** Which send it belonged to, so "file three of five" counts that send. */
+  batch: string | null;
+  /**
    * Whether this has been looked at since it arrived.
    *
    * Only meaningful on an incoming file. Nothing arrives with a prompt, so this
