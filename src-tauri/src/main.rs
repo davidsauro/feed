@@ -683,7 +683,10 @@ fn create_tables(conn: &Connection) -> SqlResult<()> {
             transferred INTEGER NOT NULL DEFAULT 0,
             error       TEXT,
             sent_at     INTEGER NOT NULL,
-            seen        INTEGER NOT NULL DEFAULT 0
+            seen        INTEGER NOT NULL DEFAULT 0,
+            addresses   TEXT,
+            group_id    TEXT,
+            batch       TEXT
         )",
         (),
     )?;
@@ -724,6 +727,8 @@ fn add_missing_columns(conn: &Connection) -> SqlResult<()> {
     // announce every file the user has ever received as new, so they start as
     // seen and only genuinely new arrivals raise the badge.
     add_column_if_missing(conn, "files", "addresses", "TEXT")?;
+    add_column_if_missing(conn, "files", "group_id", "TEXT")?;
+    add_column_if_missing(conn, "files", "batch", "TEXT")?;
 
     if add_column_if_missing(conn, "files", "seen", "INTEGER NOT NULL DEFAULT 0")? {
         conn.execute("UPDATE files SET seen = 1", ())?;
@@ -898,6 +903,19 @@ pub struct FileTransfer {
     pub transferred: u64,
     pub error: Option<String>,
     pub sent_at: i64,
+    /// The group this was sent to, if it went to a group at all.
+    ///
+    /// A group send is not one transfer to many people. It is many ordinary
+    /// transfers that happen to share a group, so a member who is offline fails
+    /// on their own and can be tried again on their own. This is what gathers
+    /// them back together for display.
+    pub group_id: Option<String>,
+    /// Which send this belonged to.
+    ///
+    /// Five files chosen at once are one batch. Without it there is no way to
+    /// say "file three of five" to a group you have sent to before, because
+    /// everything ever sent there would be part of the count.
+    pub batch: Option<String>,
     /// Where the sender said they could be reached, as a JSON array.
     ///
     /// Only meaningful on an incoming transfer, and only when the sender cannot
@@ -914,7 +932,8 @@ pub struct FileTransfer {
 }
 
 const FILE_COLUMNS: &str =
-    "id, peer_id, direction, name, size, hash, key, path, status, transferred, error, sent_at, seen, addresses";
+    "id, peer_id, direction, name, size, hash, key, path, status, transferred, error, sent_at, \
+     seen, addresses, group_id, batch";
 
 fn read_file_row(row: &rusqlite::Row) -> SqlResult<FileTransfer> {
     Ok(FileTransfer {
@@ -932,6 +951,8 @@ fn read_file_row(row: &rusqlite::Row) -> SqlResult<FileTransfer> {
         sent_at: row.get(11)?,
         seen: row.get::<_, i64>(12)? != 0,
         addresses: row.get(13)?,
+        group_id: row.get(14)?,
+        batch: row.get(15)?,
     })
 }
 
@@ -1389,6 +1410,112 @@ async fn resume_file(
     Ok(())
 }
 
+/// Prepares one file to be sent to every member of a group.
+///
+/// A group send is not one transfer to many people. It is one transfer per
+/// member, each an ordinary one to one transfer tagged with the group, which
+/// means everything already built works on it untouched: serving, pulling,
+/// resuming, the offer watch, progress, and retrying one member without
+/// disturbing the others. A member who is offline fails alone.
+///
+/// The file is read and hashed once rather than once per member, which for
+/// fifteen members and a large file is the difference between a moment and a
+/// minute. They share a key as well, which costs nothing: everyone here is
+/// already able to read everything sent to the group.
+///
+/// Nothing is sent from here. The caller puts each of these in an offer to its
+/// own member, exactly as it does for one person.
+#[tauri::command]
+async fn send_file_to_group(
+    app: AppHandle,
+    group_id: String,
+    path: String,
+    sent_at: i64,
+    batch: String,
+) -> Result<Vec<FileTransfer>, String> {
+    let members = {
+        let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
+        let mut members = get_group_members(&conn, &group_id).map_err(|e| e.to_string())?;
+
+        // Sending a file to ourselves is not a transfer, it is a copy we
+        // already have.
+        let me = get_identity(app.clone())?;
+        members.retain(|member| member != &me);
+        members
+    };
+
+    if members.is_empty() {
+        return Err("there is nobody else in that group".to_string());
+    }
+
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| format!("could not read {}: {}", path, e))?;
+
+    if !metadata.is_file() {
+        return Err(format!("{} is not a file", path));
+    }
+
+    let size = metadata.len();
+
+    // The strictest limit of anyone in the group. One member reachable only
+    // through a relay is enough to cap it, since the file has to reach them
+    // too, and refusing here beats refusing for that one person later.
+    let limit = members
+        .iter()
+        .filter_map(|member| size_limit_for(&app, member))
+        .min();
+
+    if let Some(limit) = limit {
+        if size > limit {
+            return Err(format!(
+                "that file is {:.1}MB. At least one member has to be reached through a relay \
+                 server, which is limited to {}MB",
+                size as f64 / (1024.0 * 1024.0),
+                limit / (1024 * 1024)
+            ));
+        }
+    }
+
+    let name = std::path::Path::new(&path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+
+    // Once, however many members there are.
+    let hash = file_transfer::hash_file(&path).await?;
+    let key = file_crypto::FileKey::generate();
+    let encoded_key = file_transfer::encode_key(&key);
+
+    let mut transfers = Vec::with_capacity(members.len());
+
+    for member in members {
+        let transfer = FileTransfer {
+            id: random_id(),
+            peer_id: member,
+            direction: "outgoing".to_string(),
+            name: name.clone(),
+            size,
+            hash: hash.clone(),
+            key: encoded_key.clone(),
+            path: Some(path.clone()),
+            status: "offered".to_string(),
+            transferred: 0,
+            error: None,
+            sent_at,
+            seen: true,
+            addresses: None,
+            group_id: Some(group_id.clone()),
+            batch: Some(batch.clone()),
+        };
+
+        insert_file(&app, &transfer)?;
+        transfers.push(transfer);
+    }
+
+    Ok(transfers)
+}
+
 /// Marks everything that has finished arriving as looked at.
 ///
 /// Called when the files view is opened. A transfer still in flight is left
@@ -1472,11 +1599,16 @@ async fn inspect_files(
 /// travels as an ordinary sealed message, and the recipient then asks for the
 /// bytes.
 #[tauri::command]
+/// `group_id` is set when this is one member's copy of a send to a group, and
+/// `batch` says which send it belonged to, so "file three of five" can be
+/// counted. Both are absent for an ordinary one to one send.
 async fn send_file(
     app: AppHandle,
     peer_id: String,
     path: String,
     sent_at: i64,
+    group_id: Option<String>,
+    batch: Option<String>,
 ) -> Result<FileTransfer, String> {
     let metadata = tokio::fs::metadata(&path)
         .await
@@ -1522,6 +1654,8 @@ async fn send_file(
         sent_at,
         // Ours already, so there is nothing to notice about it.
         seen: true,
+        group_id,
+        batch,
         // Outgoing. We are the one being fetched from, so it is the recipient
         // who needs an address, not us.
         addresses: None,
@@ -1548,6 +1682,12 @@ pub struct IncomingOffer {
     pub hash: String,
     pub key: String,
     pub sent_at: i64,
+    /// The group this was sent to, when it was sent to one.
+    #[serde(default)]
+    pub group_id: Option<String>,
+    /// Which send it belonged to.
+    #[serde(default)]
+    pub batch: Option<String>,
     /// Where the sender says they can be reached through a relay.
     ///
     /// Carried in the offer rather than announced separately, which avoids the
@@ -1647,6 +1787,8 @@ async fn receive_file(
         key,
         sent_at,
         addresses,
+        group_id,
+        batch,
     } = offer;
 
     // Checked here as well as by the sender. A limit only one side enforces is a
@@ -1687,6 +1829,8 @@ async fn receive_file(
         sent_at,
         seen: false,
         addresses: encode_addresses(&addresses),
+        group_id,
+        batch,
     };
 
     insert_file(&app, &transfer)?;
@@ -1709,8 +1853,8 @@ fn insert_file(app: &AppHandle, transfer: &FileTransfer) -> Result<(), String> {
     let conn = get_db_connection(app).map_err(|e| e.to_string())?;
 
     conn.execute(
-        "INSERT OR IGNORE INTO files (id, peer_id, direction, name, size, hash, key, path, status, transferred, error, sent_at, seen, addresses)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        "INSERT OR IGNORE INTO files (id, peer_id, direction, name, size, hash, key, path, status, transferred, error, sent_at, seen, addresses, group_id, batch)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         (
             &transfer.id,
             &transfer.peer_id,
@@ -1726,6 +1870,8 @@ fn insert_file(app: &AppHandle, transfer: &FileTransfer) -> Result<(), String> {
             transfer.sent_at,
             i64::from(transfer.seen),
             &transfer.addresses,
+            &transfer.group_id,
+            &transfer.batch,
         ),
     )
     .map_err(|e| e.to_string())?;
@@ -3994,6 +4140,7 @@ fn main() {
             get_files,
             mark_files_seen,
             resume_file,
+            send_file_to_group,
             reoffer_file,
             watch_offer,
             inspect_files,
