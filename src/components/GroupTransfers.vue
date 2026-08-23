@@ -33,8 +33,6 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  /** Choose files and send them to everybody in this group. */
-  add: [groupId: string];
   /** Try again everything that failed for one member. */
   resumeMember: [files: FileTransfer[]];
   open: [file: FileTransfer];
@@ -144,13 +142,6 @@ function progress(member: Member): number {
         </span>
       </span>
 
-      <button
-        class="group-add"
-        :title="`Choose files to send to everybody in ${group.name}`"
-        @click="emit('add', group.id)"
-      >
-        Add files
-      </button>
     </header>
 
     <StagedTray
@@ -250,21 +241,6 @@ function progress(member: Member): number {
 .summary {
   font-size: 11px;
   color: var(--text-faint);
-}
-
-.group-add {
-  margin-left: auto;
-  flex: none;
-  padding: 5px 10px;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--text);
-}
-
-.group-add:hover {
-  background-color: var(--bg-hover);
 }
 
 /* Members ---------------------------------------------------------------- */

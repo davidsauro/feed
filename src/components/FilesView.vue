@@ -186,15 +186,9 @@ const groupSections = computed(() =>
       files: props.files.filter((file) => file.group_id === group.id),
       staged: props.staged[`group:${group.id}`] ?? [],
     }))
-    // A group with nothing yet appears once it is picked in the sidebar, so
-    // there is somewhere for its files to be staged and sent from. Otherwise
-    // sending to a group for the first time would have nowhere to happen.
-    .filter(
-      (section) =>
-        section.files.length > 0 ||
-        section.staged.length > 0 ||
-        (props.selection?.kind === "group" && props.selection.id === section.group.id),
-    )
+    // A group nothing has been sent to has nothing to show. It appears as soon
+    // as files are staged for it, which is where the tray then lives.
+    .filter((section) => section.files.length > 0 || section.staged.length > 0)
     .sort(
       (a, b) =>
         Math.max(...b.files.map((f) => f.sent_at)) -
@@ -293,7 +287,6 @@ function describeCounts(group: ContactFiles): string {
         :newly-arrived="newlyArrived"
         :staged="section.staged"
         :selected="selection?.kind === 'group' && selection.id === section.group.id"
-        @add="emit('addToGroup', $event)"
         @send="emit('send', `group:${section.group.id}`)"
         @clear="emit('clear', `group:${section.group.id}`)"
         @unstage="emit('unstage', `group:${section.group.id}`, $event)"

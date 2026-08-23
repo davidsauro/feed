@@ -183,9 +183,9 @@ Put it back to `0` afterwards.
 
 Needs a group with at least two other members, one of which you can take offline.
 
-1. Pick the group in the sidebar, then **Add files** at the top of the Files
-   view. It should offer the group by name, and the files should collect in a
-   tray under it rather than going straight out. Press Send.
+1. Pick the group in the sidebar, then **Add files for <group>** at the top of
+   the Files view. The group has no section until something is staged for it,
+   and appears with a tray once there is. Press Send.
 2. The conversation's attach button also works and sends straight away, moving
    you to the Files view as it does.
 3. The group gets a section of its own, above the one to one
