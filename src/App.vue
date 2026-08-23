@@ -324,13 +324,30 @@ const unseenFiles = computed(
     ).length,
 );
 
-/** The files belonging to whichever conversation is open. */
-const currentFiles = computed(() => {
-  if (selection.value?.kind !== "contact") {
-    return [];
+/**
+ * Whichever conversation is open, in the shape the Files view wants.
+ *
+ * It only needs enough to label a button and highlight a section, and taking
+ * the name here means the view does not have to look either list up itself.
+ */
+const filesSelection = computed(() => {
+  if (selectedContact.value) {
+    return {
+      kind: "contact" as const,
+      id: selectedContact.value.peer_id,
+      name: selectedContact.value.nickname,
+    };
   }
 
-  return files.value.filter((file) => file.peer_id === selection.value?.id);
+  if (selectedGroup.value) {
+    return {
+      kind: "group" as const,
+      id: selectedGroup.value.id,
+      name: selectedGroup.value.name,
+    };
+  }
+
+  return null;
 });
 
 /**
@@ -873,6 +890,15 @@ function rememberFile(file: FileTransfer) {
  * per member, but from here it is the same gesture in the same place.
  */
 async function attachFiles() {
+  if (!selectedContact.value && !selectedGroup.value) {
+    return;
+  }
+
+  // Transfers are shown in the Files view and nowhere else, so sending from a
+  // conversation moves there. Otherwise the button would appear to do nothing:
+  // the work happens somewhere you are not looking.
+  view.value = "files";
+
   if (selectedContact.value) {
     await attachFilesTo(selectedContact.value.peer_id);
   } else if (selectedGroup.value) {
@@ -923,52 +949,117 @@ async function stageFilesFor(peerId: string) {
     return;
   }
 
-  const paths = await pickPaths(`Add files for ${contact.nickname}`);
+  // The peer matters: a file only has a size limit when it has to cross a relay
+  // server to get there.
+  await stageFor(`contact:${peerId}`, contact.nickname, peerId);
+}
+
+/**
+ * Picks files and puts them in a group's tray.
+ *
+ * The strictest member decides what fits, since the file has to reach all of
+ * them, so the check asks about whichever one is hardest to reach.
+ */
+async function stageFilesForGroup(groupId: string) {
+  const group = groups.value.find((candidate) => candidate.id === groupId);
+  if (!group) {
+    return;
+  }
+
+  const others = group.members.filter((member) => member !== myPeerId.value);
+  if (others.length === 0) {
+    notify("There is nobody else in that group.");
+    return;
+  }
+
+  await stageFor(`group:${groupId}`, group.name, others);
+}
+
+/**
+ * Picks files and puts them in a tray without sending anything.
+ *
+ * Sizes are read here rather than at send time so the tray can say up front
+ * that something is too large, instead of accepting it and failing later. For a
+ * group that means asking about every member and keeping the worst answer.
+ */
+async function stageFor(key: string, recipient: string, against: string | string[]) {
+  const paths = await pickPaths(`Add files for ${recipient}`);
   if (paths.length === 0) {
     return;
   }
 
-  let picked: PickedFile[];
+  const peers = Array.isArray(against) ? against : [against];
+  let picked: PickedFile[] = [];
+
   try {
-    // The peer matters: a file only has a size limit when it has to cross a
-    // relay server to get there.
-    picked = await invoke<PickedFile[]>("inspect_files", { peerId, paths });
+    for (const peerId of peers) {
+      const seen = await invoke<PickedFile[]>("inspect_files", { peerId, paths });
+
+      // Keep whichever answer refuses a file, so one member reachable only
+      // through a relay caps the whole batch.
+      picked =
+        picked.length === 0
+          ? seen
+          : picked.map((file, at) => (seen[at]?.too_large ? seen[at] : file));
+    }
   } catch (error) {
     notify(`Could not read those files: ${error}`);
     return;
   }
 
-  const tray = staged.value[peerId] ?? [];
+  const tray = staged.value[key] ?? [];
 
   // Picking the same file twice should not queue it twice.
   const fresh = picked.filter(
     (file) => !tray.some((existing) => existing.path === file.path),
   );
 
-  staged.value = { ...staged.value, [peerId]: [...tray, ...fresh] };
+  staged.value = { ...staged.value, [key]: [...tray, ...fresh] };
 }
 
-/** Sends everything in a contact's tray, then empties it. */
-async function sendStaged(peerId: string) {
-  const contact = savedContacts.value.find((candidate) => candidate.peer_id === peerId);
-  const tray = staged.value[peerId];
-
-  if (!contact || !tray) {
+/**
+ * Sends everything in a tray, then empties it.
+ *
+ * The key says which kind of recipient it is, since a group becomes one
+ * transfer per member and a contact is one transfer.
+ */
+async function sendStaged(key: string) {
+  const tray = staged.value[key];
+  if (!tray) {
     return;
   }
 
   // Emptied first so a second press cannot send the same batch twice while the
-  // first one is still going out.
-  clearStaged(peerId);
+  // first is still going out.
+  clearStaged(key);
 
-  for (const file of tray.filter(canSend)) {
+  const sendable = tray.filter(canSend);
+  if (sendable.length === 0) {
+    return;
+  }
+
+  // Where the transfers will show up, which is not where the button was.
+  view.value = "files";
+
+  if (key.startsWith("group:")) {
+    await sendFilesToGroup(key.slice("group:".length), sendable.map((file) => file.path));
+    return;
+  }
+
+  const peerId = key.slice("contact:".length);
+  const contact = savedContacts.value.find((candidate) => candidate.peer_id === peerId);
+  if (!contact) {
+    return;
+  }
+
+  for (const file of sendable) {
     await sendOneFile(contact, file.path);
   }
 }
 
 /** Drops one file from a tray before it is sent. */
-function unstage(peerId: string, path: string) {
-  const tray = staged.value[peerId];
+function unstage(key: string, path: string) {
+  const tray = staged.value[key];
   if (!tray) {
     return;
   }
@@ -976,15 +1067,15 @@ function unstage(peerId: string, path: string) {
   const left = tray.filter((file) => file.path !== path);
 
   if (left.length === 0) {
-    clearStaged(peerId);
+    clearStaged(key);
   } else {
-    staged.value = { ...staged.value, [peerId]: left };
+    staged.value = { ...staged.value, [key]: left };
   }
 }
 
-function clearStaged(peerId: string) {
+function clearStaged(key: string) {
   const rest = { ...staged.value };
-  delete rest[peerId];
+  delete rest[key];
   staged.value = rest;
 }
 
@@ -1038,13 +1129,15 @@ watch(view, async (now) => {
  * is offline fails on their own and can be tried again on their own. The file
  * is read and hashed once however many members there are.
  */
-async function sendFilesToGroup(groupId: string) {
+async function sendFilesToGroup(groupId: string, chosen?: string[]) {
   const group = groups.value.find((candidate) => candidate.id === groupId);
   if (!group) {
     return;
   }
 
-  const paths = await pickPaths(`Send to ${group.name}`);
+  // Given when a tray is being emptied, picked here when the button is in a
+  // conversation and there is no tray involved.
+  const paths = chosen ?? (await pickPaths(`Send to ${group.name}`));
   if (paths.length === 0) {
     return;
   }
@@ -2306,12 +2399,12 @@ function parsePayload(
         :files="files"
         :contacts="savedContacts"
         :staged="staged"
-        :selected-peer-id="selectedContact?.peer_id ?? null"
+        :selection="filesSelection"
         :newly-arrived="newlyArrived"
         :online-peers="onlinePeers"
         :groups="groups"
         @add="stageFilesFor"
-        @add-to-group="sendFilesToGroup"
+        @add-to-group="stageFilesForGroup"
         @resume-member="resumeMember"
         @send="sendStaged"
         @unstage="unstage"
@@ -2328,14 +2421,10 @@ function parsePayload(
         :subtitle="shortPeerId(selectedContact.peer_id)"
         :online="selectedIsOnline"
         :messages="currentMessages"
-        :files="currentFiles"
         :my-peer-id="myPeerId"
         @send="sendMessage"
         @retry="retryMessage"
         @attach="attachFiles"
-        @open-file="openFile"
-        @reveal-file="revealFile"
-        @resume-file="resumeFile"
       />
 
       <ChatPane
@@ -2345,7 +2434,6 @@ function parsePayload(
         :subtitle="`${selectedGroup.members.length} members`"
         :online="null"
         :messages="currentMessages"
-        :files="[]"
         :my-peer-id="myPeerId"
         :sender-labels="groupSenderLabels"
         :can-add-members="true"

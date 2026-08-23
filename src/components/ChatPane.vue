@@ -9,10 +9,9 @@
  * Sending is reported upward. All this component owns is the draft text and
  * keeping the history scrolled to the newest message.
  */
-import { computed, nextTick, ref, watch } from "vue";
-import FileBubble from "./FileBubble.vue";
+import { nextTick, ref, watch } from "vue";
 import MessageBubble from "./MessageBubble.vue";
-import type { ChatMessage, FileTransfer } from "../types";
+import type { ChatMessage } from "../types";
 
 const props = defineProps<{
   /** Contact nickname, or group name. */
@@ -20,8 +19,6 @@ const props = defineProps<{
   /** Shortened peer ID, or the member count. */
   subtitle: string;
   messages: ChatMessage[];
-  /** Files sent or received in this conversation. */
-  files: FileTransfer[];
   /** Our own peer ID, used to tell our messages from theirs. */
   myPeerId: string;
   /**
@@ -44,38 +41,16 @@ const emit = defineEmits<{
   addMembers: [];
   /** A message that didn't go out should be tried again. */
   retry: [id: string];
+  /**
+   * Send files to whoever this conversation is with.
+   *
+   * The button stays here because this is where you are when you decide to send
+   * somebody something. What happens next does not: transfers are shown in the
+   * Files view, which the app moves to, rather than reported in two places that
+   * would have to agree.
+   */
   attach: [];
-  openFile: [file: FileTransfer];
-  revealFile: [file: FileTransfer];
-  resumeFile: [file: FileTransfer];
 }>();
-
-/**
- * Messages and files in one list, in the order they were sent.
- *
- * Sending somebody a file is a thing you said to them, so it belongs in the
- * conversation rather than only in a separate list. Merging here rather than
- * storing a file as a message too keeps one record of a transfer rather than two
- * that could disagree.
- */
-const timeline = computed(() => {
-  const entries = [
-    ...props.messages.map((message) => ({
-      key: `m:${message.id}`,
-      sentAt: message.sent_at,
-      message,
-      file: null as FileTransfer | null,
-    })),
-    ...props.files.map((file) => ({
-      key: `f:${file.id}`,
-      sentAt: file.sent_at,
-      message: null as ChatMessage | null,
-      file,
-    })),
-  ];
-
-  return entries.sort((a, b) => a.sentAt - b.sentAt);
-});
 
 const draft = ref("");
 const history = ref<HTMLElement | null>(null);
@@ -95,7 +70,7 @@ function send() {
  * conversation changes, which is what makes the newest message the one you see.
  */
 watch(
-  () => [props.title, props.messages.length, props.files.length],
+  () => [props.title, props.messages.length],
   async () => {
     await nextTick();
     if (history.value) {
@@ -143,28 +118,18 @@ watch(
     </header>
 
     <div ref="history" class="history">
-      <p v-if="timeline.length === 0" class="empty">
+      <p v-if="messages.length === 0" class="empty">
         No messages yet. Say hello.
       </p>
 
-      <template v-for="entry in timeline" :key="entry.key">
-        <MessageBubble
-          v-if="entry.message"
-          :message="entry.message"
-          :outgoing="entry.message.sender === myPeerId"
-          :sender-label="senderLabels?.[entry.message.sender]"
-          @retry="emit('retry', entry.message!.id)"
-        />
-
-        <FileBubble
-          v-else-if="entry.file"
-          :file="entry.file"
-          :outgoing="entry.file.direction === 'outgoing'"
-          @open="emit('openFile', $event)"
-          @reveal="emit('revealFile', $event)"
-          @resume="emit('resumeFile', $event)"
-        />
-      </template>
+      <MessageBubble
+        v-for="message in messages"
+        :key="message.id"
+        :message="message"
+        :outgoing="message.sender === myPeerId"
+        :sender-label="senderLabels?.[message.sender]"
+        @retry="emit('retry', message.id)"
+      />
     </div>
 
     <footer class="composer">

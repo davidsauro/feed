@@ -15,7 +15,8 @@
  */
 import { computed, ref } from "vue";
 import FileRow from "./FileRow.vue";
-import type { Contact, FileTransfer, Group } from "../types";
+import StagedTray from "./StagedTray.vue";
+import type { Contact, FileTransfer, Group, PickedFile } from "../types";
 import { describeSize, shortPeerId } from "../types";
 
 const props = defineProps<{
@@ -25,6 +26,10 @@ const props = defineProps<{
   contacts: Contact[];
   onlinePeers: Set<string>;
   newlyArrived: Set<string>;
+  /** Files picked for this group but not sent yet. */
+  staged: PickedFile[];
+  /** Whether this is the group picked in the sidebar. */
+  selected: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -35,6 +40,10 @@ const emit = defineEmits<{
   open: [file: FileTransfer];
   reveal: [file: FileTransfer];
   resume: [file: FileTransfer];
+  /** Send everything staged for this group. */
+  send: [];
+  clear: [];
+  unstage: [path: string];
 }>();
 
 interface Member {
@@ -127,7 +136,7 @@ function progress(member: Member): number {
   <section class="group">
     <header class="group-header">
       <span class="who">
-        <span class="name">{{ group.name }}</span>
+        <span class="name" :class="{ selected }">{{ group.name }}</span>
         <span class="summary">
           {{ members.length }}
           {{ members.length === 1 ? "person" : "people" }} · {{ files.length }}
@@ -144,7 +153,15 @@ function progress(member: Member): number {
       </button>
     </header>
 
-    <ul class="members">
+    <StagedTray
+      :files="staged"
+      :recipient="group.name"
+      @send="emit('send')"
+      @clear="emit('clear')"
+      @remove="emit('unstage', $event)"
+    />
+
+    <ul v-if="members.length" class="members">
       <li v-for="member in members" :key="member.peerId" class="member">
         <div class="member-row" :class="{ trouble: member.failed.length > 0 }">
           <button
@@ -222,6 +239,12 @@ function progress(member: Member): number {
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Whichever group is picked in the sidebar, so choosing one while looking at
+   files visibly points somewhere. */
+.name.selected {
+  color: var(--accent);
 }
 
 .summary {
