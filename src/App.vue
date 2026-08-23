@@ -31,6 +31,7 @@ import UnlockScreen from "./components/UnlockScreen.vue";
 import type {
   ChatMessage,
   Contact,
+  FileOffer,
   FileTransfer,
   Group,
   MessageStatus,
@@ -38,7 +39,7 @@ import type {
   Server,
   ServerStatus,
 } from "./types";
-import { canSend, shortPeerId } from "./types";
+import { canSend, readFileOffer, shortPeerId } from "./types";
 
 /** Which kind of thing a conversation is with. */
 type ConversationKind = "contact" | "group";
@@ -1166,7 +1167,7 @@ async function sendFilesToGroup(groupId: string, chosen?: string[]) {
 
     for (const transfer of transfers) {
       rememberFile(transfer);
-      await offerFile(transfer, addresses, sentAt);
+      await offerFile(transfer, addresses);
     }
   }
 }
@@ -1178,9 +1179,11 @@ async function sendFilesToGroup(groupId: string, chosen?: string[]) {
  * treatment as a single one: repeated a few times if nobody answers, and then
  * called a failure rather than waiting for ever.
  */
-async function offerFile(file: FileTransfer, addresses: string[], sentAt: number) {
-  const offer = JSON.stringify({
-    type: "file-offer",
+async function offerFile(file: FileTransfer, addresses: string[]) {
+  // Built from the transfer rather than from whatever the caller happens to
+  // hold, so every path offers the same thing. Three of these were written out
+  // by hand and two had already lost the group.
+  const details: FileOffer = {
     id: file.id,
     name: file.name,
     size: file.size,
@@ -1189,14 +1192,20 @@ async function offerFile(file: FileTransfer, addresses: string[], sentAt: number
     addresses,
     groupId: file.group_id,
     batch: file.batch,
-    sentAt,
-  });
+    sentAt: file.sent_at,
+  };
+
+  const offer = JSON.stringify({ type: "file-offer", ...details });
 
   try {
     await invoke("send_direct", { peerId: file.peer_id, message: offer });
+
+    // An offer is an ordinary message and nothing stores those, so one sent to
+    // somebody who is not running is gone. This repeats it a few times and then
+    // says so, rather than leaving a row that waits for ever.
     await invoke("watch_offer", { id: file.id, message: offer });
   } catch (error) {
-    console.error(`Could not offer ${file.name} to ${file.peer_id}`, error);
+    notify(`Could not offer ${file.name}: ${error}`);
   }
 }
 
@@ -1233,62 +1242,29 @@ async function sendOneFile(contact: Contact, path: string) {
 
     rememberFile(file);
 
-    // Where they should come and get it. Empty on a local network, where
-    // they can already reach us, and carried in the offer rather than
-    // announced separately so it arrives exactly when it is needed.
-    const addresses = await relayedAddresses();
-
-    const offer = JSON.stringify({
-      type: "file-offer",
-      id: file.id,
-      name: file.name,
-      size: file.size,
-      hash: file.hash,
-      key: file.key,
-      addresses,
-      sentAt,
-    });
-
-    await invoke("send_direct", { peerId: contact.peer_id, message: offer });
-
-    // An offer is an ordinary message and nothing stores those, so one sent to
-    // somebody who is not running is gone. This repeats it a few times and then
-    // says so, rather than leaving a row that waits for ever.
-    await invoke("watch_offer", { id: file.id, message: offer });
+    // Where they should come and get it. Empty on a local network, where they
+    // can already reach us, and carried in the offer rather than announced
+    // separately so it arrives exactly when it is needed.
+    await offerFile(file, await relayedAddresses());
   } catch (error) {
     notify(`Could not send that file: ${error}`);
   }
 }
 
 /** Handles a file somebody has offered us, and starts fetching it. */
-async function receiveOffer(
-  sender: string,
-  offer: {
-    id: string;
-    name: string;
-    size: number;
-    hash: string;
-    key: string;
-    addresses?: string[];
-  },
-  sentAt: number,
-) {
+async function receiveOffer(sender: string, offer: FileOffer) {
   const contact = savedContacts.value.find((saved) => saved.peer_id === sender);
 
   try {
+    // Passed through rather than transcribed. The field names are already the
+    // ones the backend expects, and listing them again here is exactly how the
+    // group a file belonged to used to be lost on arrival.
     const file = await invoke<FileTransfer>("receive_file", {
       offer: {
         peerId: sender,
         nickname: contact?.nickname ?? "",
-        id: offer.id,
-        name: offer.name,
-        size: offer.size,
-        hash: offer.hash,
-        key: offer.key,
-        // Absent from an offer sent by an older node, which simply means they
-        // are only reachable directly.
-        addresses: offer.addresses ?? [],
-        sentAt,
+        ...offer,
+        sentAt: claimedSentAt(offer.sentAt),
       },
     });
 
@@ -1330,21 +1306,8 @@ async function resumeFile(file: FileTransfer) {
  */
 async function reoffer(file: FileTransfer) {
   const restored = await invoke<FileTransfer>("reoffer_file", { id: file.id });
-  const addresses = await relayedAddresses();
 
-  const offer = JSON.stringify({
-    type: "file-offer",
-    id: restored.id,
-    name: restored.name,
-    size: restored.size,
-    hash: restored.hash,
-    key: restored.key,
-    addresses,
-    sentAt: restored.sent_at,
-  });
-
-  await invoke("send_direct", { peerId: restored.peer_id, message: offer });
-  await invoke("watch_offer", { id: restored.id, message: offer });
+  await offerFile(restored, await relayedAddresses());
 }
 
 async function openFile(file: FileTransfer) {
@@ -2096,29 +2059,12 @@ async function startSession() {
       Array.isArray(data.members)
     ) {
       await receiveInvite(sender, data.groupId, data.groupName, data.members);
-    } else if (
-      data.type === "file-offer" &&
-      data.id &&
-      data.name &&
-      typeof data.size === "number" &&
-      data.hash &&
-      data.key
-    ) {
-      await receiveOffer(
-        sender,
-        {
-          id: data.id,
-          name: data.name,
-          size: data.size,
-          hash: data.hash,
-          key: data.key,
-          // Where to go and get it. Without these there is no way to reach
-          // somebody who is not on this network, and the offer is the only
-          // place they are carried.
-          addresses: Array.isArray(data.addresses) ? data.addresses : [],
-        },
-        claimedSentAt(data.sentAt),
-      );
+    } else if (data.type === "file-offer") {
+      const offer = readFileOffer(data);
+
+      if (offer) {
+        await receiveOffer(sender, offer);
+      }
     } else if (data.type === "group-leave" && data.groupId) {
       await receiveDeparture(sender, data.groupId);
     }
@@ -2288,15 +2234,13 @@ function parsePayload(
   text?: string;
   messageIds?: string[];
   sentAt?: number;
-  name?: string;
-  size?: number;
-  hash?: string;
-  key?: string;
-  /** Where a file's sender says they can be reached. Offers only. */
-  addresses?: string[];
   groupId?: string;
   groupName?: string;
   members?: string[];
+  // A file offer carries more than this, and is read by readFileOffer rather
+  // than described twice. Listing its fields here as well is how they came to
+  // disagree.
+  [more: string]: unknown;
 } | null {
   try {
     return JSON.parse(message);

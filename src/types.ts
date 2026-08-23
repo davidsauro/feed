@@ -266,6 +266,70 @@ export function describeTransferError(error: string): string {
   return error.length > 60 ? `${error.slice(0, 57)}…` : error;
 }
 
+/**
+ * What a file offer carries between two nodes.
+ *
+ * The one description of that shape. Every offer is built from a value of this
+ * type and every arriving offer is read back into one, so a field added here
+ * has to be set by the sender and arrives at the receiver. Both sides used to
+ * list the fields by hand, in three places on the way out and one on the way
+ * in, and what happened is what always happens: they drifted. The group a file
+ * belonged to was sent by one of the three and thrown away on arrival, so a
+ * receiver could not tell a group file from a private one.
+ *
+ * Field names are those the Rust side expects, so an offer can be passed
+ * straight through rather than transcribed again.
+ */
+export interface FileOffer {
+  id: string;
+  name: string;
+  size: number;
+  hash: string;
+  key: string;
+  /** Where the sender can be reached, empty when only reachable directly. */
+  addresses: string[];
+  /** The group it was sent to, or null when it was sent to one person. */
+  groupId: string | null;
+  /** Which send it belonged to. */
+  batch: string | null;
+  sentAt: number;
+}
+
+/**
+ * Reads an offer that has arrived, or returns null if it is not one.
+ *
+ * Anything absent is filled in rather than refused, so an offer from an older
+ * node still works: it simply has no group and no addresses, which is what an
+ * older node meant.
+ */
+export function readFileOffer(payload: Record<string, unknown>): FileOffer | null {
+  const { id, name, size, hash, key } = payload;
+
+  if (
+    typeof id !== "string" ||
+    typeof name !== "string" ||
+    typeof size !== "number" ||
+    typeof hash !== "string" ||
+    typeof key !== "string"
+  ) {
+    return null;
+  }
+
+  return {
+    id,
+    name,
+    size,
+    hash,
+    key,
+    addresses: Array.isArray(payload.addresses)
+      ? payload.addresses.filter((one): one is string => typeof one === "string")
+      : [],
+    groupId: typeof payload.groupId === "string" ? payload.groupId : null,
+    batch: typeof payload.batch === "string" ? payload.batch : null,
+    sentAt: typeof payload.sentAt === "number" ? payload.sentAt : Date.now(),
+  };
+}
+
 /** Bytes as something a person reads. */
 export function describeSize(bytes: number): string {
   if (bytes < 1024) {

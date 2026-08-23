@@ -188,20 +188,23 @@ Needs a group with at least two other members, one of which you can take offline
    and appears with a tray once there is. Press Send.
 2. The conversation's attach button also works and sends straight away, moving
    you to the Files view as it does.
-3. The group gets a section of its own, above the one to one
+3. **On the receiving side too**, the files should appear under the group, not
+   under the sender as though they had been sent privately. Whether fourteen
+   other people have a copy is not a detail.
+4. The group gets a section of its own, above the one to one
    history, with **one line per member** rather than one per file. Three members
    and three files is three lines, not nine.
-4. A member's line should say how far along they are and, while something is
+5. A member's line should say how far along they are and, while something is
    moving, which file. Opening it with the arrow shows their files.
-5. **Take one member offline and send again.** Everyone else should complete.
+6. **Take one member offline and send again.** Everyone else should complete.
    The absent member should count out its attempts and end at "they are not
    answering", and their line should say something did not go, in red, without
    needing to be opened.
-6. **Resume on that member's line** should retry only their failures. Nobody
+7. **Resume on that member's line** should retry only their failures. Nobody
    else is disturbed.
-7. Bring them back and press it again. It should go through, resuming any
+8. Bring them back and press it again. It should go through, resuming any
    partial file rather than starting over.
-8. Check the size limit: a file over 25 MB should be refused if **any** member
+9. Check the size limit: a file over 25 MB should be refused if **any** member
    has to be reached through a relay, even when the others are on this network.
 
 ## 7. Things that should fail cleanly
