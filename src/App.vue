@@ -1407,6 +1407,11 @@ async function sendReadReceipt(peerId: string, messageIds: string[]) {
   }
 }
 
+/** Whether this is the conversation already open. */
+function isSelected(kind: ConversationKind, id: string): boolean {
+  return selection.value?.kind === kind && selection.value.id === id;
+}
+
 /**
  * Opens a direct conversation: loads its history, clears the unread dot, and
  * tells the other side we've read what they sent.
@@ -1415,6 +1420,14 @@ async function sendReadReceipt(peerId: string, messageIds: string[]) {
  * looking at files means "this one", not "take me somewhere else".
  */
 async function selectContact(contact: Contact) {
+  // Clicking whoever is already open closes them. There was no other way back
+  // to nothing selected, and in the Files view that is the difference between
+  // seeing one person and seeing everybody.
+  if (isSelected("contact", contact.peer_id)) {
+    selection.value = null;
+    return;
+  }
+
   selection.value = { kind: "contact", id: contact.peer_id };
   const key = conversationKey("contact", contact.peer_id);
 
@@ -1455,6 +1468,11 @@ async function selectContact(contact: Contact) {
  * read it, and tracking that per member is a bigger feature than it looks.
  */
 async function selectGroup(group: Group) {
+  if (isSelected("group", group.id)) {
+    selection.value = null;
+    return;
+  }
+
   selection.value = { kind: "group", id: group.id };
   const key = conversationKey("group", group.id);
 

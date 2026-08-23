@@ -99,7 +99,11 @@ function isOnline(peerId: string): boolean {
           role="button"
           tabindex="0"
           :class="{ selected: selectedPeerId === contact.peer_id }"
-          :title="contact.peer_id"
+          :title="
+            selectedPeerId === contact.peer_id
+              ? `${contact.peer_id}\n\nClick again to close`
+              : contact.peer_id
+          "
           @click="emit('select', contact)"
           @keyup.enter="emit('select', contact)"
         >
