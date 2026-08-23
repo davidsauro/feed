@@ -320,16 +320,6 @@ function describeCounts(group: ContactFiles): string {
             <span class="summary">{{ describeCounts(group) }}</span>
           </span>
 
-          <!-- Sending from here rather than only from a conversation, since this
-               is where somebody is when they are thinking about files. -->
-          <button
-            v-if="!group.unknown"
-            class="group-add"
-            :title="`Choose files to send to ${group.name}`"
-            @click="emit('add', group.peerId)"
-          >
-            Add files
-          </button>
         </header>
 
         <!-- The tray: picked, looked over, not yet gone anywhere. -->
@@ -510,21 +500,6 @@ function describeCounts(group: ContactFiles): string {
 .summary {
   font-size: 11px;
   color: var(--text-faint);
-}
-
-.group-add {
-  margin-left: auto;
-  flex: none;
-  padding: 5px 10px;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--text);
-}
-
-.group-add:hover {
-  background-color: var(--bg-hover);
 }
 
 /* Tray ------------------------------------------------------------------- */
