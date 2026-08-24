@@ -14,19 +14,6 @@
 /*
  * Roboto, bundled rather than borrowed from the system.
  *
- * The three platforms disagree about what `system-ui` means, so the same window
- * looked different on each and none of them was the one being designed against.
- * Shipping the face removes that variable entirely.
- *
- * One variable file covers every weight from 100 to 900, which is smaller than
- * the four static cuts it replaces and means a weight can be changed without
- * shipping another file.
- *
- * Not subsetted. Cutting it to Latin would save 130 KB against installers of
- * five to eighty megabytes, and would cost a box in place of any letter in a
- * nickname or filename that somebody else chose. The full face covers Latin,
- * Greek, Cyrillic and Vietnamese.
- *
  * Licensed under the SIL Open Font License 1.1, which permits bundling on the
  * condition that the notice and licence travel with it. Both files sit in
  * public/fonts, so they are copied into the application as they are.
