@@ -32,38 +32,15 @@ const STATUS_LABELS: Record<ChatMessage["status"], string> = {
 </script>
 
 <template>
-  <div class="bubble" :class="outgoing ? 'outgoing' : 'incoming'">
+  <div class="line" :class="outgoing ? 'from-us' : 'from-them'">
+    <div class="bubble" :class="outgoing ? 'outgoing' : 'incoming'">
     <span class="body">
       <span v-if="senderLabel" class="sender">{{ senderLabel }}</span>
       <span class="text">{{ message.text }}</span>
     </span>
 
-    <!-- A message that didn't go out is the one status worth acting on, so it
-         becomes a button rather than an icon. Nothing retries on its own. -->
-    <button
-      v-if="outgoing && message.status === 'failed'"
-      class="retry"
-      title="Not sent. Click to try again."
-      @click="emit('retry')"
-    >
-      <svg
-        viewBox="0 0 24 24"
-        width="13"
-        height="13"
-        stroke="currentColor"
-        stroke-width="2.5"
-        fill="none"
-        stroke-linecap="round"
-      >
-        <circle cx="12" cy="12" r="10" />
-        <line x1="12" y1="7" x2="12" y2="13" />
-        <line x1="12" y1="17" x2="12.01" y2="17" />
-      </svg>
-      Retry
-    </button>
-
     <span
-      v-else-if="outgoing"
+      v-if="outgoing"
       class="status"
       :class="{ read: message.status === 'read' }"
       :title="STATUS_LABELS[message.status]"
@@ -109,30 +86,73 @@ const STATUS_LABELS: Record<ChatMessage["status"], string> = {
         <polyline points="18 6 7 17 2 12" />
         <polyline points="22 6 12 16 11 15" />
       </svg>
-    </span>
+      </span>
+    </div>
+
+    <!-- Said in words underneath rather than as an icon inside. A message that
+         did not arrive is the one status somebody has to act on, and an icon in
+         a corner is not where anybody looks for that. -->
+    <p v-if="outgoing && message.status === 'failed'" class="undelivered">
+      Not delivered.
+      <button class="retry" @click="emit('retry')">Try again</button>
+    </p>
   </div>
 </template>
 
 <style scoped>
+/* Wraps a bubble and anything said about it, so both sit on the same side of
+   the conversation. */
+.line {
+  display: flex;
+  flex-direction: column;
+  max-width: min(70%, 560px);
+}
+
+.line.from-us {
+  align-self: flex-end;
+  align-items: flex-end;
+}
+
+.line.from-them {
+  align-self: flex-start;
+  align-items: flex-start;
+}
+
+.undelivered {
+  margin: 3px 2px 0;
+  font-size: 11px;
+  color: var(--danger);
+}
+
+.retry {
+  padding: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--danger);
+  text-decoration: underline;
+}
+
+.retry:hover {
+  color: var(--text);
+}
+
 .bubble {
   display: flex;
   align-items: flex-end;
   gap: 8px;
-  max-width: min(70%, 560px);
+  max-width: 100%;
   width: fit-content;
   padding: 7px 12px;
   border-radius: var(--radius-bubble);
 }
 
 .outgoing {
-  align-self: flex-end;
   border-bottom-right-radius: 4px;
   background-color: var(--bubble-out-bg);
   color: var(--bubble-out-text);
 }
 
 .incoming {
-  align-self: flex-start;
   border-bottom-left-radius: 4px;
   background-color: var(--bubble-in-bg);
   color: var(--bubble-in-text);
@@ -167,26 +187,5 @@ const STATUS_LABELS: Record<ChatMessage["status"], string> = {
 
 .status.read {
   opacity: 1;
-}
-
-/* The retry affordance sits on the outgoing bubble, which is already filled with
-   the accent color, so it reads by full opacity and an underline rather than by
-   turning red — red on blue would be close to unreadable. */
-.retry {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  flex: none;
-  align-self: flex-end;
-  padding: 0 0 2px;
-  color: inherit;
-  font-size: 11px;
-  font-weight: 600;
-  text-decoration: underline;
-  text-underline-offset: 2px;
-}
-
-.retry:hover {
-  opacity: 0.8;
 }
 </style>

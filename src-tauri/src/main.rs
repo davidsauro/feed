@@ -2352,6 +2352,93 @@ fn save_chat_message(
 }
 
 /// Moves a message along to its next status: sending, delivered, or read.
+/// How many times a message is put in front of somebody before giving up.
+///
+/// Hidden while it happens. A message that arrives on the third attempt arrived,
+/// and saying so would be reporting our own plumbing rather than anything the
+/// reader did or needs to do.
+const MESSAGE_ATTEMPTS: usize = 5;
+
+/// How long to wait for an acknowledgement before sending it again.
+///
+/// A message crosses a relay in a few milliseconds and the acknowledgement comes
+/// straight back, so this is generous. It is mostly spent waiting on somebody
+/// who is not there.
+const MESSAGE_WAIT: Duration = Duration::from_secs(5);
+
+/// The status one message is at, or None if it has been deleted.
+fn message_status(app: &AppHandle, id: &str) -> Option<String> {
+    let conn = get_db_connection(app).ok()?;
+
+    conn.query_row("SELECT status FROM messages WHERE id = ?1", (id,), |row| {
+        row.get::<_, String>(0)
+    })
+    .ok()
+}
+
+/// Watches a sent message, and gives up on it out loud.
+///
+/// Publishing to a conversation is not the same as reaching the person in it.
+/// With a server carrying the conversation the publish succeeds whether or not
+/// anybody is listening, so a message to somebody who is not running went out,
+/// reached the server, reached nobody, and sat at "sending" for ever. There was
+/// no way to make it try again, because the only retry offered is on a message
+/// that has been called failed, and this one never was.
+///
+/// So it is sent again a few times in case they appear, and then called what it
+/// is. Which of those happened is read off the acknowledgement: anything other
+/// than still sending means it arrived.
+///
+/// Sending the same message twice is safe. It carries its own id, and the
+/// receiving side stores it with an insert that ignores one it already has.
+#[tauri::command]
+async fn watch_message(
+    app: AppHandle,
+    state: State<'_, NetworkState>,
+    id: String,
+    peer_id: String,
+    message: String,
+) -> Result<(), String> {
+    let network_tx = network_sender(&state)?;
+
+    tauri::async_runtime::spawn(async move {
+        for attempt in 1..=MESSAGE_ATTEMPTS {
+            tokio::time::sleep(MESSAGE_WAIT).await;
+
+            match message_status(&app, &id).as_deref() {
+                // Acknowledged, read, or already given up on by somebody else.
+                Some("sending") => {}
+                _ => return,
+            }
+
+            if attempt == MESSAGE_ATTEMPTS {
+                break;
+            }
+
+            let (result_tx, result_rx) = oneshot::channel();
+
+            if network_tx
+                .send(NetworkCommand::PublishToDirect {
+                    peer_id: peer_id.clone(),
+                    message: message.clone(),
+                    result_tx,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            let _ = result_rx.await;
+        }
+
+        let _ = update_message_status(app.clone(), id.clone(), "failed".to_string());
+        emit_to_frontend(&app, "message-failed", &id);
+    });
+
+    Ok(())
+}
+
 #[tauri::command]
 fn update_message_status(app: AppHandle, id: String, status: String) -> Result<(), String> {
     let conn = get_db_connection(&app).map_err(|e| e.to_string())?;
@@ -4123,6 +4210,7 @@ fn main() {
             // Chat history
             save_chat_message,
             update_message_status,
+            watch_message,
             get_chat_history,
             count_chat_messages,
             // Files

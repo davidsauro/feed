@@ -815,7 +815,7 @@ async function sendGroupMessage(text: string) {
   } catch (error) {
     setMessageStatus(key, id, "failed");
     invoke("update_message_status", { id, status: "failed" }).catch(() => {});
-    notify(`Not sent to ${group.name} — ${error}. Click the message to try again.`);
+    notify(`Not sent to ${group.name}: ${error}`);
   }
 }
 
@@ -1515,14 +1515,18 @@ async function sendMessage(text: string) {
     // Reaching the conversation is not the same as reaching the person: with
     // anything in the middle, this only means it was carried. It stays at
     // "sending" until they acknowledge it.
-    await invoke("send_direct", {
-      peerId,
-      message: JSON.stringify({ type: "chat", id, text, sentAt }),
-    });
+    const body = JSON.stringify({ type: "chat", id, text, sentAt });
+    await invoke("send_direct", { peerId, message: body });
+
+    // Nothing stores a message, so one sent to somebody who is not running is
+    // gone. This sends it again a few times in case they appear, quietly, and
+    // calls it failed if they never do. Without it the clock stayed for ever
+    // and there was no way to ask again.
+    await invoke("watch_message", { id, peerId, message: body });
   } catch (error) {
     setMessageStatus(key, id, "failed");
     invoke("update_message_status", { id, status: "failed" }).catch(() => {});
-    notify(`Not sent to ${contact.nickname} — ${error}. Click the message to try again.`);
+    notify(`Not sent to ${contact.nickname}: ${error}`);
   }
 }
 
@@ -1553,9 +1557,16 @@ async function retryMessage(id: string) {
 
   try {
     if (conversation.kind === "contact") {
-      await invoke("send_direct", {
+      const payload = JSON.stringify({ type: "chat", ...body });
+
+      await invoke("send_direct", { peerId: conversation.id, message: payload });
+
+      // Watched again, so pressing retry while they are still away ends in the
+      // same honest place rather than back at a permanent clock.
+      await invoke("watch_message", {
+        id,
         peerId: conversation.id,
-        message: JSON.stringify({ type: "chat", ...body }),
+        message: payload,
       });
     } else {
       await invoke("send_group_message", {
@@ -1989,6 +2000,22 @@ async function startSession() {
 
   await listen<string>("peer-lost", (event) => {
     activePeers.value.delete(event.payload);
+  });
+
+  // A message that was sent again a few times and never acknowledged. The
+  // conversation it belongs to may not be open, so every loaded one is checked
+  // rather than working out which it was.
+  await listen<string>("message-failed", (event) => {
+    for (const key of Object.keys(messages.value)) {
+      const message = messages.value[key]?.find(
+        (candidate) => candidate.id === event.payload,
+      );
+
+      if (message && message.status === "sending") {
+        setMessageStatus(key, event.payload, "failed");
+        return;
+      }
+    }
   });
 
   // Progress arrives per chunk, so this updates one number rather than
