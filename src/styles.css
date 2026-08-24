@@ -11,6 +11,37 @@
  * is resolved in JavaScript where a manual override can win.
  */
 
+/*
+ * Roboto, bundled rather than borrowed from the system.
+ *
+ * The three platforms disagree about what `system-ui` means, so the same window
+ * looked different on each and none of them was the one being designed against.
+ * Shipping the face removes that variable entirely.
+ *
+ * One variable file covers every weight from 100 to 900, which is smaller than
+ * the four static cuts it replaces and means a weight can be changed without
+ * shipping another file.
+ *
+ * Not subsetted. Cutting it to Latin would save 130 KB against installers of
+ * five to eighty megabytes, and would cost a box in place of any letter in a
+ * nickname or filename that somebody else chose. The full face covers Latin,
+ * Greek, Cyrillic and Vietnamese.
+ *
+ * Licensed under the SIL Open Font License 1.1, which permits bundling on the
+ * condition that the notice and licence travel with it. Both files sit in
+ * public/fonts, so they are copied into the application as they are.
+ */
+@font-face {
+  font-family: "Roboto";
+  src: url("/fonts/Roboto-Variable.woff2") format("woff2");
+  /* The range the variable axis covers, so the browser varies the real font
+     rather than smearing a single weight into a fake bold. */
+  font-weight: 100 900;
+  font-stretch: 75% 100%;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   /* Tells the browser to render form controls and scrollbars to match. */
   color-scheme: light;
@@ -58,7 +89,9 @@
 
   --shadow: 0 1px 2px rgba(16, 24, 40, 0.06);
 
-  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+  /* The system stack stays behind Roboto, so anything it does not cover, which
+     mostly means CJK and emoji, still renders instead of becoming boxes. */
+  --font: "Roboto", system-ui, -apple-system, "Segoe UI", "Helvetica Neue",
     Arial, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
     "Liberation Mono", monospace;

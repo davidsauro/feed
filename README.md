@@ -18,6 +18,22 @@ There are two programs here:
 * **Networking:** Rust + `rust-libp2p` (gossipsub, mDNS, Noise, ping) + Tokio
 * **Storage:** SQLite via `rusqlite`, optionally encrypted with SQLCipher
 * **Message encryption:** X25519 + ChaCha20-Poly1305 + HKDF
+* **Typeface:** Roboto, bundled with the app
+
+## Third party
+
+The interface is set in [Roboto](https://github.com/googlefonts/roboto-3-classic),
+copyright 2011 The Roboto Project Authors, used under the
+[SIL Open Font License 1.1](public/fonts/OFL.txt).
+
+It is bundled rather than taken from the system, because the three platforms
+disagree about which face `system-ui` means and the same window looked
+different on each. One variable file covers every weight the interface uses. The
+licence travels with it, in `public/fonts`, and is copied into the application
+as it is.
+
+The licence applies to the font and not to this application. Nothing about
+bundling it changes the terms of the code around it.
 
 ## Features
 
