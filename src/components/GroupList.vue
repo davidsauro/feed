@@ -55,6 +55,7 @@ const emit = defineEmits<{
           role="button"
           tabindex="0"
           :class="{ selected: selectedGroupId === group.id }"
+          :title="selectedGroupId === group.id ? 'Click again to close' : undefined"
           @click="emit('select', group)"
           @keyup.enter="emit('select', group)"
         >

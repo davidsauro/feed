@@ -34,11 +34,6 @@
 //! That is what the whole-file hash is for. The sender hashes what it read, the
 //! receiver hashes what it wrote, and the two are compared at the end.
 
-// Nothing calls this yet. The transfer code that will is the next piece of work,
-// and doing the encryption first meant it could be tested on its own rather than
-// through a network protocol. Remove this once the transfer code lands.
-#![allow(dead_code)]
-
 use chacha20poly1305::aead::rand_core::RngCore;
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -203,16 +198,20 @@ impl RunningHash {
     }
 }
 
-/// Hashes a run of bytes in one go, for anything small enough to hold.
-pub fn hash_bytes(bytes: &[u8]) -> String {
-    let mut hash = RunningHash::new();
-    hash.update(bytes);
-
-    hash.finish()
-}
-
 #[cfg(test)]
 mod tests {
+    /// Hashes a run of bytes in one go.
+    ///
+    /// Only the tests want this. Everything real hashes a file as it streams
+    /// past, which is what `RunningHash` is for, and having a whole-input
+    /// version outside these tests would be a function nothing calls.
+    fn hash_bytes(bytes: &[u8]) -> String {
+        let mut hash = super::RunningHash::new();
+        hash.update(bytes);
+
+        hash.finish()
+    }
+
     use super::*;
 
     /// Seals a whole file and returns its chunks, as a transfer would.

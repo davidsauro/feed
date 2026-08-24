@@ -16,15 +16,11 @@
  * looked over and pruned, and only leaves when Send is pressed.
  */
 import { computed } from "vue";
-import type { Contact, FileTransfer, PickedFile } from "../types";
-import {
-  canSend,
-  describeProblem,
-  describeSize,
-  describeTransferError,
-  describeWhen,
-  shortPeerId,
-} from "../types";
+import FileRow from "./FileRow.vue";
+import GroupTransfers from "./GroupTransfers.vue";
+import StagedTray from "./StagedTray.vue";
+import type { Contact, FileTransfer, Group, PickedFile } from "../types";
+import { canSend, describeSize, shortPeerId } from "../types";
 
 const props = defineProps<{
   files: FileTransfer[];
@@ -35,7 +31,12 @@ const props = defineProps<{
    * Whoever is picked in the sidebar, which is who the toolbar button adds for.
    * The sidebar stays visible in this view precisely so this can be changed.
    */
-  selectedPeerId: string | null;
+  /**
+   * Whichever conversation is open, contact or group, which is what the toolbar
+   * button adds files for. The sidebar stays visible in this view precisely so
+   * this can be changed without leaving.
+   */
+  selection: { kind: "contact" | "group"; id: string; name: string } | null;
   /**
    * Files that had not been looked at when this view was opened.
    *
@@ -51,33 +52,36 @@ const props = defineProps<{
    * rather than failing. Worth knowing before pressing Send, not after.
    */
   onlinePeers: Set<string>;
+  /** Groups this node is in, so a group's files can be shown under its name. */
+  groups: Group[];
 }>();
 
 const emit = defineEmits<{
   /** Open the picker and stage whatever is chosen for this peer. */
   add: [peerId: string];
-  /** Send everything staged for this peer. */
-  send: [peerId: string];
+  /**
+   * Send everything staged for one recipient.
+   *
+   * The key carries which kind it is, `contact:<peer id>` or `group:<group
+   * id>`, since the two are sent quite differently and their ids could
+   * otherwise collide.
+   */
+  send: [key: string];
   /** Drop one staged file before it is sent. */
-  unstage: [peerId: string, path: string];
-  clear: [peerId: string];
+  unstage: [key: string, path: string];
+  clear: [key: string];
   open: [file: FileTransfer];
   reveal: [file: FileTransfer];
   /** Ask again for the rest of one that stopped partway. */
   resume: [file: FileTransfer];
+  /** Choose files and send them to everybody in a group. */
+  addToGroup: [groupId: string];
+  /** Try again everything that failed for one member of a group. */
+  resumeMember: [files: FileTransfer[]];
 }>();
 
-/**
- * Whether asking again could finish this one off.
- *
- * Only ever the receiving side. The receiver is the one that knows how much it
- * already has, and the sender serves whatever chunk it is asked for, so there
- * is nothing for the sender to retry.
- */
-const canResume = (file: FileTransfer) =>
-  file.status === "failed";
 
-interface Group {
+interface ContactFiles {
   peerId: string;
   name: string;
   /** True when this is somebody we no longer have as a contact. */
@@ -92,14 +96,30 @@ interface Group {
   latest: number;
 }
 
-const selectedContact = computed(() =>
-  props.contacts.find((contact) => contact.peer_id === props.selectedPeerId) ?? null,
-);
+/** Sends to a group and stages for a contact go to different places. */
+function addForSelection() {
+  const chosen = props.selection;
+  if (!chosen) {
+    return;
+  }
 
-const groups = computed<Group[]>(() => {
+  if (chosen.kind === "group") {
+    emit("addToGroup", chosen.id);
+  } else {
+    emit("add", chosen.id);
+  }
+}
+
+const contactFiles = computed<ContactFiles[]>(() => {
   const byPeer = new Map<string, FileTransfer[]>();
 
   for (const file of props.files) {
+    // Group files have sections of their own further down. Without this they
+    // would appear in both, which is worse than either.
+    if (file.group_id) {
+      continue;
+    }
+
     const existing = byPeer.get(file.peer_id);
 
     if (existing) {
@@ -110,23 +130,25 @@ const groups = computed<Group[]>(() => {
   }
 
   // Somebody with a tray but no history still needs somewhere to put it.
-  for (const peerId of Object.keys(props.staged)) {
-    if (!byPeer.has(peerId)) {
+  for (const key of Object.keys(props.staged)) {
+    const peerId = key.startsWith("contact:") ? key.slice("contact:".length) : null;
+
+    if (peerId && !byPeer.has(peerId)) {
       byPeer.set(peerId, []);
     }
   }
 
-  const groups: Group[] = [];
+  const gathered: ContactFiles[] = [];
 
   for (const [peerId, files] of byPeer) {
     // Files outlive contacts on purpose: removing somebody should not delete
     // things off the disk. So a group may belong to nobody we still know.
     const contact = props.contacts.find((candidate) => candidate.peer_id === peerId);
-    const staged = props.staged[peerId] ?? [];
+    const staged = props.staged[`contact:${peerId}`] ?? [];
 
     files.sort((a, b) => b.sent_at - a.sent_at);
 
-    groups.push({
+    gathered.push({
       peerId,
       name: contact?.nickname ?? shortPeerId(peerId),
       unknown: !contact,
@@ -142,7 +164,7 @@ const groups = computed<Group[]>(() => {
 
   // A tray is a pending action, so it sorts above finished history rather than
   // being left somewhere down the page to be scrolled past.
-  return groups.sort((a, b) => {
+  return gathered.sort((a, b) => {
     if ((a.staged.length > 0) !== (b.staged.length > 0)) {
       return a.staged.length > 0 ? -1 : 1;
     }
@@ -151,8 +173,31 @@ const groups = computed<Group[]>(() => {
   });
 });
 
+/**
+ * Files belonging to a group, gathered under it.
+ *
+ * A group we are no longer in is left out. Its files stay on disk, and the
+ * per contact list below still shows them, so nothing is hidden by this.
+ */
+const groupSections = computed(() =>
+  props.groups
+    .map((group) => ({
+      group,
+      files: props.files.filter((file) => file.group_id === group.id),
+      staged: props.staged[`group:${group.id}`] ?? [],
+    }))
+    // A group nothing has been sent to has nothing to show. It appears as soon
+    // as files are staged for it, which is where the tray then lives.
+    .filter((section) => section.files.length > 0 || section.staged.length > 0)
+    .sort(
+      (a, b) =>
+        Math.max(...b.files.map((f) => f.sent_at)) -
+        Math.max(...a.files.map((f) => f.sent_at)),
+    ),
+);
+
 /** "3 received, 2 sent", leaving out whichever is zero. */
-function describeCounts(group: Group): string {
+function describeCounts(group: ContactFiles): string {
   const parts = [];
 
   if (group.received > 0) {
@@ -170,40 +215,8 @@ function describeCounts(group: Group): string {
   return `${parts.join(", ")} · ${describeSize(group.bytes)}`;
 }
 
-/** What one row says about where a file got to. */
-function describeStatus(file: FileTransfer): string {
-  const incoming = file.direction === "incoming";
 
-  switch (file.status) {
-    case "complete":
-      return incoming ? "received" : "sent";
-    case "transferring":
-      return incoming ? "receiving" : "sending";
-    case "pending":
-      // The backend says what it is waiting on, which for a peer who is not
-      // answering is the difference between a progress report and a frozen row.
-      return file.error ?? "starting";
-    case "offered":
-      // Carries which attempt it is on, because waiting for somebody who is not
-      // there should not read like waiting for somebody who is.
-      return file.error ?? "waiting for them";
-    case "failed":
-      return file.error ? describeTransferError(file.error) : "failed";
-    default:
-      return file.status;
-  }
-}
 
-function progress(file: FileTransfer): number {
-  if (file.size === 0) {
-    return 100;
-  }
-
-  return Math.min(100, Math.round((file.transferred / file.size) * 100));
-}
-
-const inFlight = (file: FileTransfer) =>
-  file.status === "transferring" || file.status === "pending";
 </script>
 
 <template>
@@ -216,13 +229,13 @@ const inFlight = (file: FileTransfer) =>
            hidden, so the reason it cannot be used is readable. -->
       <button
         class="add"
-        :disabled="!selectedContact"
+        :disabled="!selection"
         :title="
-          selectedContact
-            ? `Choose files to send to ${selectedContact.nickname}`
-            : 'Pick a contact on the left to send files to'
+          selection
+            ? `Choose files to send to ${selection.name}`
+            : 'Pick a contact or a group on the left to send files to'
         "
-        @click="selectedContact && emit('add', selectedContact.peer_id)"
+        @click="addForSelection"
       >
         <svg
           viewBox="0 0 24 24"
@@ -236,11 +249,11 @@ const inFlight = (file: FileTransfer) =>
           <line x1="12" y1="5" x2="12" y2="19" />
           <line x1="5" y1="12" x2="19" y2="12" />
         </svg>
-        {{ selectedContact ? `Add files for ${selectedContact.nickname}` : "Add files" }}
+        {{ selection ? `Add files for ${selection.name}` : "Add files" }}
       </button>
     </header>
 
-    <div v-if="groups.length === 0" class="empty">
+    <div v-if="contactFiles.length === 0 && groupSections.length === 0" class="empty">
       <svg
         viewBox="0 0 24 24"
         width="38"
@@ -261,11 +274,33 @@ const inFlight = (file: FileTransfer) =>
     </div>
 
     <div v-else class="groups">
+      <!-- Groups first. A send to fifteen people is the thing most likely to
+           need looking at, and burying it under one to one history would mean
+           scrolling to find out. -->
+      <GroupTransfers
+        v-for="section in groupSections"
+        :key="section.group.id"
+        :group="section.group"
+        :files="section.files"
+        :contacts="contacts"
+        :online-peers="onlinePeers"
+        :newly-arrived="newlyArrived"
+        :staged="section.staged"
+        :selected="selection?.kind === 'group' && selection.id === section.group.id"
+        @send="emit('send', `group:${section.group.id}`)"
+        @clear="emit('clear', `group:${section.group.id}`)"
+        @unstage="emit('unstage', `group:${section.group.id}`, $event)"
+        @resume-member="emit('resumeMember', $event)"
+        @open="emit('open', $event)"
+        @reveal="emit('reveal', $event)"
+        @resume="emit('resume', $event)"
+      />
+
       <section
-        v-for="group in groups"
+        v-for="group in contactFiles"
         :key="group.peerId"
         class="group"
-        :class="{ selected: group.peerId === selectedPeerId }"
+        :class="{ selected: selection?.kind === 'contact' && group.peerId === selection.id }"
       >
         <header class="group-header">
           <span class="who">
@@ -285,151 +320,27 @@ const inFlight = (file: FileTransfer) =>
             <span class="summary">{{ describeCounts(group) }}</span>
           </span>
 
-          <!-- Sending from here rather than only from a conversation, since this
-               is where somebody is when they are thinking about files. -->
-          <button
-            v-if="!group.unknown"
-            class="group-add"
-            :title="`Choose files to send to ${group.name}`"
-            @click="emit('add', group.peerId)"
-          >
-            Add files
-          </button>
         </header>
 
         <!-- The tray: picked, looked over, not yet gone anywhere. -->
-        <div v-if="group.staged.length" class="tray">
-          <div class="tray-header">
-            <span class="tray-title">
-              {{ group.staged.length }}
-              {{ group.staged.length === 1 ? "file" : "files" }} ready to send
-            </span>
-
-            <button class="tray-clear" @click="emit('clear', group.peerId)">Clear</button>
-            <button
-              class="tray-send"
-              :disabled="group.sendable === 0"
-              :title="
-                group.sendable === 0
-                  ? 'None of these can be sent'
-                  : `Send to ${group.name}`
-              "
-              @click="emit('send', group.peerId)"
-            >
-              Send {{ group.sendable }}
-            </button>
-          </div>
-
-          <ul class="tray-list">
-            <li
-              v-for="file in group.staged"
-              :key="file.path"
-              class="tray-row"
-              :class="{ rejected: !canSend(file) }"
-            >
-              <span class="file-name" :title="file.path">{{ file.name }}</span>
-              <span class="tray-meta">
-                {{ describeProblem(file) ?? `${describeSize(file.size)} · not sent yet` }}
-              </span>
-
-              <button
-                class="tray-remove"
-                title="Remove from this batch"
-                @click="emit('unstage', group.peerId, file.path)"
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  width="13"
-                  height="13"
-                  stroke="currentColor"
-                  stroke-width="2.2"
-                  fill="none"
-                  stroke-linecap="round"
-                >
-                  <line x1="18" y1="6" x2="6" y2="18" />
-                  <line x1="6" y1="6" x2="18" y2="18" />
-                </svg>
-              </button>
-            </li>
-          </ul>
-        </div>
+        <StagedTray
+          :files="group.staged"
+          :recipient="group.name"
+          @send="emit('send', `contact:${group.peerId}`)"
+          @clear="emit('clear', `contact:${group.peerId}`)"
+          @remove="emit('unstage', `contact:${group.peerId}`, $event)"
+        />
 
         <ul v-if="group.files.length" class="list">
-          <li v-for="file in group.files" :key="file.id" class="row" :class="file.status">
-            <span class="direction" :class="file.direction" aria-hidden="true">
-              <svg
-                viewBox="0 0 24 24"
-                width="13"
-                height="13"
-                stroke="currentColor"
-                stroke-width="2.5"
-                fill="none"
-                stroke-linecap="round"
-              >
-                <line x1="12" y1="5" x2="12" y2="19" />
-                <polyline
-                  :points="file.direction === 'incoming' ? '6 13 12 19 18 13' : '6 11 12 5 18 11'"
-                />
-              </svg>
-            </span>
-
-            <span class="details">
-              <span class="file-line">
-                <span class="file-name" :title="file.name">{{ file.name }}</span>
-                <!-- Turned up while you were somewhere else. -->
-                <span v-if="newlyArrived.has(file.id)" class="new">New</span>
-              </span>
-              <!-- The full text on hover, since the detail is what somebody
-                   wants at exactly the moment they are working out why. -->
-              <span class="meta" :title="file.error ?? undefined">
-                {{ describeSize(file.size) }} · {{ describeStatus(file) }} ·
-                {{ describeWhen(file.sent_at) }}
-              </span>
-
-              <span v-if="inFlight(file)" class="progress">
-                <span class="bar" :style="{ width: `${progress(file)}%` }" />
-              </span>
-            </span>
-
-            <span v-if="canResume(file)" class="actions">
-              <button class="resume" title="Ask for the rest" @click="emit('resume', file)">
-                Resume
-              </button>
-            </span>
-
-            <span v-else-if="file.status === 'complete'" class="actions">
-              <button class="action" title="Open" @click="emit('open', file)">
-                <svg
-                  viewBox="0 0 24 24"
-                  width="14"
-                  height="14"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  fill="none"
-                  stroke-linecap="round"
-                >
-                  <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-                  <polyline points="15 3 21 3 21 9" />
-                  <line x1="10" y1="14" x2="21" y2="3" />
-                </svg>
-              </button>
-
-              <button class="action" title="Show in folder" @click="emit('reveal', file)">
-                <svg
-                  viewBox="0 0 24 24"
-                  width="14"
-                  height="14"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  fill="none"
-                >
-                  <path
-                    d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"
-                  />
-                </svg>
-              </button>
-            </span>
-          </li>
+          <FileRow
+            v-for="file in group.files"
+            :key="file.id"
+            :file="file"
+            :newly-arrived="newlyArrived"
+            @open="emit('open', $event)"
+            @reveal="emit('reveal', $event)"
+            @resume="emit('resume', $event)"
+          />
         </ul>
       </section>
     </div>
@@ -589,21 +500,6 @@ const inFlight = (file: FileTransfer) =>
 .summary {
   font-size: 11px;
   color: var(--text-faint);
-}
-
-.group-add {
-  margin-left: auto;
-  flex: none;
-  padding: 5px 10px;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--text);
-}
-
-.group-add:hover {
-  background-color: var(--bg-hover);
 }
 
 /* Tray ------------------------------------------------------------------- */

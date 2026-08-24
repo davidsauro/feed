@@ -31,6 +31,7 @@ import UnlockScreen from "./components/UnlockScreen.vue";
 import type {
   ChatMessage,
   Contact,
+  FileOffer,
   FileTransfer,
   Group,
   MessageStatus,
@@ -38,7 +39,7 @@ import type {
   Server,
   ServerStatus,
 } from "./types";
-import { canSend, shortPeerId } from "./types";
+import { canSend, readFileOffer, shortPeerId } from "./types";
 
 /** Which kind of thing a conversation is with. */
 type ConversationKind = "contact" | "group";
@@ -324,13 +325,30 @@ const unseenFiles = computed(
     ).length,
 );
 
-/** The files belonging to whichever conversation is open. */
-const currentFiles = computed(() => {
-  if (selection.value?.kind !== "contact") {
-    return [];
+/**
+ * Whichever conversation is open, in the shape the Files view wants.
+ *
+ * It only needs enough to label a button and highlight a section, and taking
+ * the name here means the view does not have to look either list up itself.
+ */
+const filesSelection = computed(() => {
+  if (selectedContact.value) {
+    return {
+      kind: "contact" as const,
+      id: selectedContact.value.peer_id,
+      name: selectedContact.value.nickname,
+    };
   }
 
-  return files.value.filter((file) => file.peer_id === selection.value?.id);
+  if (selectedGroup.value) {
+    return {
+      kind: "group" as const,
+      id: selectedGroup.value.id,
+      name: selectedGroup.value.name,
+    };
+  }
+
+  return null;
 });
 
 /**
@@ -866,9 +884,26 @@ function rememberFile(file: FileTransfer) {
  * One offer per file rather than one for the batch, so that a file that fails
  * takes only itself down.
  */
+/**
+ * Sends files from whichever conversation is open.
+ *
+ * A group takes a different path to one person, since it becomes one transfer
+ * per member, but from here it is the same gesture in the same place.
+ */
 async function attachFiles() {
+  if (!selectedContact.value && !selectedGroup.value) {
+    return;
+  }
+
+  // Transfers are shown in the Files view and nowhere else, so sending from a
+  // conversation moves there. Otherwise the button would appear to do nothing:
+  // the work happens somewhere you are not looking.
+  view.value = "files";
+
   if (selectedContact.value) {
     await attachFilesTo(selectedContact.value.peer_id);
+  } else if (selectedGroup.value) {
+    await sendFilesToGroup(selectedGroup.value.id);
   }
 }
 
@@ -915,52 +950,117 @@ async function stageFilesFor(peerId: string) {
     return;
   }
 
-  const paths = await pickPaths(`Add files for ${contact.nickname}`);
+  // The peer matters: a file only has a size limit when it has to cross a relay
+  // server to get there.
+  await stageFor(`contact:${peerId}`, contact.nickname, peerId);
+}
+
+/**
+ * Picks files and puts them in a group's tray.
+ *
+ * The strictest member decides what fits, since the file has to reach all of
+ * them, so the check asks about whichever one is hardest to reach.
+ */
+async function stageFilesForGroup(groupId: string) {
+  const group = groups.value.find((candidate) => candidate.id === groupId);
+  if (!group) {
+    return;
+  }
+
+  const others = group.members.filter((member) => member !== myPeerId.value);
+  if (others.length === 0) {
+    notify("There is nobody else in that group.");
+    return;
+  }
+
+  await stageFor(`group:${groupId}`, group.name, others);
+}
+
+/**
+ * Picks files and puts them in a tray without sending anything.
+ *
+ * Sizes are read here rather than at send time so the tray can say up front
+ * that something is too large, instead of accepting it and failing later. For a
+ * group that means asking about every member and keeping the worst answer.
+ */
+async function stageFor(key: string, recipient: string, against: string | string[]) {
+  const paths = await pickPaths(`Add files for ${recipient}`);
   if (paths.length === 0) {
     return;
   }
 
-  let picked: PickedFile[];
+  const peers = Array.isArray(against) ? against : [against];
+  let picked: PickedFile[] = [];
+
   try {
-    // The peer matters: a file only has a size limit when it has to cross a
-    // relay server to get there.
-    picked = await invoke<PickedFile[]>("inspect_files", { peerId, paths });
+    for (const peerId of peers) {
+      const seen = await invoke<PickedFile[]>("inspect_files", { peerId, paths });
+
+      // Keep whichever answer refuses a file, so one member reachable only
+      // through a relay caps the whole batch.
+      picked =
+        picked.length === 0
+          ? seen
+          : picked.map((file, at) => (seen[at]?.too_large ? seen[at] : file));
+    }
   } catch (error) {
     notify(`Could not read those files: ${error}`);
     return;
   }
 
-  const tray = staged.value[peerId] ?? [];
+  const tray = staged.value[key] ?? [];
 
   // Picking the same file twice should not queue it twice.
   const fresh = picked.filter(
     (file) => !tray.some((existing) => existing.path === file.path),
   );
 
-  staged.value = { ...staged.value, [peerId]: [...tray, ...fresh] };
+  staged.value = { ...staged.value, [key]: [...tray, ...fresh] };
 }
 
-/** Sends everything in a contact's tray, then empties it. */
-async function sendStaged(peerId: string) {
-  const contact = savedContacts.value.find((candidate) => candidate.peer_id === peerId);
-  const tray = staged.value[peerId];
-
-  if (!contact || !tray) {
+/**
+ * Sends everything in a tray, then empties it.
+ *
+ * The key says which kind of recipient it is, since a group becomes one
+ * transfer per member and a contact is one transfer.
+ */
+async function sendStaged(key: string) {
+  const tray = staged.value[key];
+  if (!tray) {
     return;
   }
 
   // Emptied first so a second press cannot send the same batch twice while the
-  // first one is still going out.
-  clearStaged(peerId);
+  // first is still going out.
+  clearStaged(key);
 
-  for (const file of tray.filter(canSend)) {
+  const sendable = tray.filter(canSend);
+  if (sendable.length === 0) {
+    return;
+  }
+
+  // Where the transfers will show up, which is not where the button was.
+  view.value = "files";
+
+  if (key.startsWith("group:")) {
+    await sendFilesToGroup(key.slice("group:".length), sendable.map((file) => file.path));
+    return;
+  }
+
+  const peerId = key.slice("contact:".length);
+  const contact = savedContacts.value.find((candidate) => candidate.peer_id === peerId);
+  if (!contact) {
+    return;
+  }
+
+  for (const file of sendable) {
     await sendOneFile(contact, file.path);
   }
 }
 
 /** Drops one file from a tray before it is sent. */
-function unstage(peerId: string, path: string) {
-  const tray = staged.value[peerId];
+function unstage(key: string, path: string) {
+  const tray = staged.value[key];
   if (!tray) {
     return;
   }
@@ -968,15 +1068,15 @@ function unstage(peerId: string, path: string) {
   const left = tray.filter((file) => file.path !== path);
 
   if (left.length === 0) {
-    clearStaged(peerId);
+    clearStaged(key);
   } else {
-    staged.value = { ...staged.value, [peerId]: left };
+    staged.value = { ...staged.value, [key]: left };
   }
 }
 
-function clearStaged(peerId: string) {
+function clearStaged(key: string) {
   const rest = { ...staged.value };
-  delete rest[peerId];
+  delete rest[key];
   staged.value = rest;
 }
 
@@ -1023,6 +1123,99 @@ watch(view, async (now) => {
   }
 });
 
+/**
+ * Picks files and sends them to everybody in a group.
+ *
+ * One transfer per member, each offered to that member alone, so somebody who
+ * is offline fails on their own and can be tried again on their own. The file
+ * is read and hashed once however many members there are.
+ */
+async function sendFilesToGroup(groupId: string, chosen?: string[]) {
+  const group = groups.value.find((candidate) => candidate.id === groupId);
+  if (!group) {
+    return;
+  }
+
+  // Given when a tray is being emptied, picked here when the button is in a
+  // conversation and there is no tray involved.
+  const paths = chosen ?? (await pickPaths(`Send to ${group.name}`));
+  if (paths.length === 0) {
+    return;
+  }
+
+  // One batch for everything chosen together, which is what lets a member's
+  // row say "file three of five" about this send rather than about everything
+  // ever sent to the group.
+  const batch = crypto.randomUUID();
+  const addresses = await relayedAddresses();
+
+  for (const path of paths) {
+    const sentAt = Date.now();
+
+    let transfers: FileTransfer[];
+    try {
+      transfers = await invoke<FileTransfer[]>("send_file_to_group", {
+        groupId,
+        path,
+        sentAt,
+        batch,
+      });
+    } catch (error) {
+      notify(`Could not send that file: ${error}`);
+      continue;
+    }
+
+    for (const transfer of transfers) {
+      rememberFile(transfer);
+      await offerFile(transfer, addresses);
+    }
+  }
+}
+
+/**
+ * Puts one transfer in front of its recipient and watches whether they take it.
+ *
+ * Shared by every path that offers a file, so that a group send gets the same
+ * treatment as a single one: repeated a few times if nobody answers, and then
+ * called a failure rather than waiting for ever.
+ */
+async function offerFile(file: FileTransfer, addresses: string[]) {
+  // Built from the transfer rather than from whatever the caller happens to
+  // hold, so every path offers the same thing. Three of these were written out
+  // by hand and two had already lost the group.
+  const details: FileOffer = {
+    id: file.id,
+    name: file.name,
+    size: file.size,
+    hash: file.hash,
+    key: file.key,
+    addresses,
+    groupId: file.group_id,
+    batch: file.batch,
+    sentAt: file.sent_at,
+  };
+
+  const offer = JSON.stringify({ type: "file-offer", ...details });
+
+  try {
+    await invoke("send_direct", { peerId: file.peer_id, message: offer });
+
+    // An offer is an ordinary message and nothing stores those, so one sent to
+    // somebody who is not running is gone. This repeats it a few times and then
+    // says so, rather than leaving a row that waits for ever.
+    await invoke("watch_offer", { id: file.id, message: offer });
+  } catch (error) {
+    notify(`Could not offer ${file.name}: ${error}`);
+  }
+}
+
+/** Try again everything that failed for one member of a group. */
+async function resumeMember(files: FileTransfer[]) {
+  for (const file of files) {
+    await resumeFile(file);
+  }
+}
+
 /** Where this node can be reached through a relay, if anywhere. */
 async function relayedAddresses(): Promise<string[]> {
   try {
@@ -1043,66 +1236,35 @@ async function sendOneFile(contact: Contact, path: string) {
       peerId: contact.peer_id,
       path,
       sentAt,
+      groupId: null,
+      batch: null,
     });
 
     rememberFile(file);
 
-    // Where they should come and get it. Empty on a local network, where
-    // they can already reach us, and carried in the offer rather than
-    // announced separately so it arrives exactly when it is needed.
-    const addresses = await relayedAddresses();
-
-    const offer = JSON.stringify({
-      type: "file-offer",
-      id: file.id,
-      name: file.name,
-      size: file.size,
-      hash: file.hash,
-      key: file.key,
-      addresses,
-      sentAt,
-    });
-
-    await invoke("send_direct", { peerId: contact.peer_id, message: offer });
-
-    // An offer is an ordinary message and nothing stores those, so one sent to
-    // somebody who is not running is gone. This repeats it a few times and then
-    // says so, rather than leaving a row that waits for ever.
-    await invoke("watch_offer", { id: file.id, message: offer });
+    // Where they should come and get it. Empty on a local network, where they
+    // can already reach us, and carried in the offer rather than announced
+    // separately so it arrives exactly when it is needed.
+    await offerFile(file, await relayedAddresses());
   } catch (error) {
     notify(`Could not send that file: ${error}`);
   }
 }
 
 /** Handles a file somebody has offered us, and starts fetching it. */
-async function receiveOffer(
-  sender: string,
-  offer: {
-    id: string;
-    name: string;
-    size: number;
-    hash: string;
-    key: string;
-    addresses?: string[];
-  },
-  sentAt: number,
-) {
+async function receiveOffer(sender: string, offer: FileOffer) {
   const contact = savedContacts.value.find((saved) => saved.peer_id === sender);
 
   try {
+    // Passed through rather than transcribed. The field names are already the
+    // ones the backend expects, and listing them again here is exactly how the
+    // group a file belonged to used to be lost on arrival.
     const file = await invoke<FileTransfer>("receive_file", {
       offer: {
         peerId: sender,
         nickname: contact?.nickname ?? "",
-        id: offer.id,
-        name: offer.name,
-        size: offer.size,
-        hash: offer.hash,
-        key: offer.key,
-        // Absent from an offer sent by an older node, which simply means they
-        // are only reachable directly.
-        addresses: offer.addresses ?? [],
-        sentAt,
+        ...offer,
+        sentAt: claimedSentAt(offer.sentAt),
       },
     });
 
@@ -1144,21 +1306,8 @@ async function resumeFile(file: FileTransfer) {
  */
 async function reoffer(file: FileTransfer) {
   const restored = await invoke<FileTransfer>("reoffer_file", { id: file.id });
-  const addresses = await relayedAddresses();
 
-  const offer = JSON.stringify({
-    type: "file-offer",
-    id: restored.id,
-    name: restored.name,
-    size: restored.size,
-    hash: restored.hash,
-    key: restored.key,
-    addresses,
-    sentAt: restored.sent_at,
-  });
-
-  await invoke("send_direct", { peerId: restored.peer_id, message: offer });
-  await invoke("watch_offer", { id: restored.id, message: offer });
+  await offerFile(restored, await relayedAddresses());
 }
 
 async function openFile(file: FileTransfer) {
@@ -1221,6 +1370,11 @@ async function sendReadReceipt(peerId: string, messageIds: string[]) {
   }
 }
 
+/** Whether this is the conversation already open. */
+function isSelected(kind: ConversationKind, id: string): boolean {
+  return selection.value?.kind === kind && selection.value.id === id;
+}
+
 /**
  * Opens a direct conversation: loads its history, clears the unread dot, and
  * tells the other side we've read what they sent.
@@ -1229,6 +1383,14 @@ async function sendReadReceipt(peerId: string, messageIds: string[]) {
  * looking at files means "this one", not "take me somewhere else".
  */
 async function selectContact(contact: Contact) {
+  // Clicking whoever is already open closes them. There was no other way back
+  // to nothing selected, and in the Files view that is the difference between
+  // seeing one person and seeing everybody.
+  if (isSelected("contact", contact.peer_id)) {
+    selection.value = null;
+    return;
+  }
+
   selection.value = { kind: "contact", id: contact.peer_id };
   const key = conversationKey("contact", contact.peer_id);
 
@@ -1269,6 +1431,11 @@ async function selectContact(contact: Contact) {
  * read it, and tracking that per member is a bigger feature than it looks.
  */
 async function selectGroup(group: Group) {
+  if (isSelected("group", group.id)) {
+    selection.value = null;
+    return;
+  }
+
   selection.value = { kind: "group", id: group.id };
   const key = conversationKey("group", group.id);
 
@@ -1892,29 +2059,12 @@ async function startSession() {
       Array.isArray(data.members)
     ) {
       await receiveInvite(sender, data.groupId, data.groupName, data.members);
-    } else if (
-      data.type === "file-offer" &&
-      data.id &&
-      data.name &&
-      typeof data.size === "number" &&
-      data.hash &&
-      data.key
-    ) {
-      await receiveOffer(
-        sender,
-        {
-          id: data.id,
-          name: data.name,
-          size: data.size,
-          hash: data.hash,
-          key: data.key,
-          // Where to go and get it. Without these there is no way to reach
-          // somebody who is not on this network, and the offer is the only
-          // place they are carried.
-          addresses: Array.isArray(data.addresses) ? data.addresses : [],
-        },
-        claimedSentAt(data.sentAt),
-      );
+    } else if (data.type === "file-offer") {
+      const offer = readFileOffer(data);
+
+      if (offer) {
+        await receiveOffer(sender, offer);
+      }
     } else if (data.type === "group-leave" && data.groupId) {
       await receiveDeparture(sender, data.groupId);
     }
@@ -2084,15 +2234,13 @@ function parsePayload(
   text?: string;
   messageIds?: string[];
   sentAt?: number;
-  name?: string;
-  size?: number;
-  hash?: string;
-  key?: string;
-  /** Where a file's sender says they can be reached. Offers only. */
-  addresses?: string[];
   groupId?: string;
   groupName?: string;
   members?: string[];
+  // A file offer carries more than this, and is read by readFileOffer rather
+  // than described twice. Listing its fields here as well is how they came to
+  // disagree.
+  [more: string]: unknown;
 } | null {
   try {
     return JSON.parse(message);
@@ -2213,10 +2361,13 @@ function parsePayload(
         :files="files"
         :contacts="savedContacts"
         :staged="staged"
-        :selected-peer-id="selectedContact?.peer_id ?? null"
+        :selection="filesSelection"
         :newly-arrived="newlyArrived"
         :online-peers="onlinePeers"
+        :groups="groups"
         @add="stageFilesFor"
+        @add-to-group="stageFilesForGroup"
+        @resume-member="resumeMember"
         @send="sendStaged"
         @unstage="unstage"
         @clear="clearStaged"
@@ -2232,14 +2383,10 @@ function parsePayload(
         :subtitle="shortPeerId(selectedContact.peer_id)"
         :online="selectedIsOnline"
         :messages="currentMessages"
-        :files="currentFiles"
         :my-peer-id="myPeerId"
         @send="sendMessage"
         @retry="retryMessage"
         @attach="attachFiles"
-        @open-file="openFile"
-        @reveal-file="revealFile"
-        @resume-file="resumeFile"
       />
 
       <ChatPane
@@ -2249,12 +2396,12 @@ function parsePayload(
         :subtitle="`${selectedGroup.members.length} members`"
         :online="null"
         :messages="currentMessages"
-        :files="[]"
         :my-peer-id="myPeerId"
         :sender-labels="groupSenderLabels"
         :can-add-members="true"
         @send="sendGroupMessage"
         @retry="retryMessage"
+        @attach="attachFiles"
         @add-members="addingMembers = true"
       />
 
