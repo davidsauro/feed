@@ -14,6 +14,17 @@ const props = defineProps<{
   name: string;
 }>();
 
+const emit = defineEmits<{
+  /**
+   * Somebody tapped their own name.
+   *
+   * Being asked to read out your code happens often enough that it should not
+   * be behind Settings, and your own name is where you look for something about
+   * yourself.
+   */
+  showCode: [];
+}>();
+
 const justCopied = ref(false);
 
 async function copyPeerId() {
@@ -36,7 +47,14 @@ async function copyPeerId() {
   <header class="identity">
     <span class="label">My node</span>
 
-    <div class="row">
+    <div
+      class="row"
+      role="button"
+      tabindex="0"
+      title="Show your code"
+      @click="emit('showCode')"
+      @keyup.enter="emit('showCode')"
+    >
       <span class="text">
         <span v-if="name" class="name">{{ name }}</span>
 
@@ -51,7 +69,7 @@ async function copyPeerId() {
         class="copy"
         :disabled="!peerId"
         :title="justCopied ? 'Copied' : 'Copy full peer ID'"
-        @click="copyPeerId"
+        @click.stop="copyPeerId"
       >
         <!-- Checkmark once copied, two overlapping pages otherwise. -->
         <svg
@@ -103,6 +121,16 @@ async function copyPeerId() {
   display: flex;
   align-items: center;
   gap: 6px;
+  /* Reaches past the header padding, so the whole width responds rather than
+     only the words. */
+  margin: 0 -6px;
+  padding: 4px 6px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.row:hover {
+  background-color: var(--bg-hover);
 }
 
 .text {

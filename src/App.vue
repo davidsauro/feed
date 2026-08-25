@@ -18,6 +18,7 @@ import { open as pickFiles } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 
 import AddContactDialog from "./components/AddContactDialog.vue";
+import MyCodeDialog from "./components/MyCodeDialog.vue";
 import AddMembersDialog from "./components/AddMembersDialog.vue";
 import ChatPane from "./components/ChatPane.vue";
 import ConfirmDialog from "./components/ConfirmDialog.vue";
@@ -153,6 +154,9 @@ const staged = ref<Record<string, PickedFile[]>>({});
  */
 /** This node's own fingerprint, for somebody adding us to check against. */
 const myFingerprint = ref("");
+
+/** Whether the code somebody is being asked to read out is on screen. */
+const showingMyCode = ref(false);
 
 const pendingContact = ref<{
   peerId: string;
@@ -2368,7 +2372,11 @@ function parsePayload(
 
     <div v-else class="app">
     <aside class="sidebar">
-      <IdentityBar :peer-id="myPeerId" :name="myDisplayName" />
+      <IdentityBar
+        :peer-id="myPeerId"
+        :name="myDisplayName"
+        @show-code="showingMyCode = true"
+      />
 
       <nav class="views">
         <button
@@ -2526,6 +2534,14 @@ function parsePayload(
         </p>
       </div>
     </main>
+
+    <MyCodeDialog
+      v-if="showingMyCode"
+      :peer-id="myPeerId"
+      :fingerprint="myFingerprint"
+      :name="myDisplayName"
+      @close="showingMyCode = false"
+    />
 
     <AddContactDialog
       v-if="pendingContact"

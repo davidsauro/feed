@@ -8,6 +8,7 @@
  * so both report progress.
  */
 import { nextTick, onMounted, onUnmounted, ref } from "vue";
+import FingerprintBlock from "./FingerprintBlock.vue";
 import ThemeToggle from "./ThemeToggle.vue";
 import type { Server, ServerStatus } from "../types";
 import { describeDuration, describeServer } from "../types";
@@ -241,7 +242,7 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <code class="own-code">{{ fingerprint || "…" }}</code>
+          <FingerprintBlock label="Your code" :code="fingerprint" />
         </section>
 
         <section class="section">
@@ -528,22 +529,6 @@ onUnmounted(() => {
 .hint {
   font-size: 12px;
   color: var(--text-muted);
-}
-
-/* Given its own line at full width rather than squeezed beside a label, since
-   it exists to be read aloud a group at a time. */
-.own-code {
-  display: block;
-  margin: 0 0 4px;
-  padding: 10px 12px;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  background-color: var(--bg-sunken);
-  font-family: var(--font-mono);
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  overflow-wrap: anywhere;
 }
 
 .code-row {

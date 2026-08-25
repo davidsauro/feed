@@ -12,6 +12,7 @@
  * else's is to hold their key. Reading it off their screen is the check.
  */
 import { onMounted, onUnmounted, ref } from "vue";
+import FingerprintBlock from "./FingerprintBlock.vue";
 
 const props = defineProps<{
   peerId: string;
@@ -82,13 +83,10 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
           before you trust it.
         </p>
 
-        <!-- The whole point of the dialog. Given room, and in a face where a
-             character cannot be mistaken for another. -->
-        <div class="code-block">
-          <span class="code-label">Their code</span>
-          <code v-if="fingerprint" class="code">{{ fingerprint }}</code>
-          <code v-else class="code pending">working it out…</code>
-        </div>
+        <!-- The whole point of the dialog. The same component that shows your
+             own, so two people comparing two screens are comparing like with
+             like. -->
+        <FingerprintBlock label="Their code" :code="fingerprint ?? ''" />
 
         <p class="instruction">
           Ask them to open <strong>Settings</strong> on their device and read out
@@ -175,39 +173,6 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
 
 /* The code is the reason this dialog exists, so it is the thing the eye lands
    on rather than another line of prose. */
-.code-block {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 12px;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  background-color: var(--bg-sunken);
-}
-
-.code-label {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-.code {
-  font-family: var(--font-mono);
-  font-size: 15px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  line-height: 1.6;
-  color: var(--text);
-  overflow-wrap: anywhere;
-}
-
-.code.pending {
-  font-weight: 400;
-  color: var(--text-faint);
-}
-
 .caution {
   color: var(--text-faint);
 }
