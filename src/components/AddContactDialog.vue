@@ -74,8 +74,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
         <h2 id="add-title" class="title">Add this contact?</h2>
 
         <p v-if="claimedName" class="lead">
-          This node says it is called <strong>{{ claimedName }}</strong
-          >. Anybody can say that, so check the code below instead.
+          This node says it is called <strong>{{ claimedName }}</strong>.
         </p>
 
         <p v-else class="lead">
@@ -89,13 +88,12 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
         <FingerprintBlock label="Their code" :code="fingerprint ?? ''" />
 
         <p class="instruction">
-          Ask them to open <strong>Settings</strong> on their device and read out
-          their own code. Add them only if it matches, character for character.
+          Ask them to open <strong>Settings</strong> on their device (or tap their name) and read out
+          their own code. Add them only if it matches.
         </p>
 
         <p class="caution">
-          Nicknames are not unique and anybody can claim any of them. The code is
-          the only part that cannot be.
+          Beware nicknames are not unique.
         </p>
 
         <!-- Somebody already using this name, under a different key. -->

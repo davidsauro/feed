@@ -56,7 +56,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
     <div class="backdrop" @click.self="emit('close')">
       <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="my-code-title">
         <h2 id="my-code-title" class="title">
-          {{ name ? `You, as ${name}` : "You" }}
+          {{ name ? `${name}` : "You" }}
         </h2>
 
         <FingerprintBlock label="Your code" :code="fingerprint" />
