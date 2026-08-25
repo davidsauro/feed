@@ -41,6 +41,7 @@ use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder};
 use rusqlite::Connection;
 use rusqlite::Result as SqlResult;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -2104,6 +2105,85 @@ fn reset_all_data(app: AppHandle) -> Result<(), String> {
     restrict_to_owner(&database);
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Fingerprints
+// ---------------------------------------------------------------------------
+
+/// Alphabet for a fingerprint, Crockford's base32.
+///
+/// It leaves out I, L, O and U. The first three because they are read back as
+/// 1, 1 and 0 by anybody comparing two codes on two screens, and U so that no
+/// arrangement of the rest spells anything unfortunate. What is left cannot be
+/// misread, and has no case to get wrong.
+const FINGERPRINT_ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// How much of the hash a fingerprint carries, in bytes.
+///
+/// Fifteen bytes is 120 bits, which is exactly 24 characters with nothing left
+/// over. Long enough that it cannot be forged: an attacker who wants a code
+/// matching somebody else's has to generate keys until one hashes the same way,
+/// and at 120 bits that is not a thing anybody can do.
+///
+/// Shorter would be friendlier and useless. At 32 bits a laptop finds a match
+/// in about three hours, and a fingerprint somebody can forge is worse than no
+/// fingerprint, because it invites a check that passes for the attacker.
+const FINGERPRINT_BYTES: usize = 15;
+
+/// Separates this use of the peer id from any other thing hashing one.
+const FINGERPRINT_INFO: &[u8] = b"indicium/peer-fingerprint/v1";
+
+/// A peer id as something two people can compare out loud.
+///
+/// A peer id is 52 characters of mixed case base58, of which the first eight are
+/// `12D3KooW` on every Ed25519 node and carry no information at all. What is
+/// left contains l, I, 0 and O. Nobody can compare that reliably, and a check
+/// nobody performs correctly is not a check.
+///
+/// This is derived from the whole id rather than cut out of it, so nothing is
+/// lost and the result does not resemble the input, which stops anybody
+/// comparing the wrong halves of two different things.
+pub fn fingerprint(peer_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(FINGERPRINT_INFO);
+    hasher.update(peer_id.as_bytes());
+    let digest = hasher.finalize();
+
+    let mut code = String::with_capacity(FINGERPRINT_BYTES * 8 / 5);
+    let mut bits = 0u32;
+    let mut held = 0u32;
+
+    for byte in digest.iter().take(FINGERPRINT_BYTES) {
+        held = (held << 8) | u32::from(*byte);
+        bits += 8;
+
+        while bits >= 5 {
+            bits -= 5;
+            let index = ((held >> bits) & 0b11111) as usize;
+            code.push(FINGERPRINT_ALPHABET[index] as char);
+        }
+    }
+
+    code
+}
+
+/// The fingerprint of one peer, in groups of four.
+///
+/// Grouped because a run of twenty four characters is not something anybody
+/// checks accurately, and six groups of four is.
+#[tauri::command]
+fn fingerprint_of(peer_id: String) -> Result<String, String> {
+    // Parsed rather than hashed as given, so a typo is refused here instead of
+    // producing a confident looking code for something that is not a peer.
+    let peer = parse_peer(peer_id.trim())?;
+
+    Ok(fingerprint(&peer.to_string())
+        .as_bytes()
+        .chunks(4)
+        .map(|group| String::from_utf8_lossy(group).to_string())
+        .collect::<Vec<_>>()
+        .join(" "))
 }
 
 // ---------------------------------------------------------------------------
@@ -4200,6 +4280,7 @@ fn main() {
             // Identity
             get_node_id,
             get_identity,
+            fingerprint_of,
             get_display_name,
             set_display_name,
             get_peer_names,
@@ -4272,6 +4353,83 @@ mod tests {
         fs::create_dir_all(&dir).expect("could not create the scratch directory");
 
         dir
+    }
+
+    /// The whole point is that two people comparing two screens agree.
+    #[test]
+    fn a_fingerprint_is_the_same_every_time() {
+        let peer = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN";
+
+        assert_eq!(fingerprint(peer), fingerprint(peer));
+    }
+
+    /// Twenty four characters, from an alphabet with nothing in it that can be
+    /// read as something else.
+    #[test]
+    fn a_fingerprint_is_readable() {
+        let code = fingerprint("12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN");
+
+        assert_eq!(code.len(), 24, "120 bits is exactly 24 base32 characters");
+
+        for c in code.chars() {
+            assert!(
+                FINGERPRINT_ALPHABET.contains(&(c as u8)),
+                "{} is not in the alphabet",
+                c
+            );
+        }
+
+        for confusing in ['I', 'L', 'O', 'U'] {
+            assert!(!code.contains(confusing), "{} can be misread", confusing);
+        }
+    }
+
+    /// Two peers must not share a code, and near identical ids must not produce
+    /// near identical codes, or somebody comparing the first few characters
+    /// would be satisfied by the wrong node.
+    #[test]
+    fn different_peers_get_unrelated_fingerprints() {
+        let one = fingerprint("12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN");
+        let two = fingerprint("12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTM");
+
+        assert_ne!(one, two);
+
+        let shared = one
+            .chars()
+            .zip(two.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+
+        assert!(
+            shared < 4,
+            "ids differing by one character shared {} leading characters",
+            shared
+        );
+    }
+
+    /// It is derived from the id rather than cut out of it, so nobody can
+    /// compare a code against the id it came from and think they match.
+    #[test]
+    fn a_fingerprint_does_not_resemble_the_id() {
+        let peer = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN";
+
+        assert!(!peer.contains(&fingerprint(peer)));
+        assert!(!fingerprint(peer).starts_with("12D3"));
+    }
+
+    /// Grouped for comparing, and refused outright for something that is not a
+    /// peer, rather than producing a confident looking code for a typo.
+    #[test]
+    fn fingerprint_of_groups_and_refuses_rubbish() {
+        let grouped =
+            fingerprint_of("12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".to_string())
+                .expect("a real peer id");
+
+        assert_eq!(grouped.split(' ').count(), 6);
+        assert!(grouped.split(' ').all(|group| group.len() == 4));
+
+        assert!(fingerprint_of("not a peer".to_string()).is_err());
+        assert!(fingerprint_of(String::new()).is_err());
     }
 
     /// Addresses from another node are strings, and one that does not parse

@@ -17,6 +17,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open as pickFiles } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 
+import AddContactDialog from "./components/AddContactDialog.vue";
 import AddMembersDialog from "./components/AddMembersDialog.vue";
 import ChatPane from "./components/ChatPane.vue";
 import ConfirmDialog from "./components/ConfirmDialog.vue";
@@ -143,6 +144,25 @@ const testingServers = ref(false);
  * two different people can be assembled at once without either being lost.
  */
 const staged = ref<Record<string, PickedFile[]>>({});
+
+/**
+ * A peer waiting to be confirmed as a contact.
+ *
+ * Adding is two steps now: who they say they are is not something this list can
+ * check, so the dialog shows the one part of them that cannot be claimed.
+ */
+/** This node's own fingerprint, for somebody adding us to check against. */
+const myFingerprint = ref("");
+
+const pendingContact = ref<{
+  peerId: string;
+  /** What the peer announced about itself, empty if it has told us nothing. */
+  claimedName: string;
+  /** What to put in the nickname box to start with. */
+  suggested: string;
+  fingerprint: string | null;
+  nameClash: string | null;
+} | null>(null);
 
 /**
  * Files that had not been looked at when the Files view was last opened.
@@ -447,6 +467,12 @@ function notify(text: string, kind: "error" | "info" = "error") {
 async function loadIdentity() {
   try {
     myPeerId.value = await invoke<string>("get_identity");
+
+    // Worked out once and kept. It cannot change without the identity changing,
+    // and somebody reading it out should not wait for it to appear.
+    myFingerprint.value = await invoke<string>("fingerprint_of", {
+      peerId: myPeerId.value,
+    });
   } catch (error) {
     notify(`Could not load this node's identity: ${error}`);
   }
@@ -527,6 +553,55 @@ async function loadGroups() {
  * makes the conversation exist. Undoing the save is better than leaving one of
  * those behind for somebody to puzzle over.
  */
+/**
+ * Somebody wants to add a peer, so ask them to check who it is first.
+ *
+ * The name in the list is a claim anybody can make. The fingerprint is not, so
+ * it is fetched here and the dialog shows it.
+ */
+async function requestContact(peerId: string, nickname: string) {
+  const id = peerId.trim();
+
+  pendingContact.value = {
+    peerId: id,
+    // Only what the network says about them. Somebody adding by typed address
+    // has been told nothing, and putting their own words here would have the
+    // dialog attribute them to the peer.
+    claimedName: peerNames.value[id] ?? "",
+    suggested: nickname,
+    fingerprint: null,
+    // Somebody already using this name under a different key is what an
+    // impersonation looks like from here, so it is worth saying.
+    nameClash:
+      savedContacts.value.find(
+        (contact) =>
+          contact.peer_id !== id &&
+          contact.nickname.toLowerCase() === (nickname || "").toLowerCase().trim(),
+      )?.nickname ?? null,
+  };
+
+  try {
+    const fingerprint = await invoke<string>("fingerprint_of", { peerId: id });
+
+    // Still the same request, rather than one the user has since cancelled.
+    if (pendingContact.value?.peerId === id) {
+      pendingContact.value = { ...pendingContact.value, fingerprint };
+    }
+  } catch (error) {
+    pendingContact.value = null;
+    notify(`That is not an address this app can use: ${error}`);
+  }
+}
+
+async function confirmContact(nickname: string) {
+  const pending = pendingContact.value;
+  pendingContact.value = null;
+
+  if (pending) {
+    await addContact(pending.peerId, nickname);
+  }
+}
+
 async function addContact(peerId: string, nickname: string) {
   const id = peerId.trim();
 
@@ -2338,7 +2413,7 @@ function parsePayload(
         @leave="(group) => requestRemoval('group', group.id, group.name)"
       />
 
-      <PeerList :peers="unregisteredPeers" :names="peerNames" @add="addContact" />
+      <PeerList :peers="unregisteredPeers" :names="peerNames" @add="requestContact" />
 
       <footer class="footer">
         <span class="node-badge">
@@ -2452,10 +2527,22 @@ function parsePayload(
       </div>
     </main>
 
+    <AddContactDialog
+      v-if="pendingContact"
+      :peer-id="pendingContact.peerId"
+      :claimed-name="pendingContact.claimedName"
+      :suggested="pendingContact.suggested"
+      :fingerprint="pendingContact.fingerprint"
+      :name-clash="pendingContact.nameClash"
+      @confirm="confirmContact"
+      @cancel="pendingContact = null"
+    />
+
     <SettingsDialog
       v-if="settingsOpen"
       :encryption-enabled="encryption.enabled"
       :display-name="myDisplayName"
+      :fingerprint="myFingerprint"
       :servers="servers"
       :server-status="serverStatus"
       :online-peers="activePeers"

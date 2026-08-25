@@ -26,6 +26,13 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
+  /**
+   * Somebody wants to add this peer.
+   *
+   * A request rather than the act. Who a peer actually is cannot be told from
+   * this list, so confirming it happens in a dialog that can show the one part
+   * of them that cannot be claimed.
+   */
   add: [peerId: string, nickname: string];
 }>();
 
@@ -66,12 +73,7 @@ function setDraft(peerId: string, value: string) {
 }
 
 function add(peerId: string) {
-  const nickname = draftFor(peerId).trim();
-  if (!nickname) {
-    return;
-  }
-
-  emit("add", peerId, nickname);
+  emit("add", peerId, draftFor(peerId).trim());
   delete drafts.value[peerId];
 }
 </script>
@@ -102,12 +104,7 @@ function add(peerId: string) {
               @input="setDraft(peer, ($event.target as HTMLInputElement).value)"
               @keyup.enter="add(peer)"
             />
-            <button
-              class="add-button"
-              :disabled="!draftFor(peer).trim()"
-              title="Add as contact"
-              @click="add(peer)"
-            >
+            <button class="add-button" title="Add as contact" @click="add(peer)">
               Add
             </button>
           </div>

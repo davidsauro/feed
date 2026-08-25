@@ -16,6 +16,13 @@ const props = defineProps<{
   encryptionEnabled: boolean;
   /** The name this node asks others to call it. */
   displayName: string;
+  /**
+   * This node's own fingerprint, in groups.
+   *
+   * Somebody adding you is asked to check this against what their screen shows,
+   * so it has to be somewhere you can find and read out.
+   */
+  fingerprint: string;
   /** Relay servers this node is configured to use. */
   servers: Server[];
   /**
@@ -223,6 +230,18 @@ onUnmounted(() => {
               @keyup.enter="saveName"
             />
           </div>
+
+          <div class="row code-row">
+            <div class="row-text">
+              <span class="label">Your code</span>
+              <span class="hint">
+                Read this out to somebody adding you. It comes from your key, so
+                nobody else can have it, which a name is not.
+              </span>
+            </div>
+          </div>
+
+          <code class="own-code">{{ fingerprint || "…" }}</code>
         </section>
 
         <section class="section">
@@ -509,6 +528,26 @@ onUnmounted(() => {
 .hint {
   font-size: 12px;
   color: var(--text-muted);
+}
+
+/* Given its own line at full width rather than squeezed beside a label, since
+   it exists to be read aloud a group at a time. */
+.own-code {
+  display: block;
+  margin: 0 0 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background-color: var(--bg-sunken);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  overflow-wrap: anywhere;
+}
+
+.code-row {
+  padding-bottom: 2px;
 }
 
 .name-input {
